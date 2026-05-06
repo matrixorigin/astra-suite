@@ -72,7 +72,29 @@ cli:
 #   permission_mode: auto     # auto | always-ask | never-ask
 #   model: "MiniMax-M2.7"
 
-# ── Option C: Custom CLI ──
+# ── Option C: GitHub Copilot CLI ──
+# cli:
+#   type: copilot
+#   bin: copilot              # full path or just "copilot" if on PATH
+#   model: gpt-5.2            # optional; users override with /model
+#   stream_json: true         # JSONL events for session/text/usage/tool parsing
+#   allow_all_tools: true     # required for unattended non-interactive gateway runs
+#   extra_args: []            # e.g. ["--disable-builtin-mcps"] if org policy requires it
+#
+#   # Optional: explicit, reproducible env injection.
+#   # env_file is dotenv-style KEY=VALUE; inline env overrides env_file.
+#   # env_file: ~/.astra-gateway/copilot.env
+#   # env:
+#   #   AWS_REGION: us-east-1
+#
+#   # Optional: delegate launch behavior to a script. The script receives:
+#   #   argv[1] = bin, argv[2..] = gateway-generated Copilot CLI args.
+#   # launcher:
+#   #   type: script
+#   #   path: ~/.astra-gateway/copilot-launcher
+#   #   args: []
+
+# ── Option D: Custom CLI ──
 # cli:
 #   type: custom
 #   bin: /path/to/my-agent
@@ -97,6 +119,21 @@ cli:
 #     bin: /path/to/astra
 #     permission_mode: auto
 #     model: "MiniMax-M2.7"
+#   copilot:
+#     type: copilot
+#     bin: copilot
+#     model: gpt-5.2
+#     stream_json: true
+#     allow_all_tools: true
+#   copilot-script:
+#     type: copilot
+#     bin: copilot
+#     launcher:
+#       type: script
+#       path: ~/.astra-gateway/copilot-launcher
+#       args: []
+#     stream_json: true
+#     allow_all_tools: true
 #   codex:
 #     type: codex
 #     bin: codex

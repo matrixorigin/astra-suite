@@ -584,12 +584,7 @@ impl GatewayRunner {
                 .get_user_preference(platform, user_id, &model_key)
                 .await
         {
-            match &mut profile {
-                CliProfile::Astra { model, .. } | CliProfile::Claude { model, .. } => {
-                    *model = Some(model_name);
-                }
-                _ => {}
-            }
+            profile.set_model_override(model_name);
         }
 
         profile
@@ -1630,12 +1625,7 @@ impl GatewayRunner {
                     platform: msg.platform.to_string(),
                     user_id: msg.user_id.clone(),
                     cli_profile: cli_name.clone(),
-                    model: match &cli_profile {
-                        CliProfile::Astra { model, .. } | CliProfile::Claude { model, .. } => {
-                            model.clone()
-                        }
-                        _ => None,
-                    },
+                    model: cli_profile.model_name().map(String::from),
                     tokens_prompt: result.tokens_prompt.unwrap_or(0),
                     tokens_completion: result.tokens_completion.unwrap_or(0),
                     tool_calls: result.tool_calls_count.unwrap_or(0),
