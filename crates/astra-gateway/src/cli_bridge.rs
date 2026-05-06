@@ -71,6 +71,67 @@ pub enum CliProgress {
     },
     /// Thinking state changed.
     Thinking(bool),
+    /// Reasoning/thinking text explicitly emitted by the underlying CLI.
+    ReasoningBlock {
+        kind: ReasoningKind,
+        text: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReasoningKind {
+    Raw,
+    Summary,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReasoningDisplay {
+    Off,
+    RawIfAvailable,
+}
+
+pub const REASONING_PREF_KEY: &str = "reasoning_display";
+
+impl ReasoningDisplay {
+    pub fn from_pref(value: Option<&str>) -> Self {
+        match value
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "on" | "raw" | "raw-if-available" | "raw_if_available" | "thinking"
+            | "thinking-chain" | "thinking_chain" | "reasoning" => Self::RawIfAvailable,
+            _ => Self::Off,
+        }
+    }
+
+    pub fn from_command_arg(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "on" | "raw" | "raw-if-available" | "raw_if_available" | "thinking"
+            | "thinking-chain" | "thinking_chain" | "reasoning" => Some(Self::RawIfAvailable),
+            "off" | "none" | "false" => Some(Self::Off),
+            _ => None,
+        }
+    }
+
+    pub fn as_pref(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::RawIfAvailable => "raw-if-available",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::RawIfAvailable => "raw-if-available",
+        }
+    }
+
+    pub fn is_enabled(self) -> bool {
+        !matches!(self, Self::Off)
+    }
 }
 
 #[derive(Debug)]
@@ -895,6 +956,32 @@ fn parse_claude_stream_json_line(line: &str) -> Option<CliProgress> {
                             duration_ms: None,
                         });
                     }
+                    Some("thinking") | Some("reasoning") => {
+                        if let Some(text) = block["thinking"]
+                            .as_str()
+                            .or_else(|| block["text"].as_str())
+                            .or_else(|| block["content"].as_str())
+                            && !text.is_empty()
+                        {
+                            return Some(CliProgress::ReasoningBlock {
+                                kind: ReasoningKind::Raw,
+                                text: text.to_string(),
+                            });
+                        }
+                    }
+                    Some("thinking_summary") | Some("reasoning_summary") => {
+                        if let Some(text) = block["summary"]
+                            .as_str()
+                            .or_else(|| block["text"].as_str())
+                            .or_else(|| block["content"].as_str())
+                            && !text.is_empty()
+                        {
+                            return Some(CliProgress::ReasoningBlock {
+                                kind: ReasoningKind::Summary,
+                                text: text.to_string(),
+                            });
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -1079,7 +1166,18 @@ fn parse_copilot_jsonl_line(line: &str) -> Option<CliProgress> {
         "assistant.reasoning_delta" => v["data"]["deltaContent"]
             .as_str()
             .filter(|text| !text.is_empty())
-            .map(|text| CliProgress::Status(text.to_string())),
+            .map(|text| CliProgress::ReasoningBlock {
+                kind: ReasoningKind::Raw,
+                text: text.to_string(),
+            }),
+        "assistant.reasoning_summary" => v["data"]["summary"]
+            .as_str()
+            .or_else(|| v["data"]["content"].as_str())
+            .filter(|text| !text.is_empty())
+            .map(|text| CliProgress::ReasoningBlock {
+                kind: ReasoningKind::Summary,
+                text: text.to_string(),
+            }),
         "session.warning" | "session.info" => v["data"]["message"]
             .as_str()
             .filter(|text| !text.is_empty())
@@ -1183,7 +1281,10 @@ fn parse_stderr_line(line: &str) -> CliProgress {
                 return CliProgress::Thinking(active);
             }
             Some("thinking_chunk") => {
-                return CliProgress::Status(v["text"].as_str().unwrap_or_default().to_string());
+                return CliProgress::ReasoningBlock {
+                    kind: ReasoningKind::Raw,
+                    text: v["text"].as_str().unwrap_or_default().to_string(),
+                };
             }
             Some("tool_started") => {
                 let name = v["name"].as_str().unwrap_or_default().to_string();
@@ -2543,9 +2644,41 @@ printf '%s\n' '{"type":"assistant.message_delta","data":{"deltaContent":"from sc
     #[test]
     fn parse_thinking_chunk_event() {
         let line = r#"{"type":"thinking_chunk","text":"let me consider..."}"#;
-        assert!(
-            matches!(parse_stderr_line(line), CliProgress::Status(t) if t == "let me consider...")
+        assert!(matches!(
+            parse_stderr_line(line),
+            CliProgress::ReasoningBlock { kind: ReasoningKind::Raw, text } if text == "let me consider..."
+        ));
+    }
+
+    #[test]
+    fn parse_copilot_reasoning_delta_progress() {
+        let line = r#"{"type":"assistant.reasoning_delta","data":{"deltaContent":"checking context"},"id":"r1"}"#;
+        assert!(matches!(
+            parse_stdout_jsonl_line(line),
+            Some(CliProgress::ReasoningBlock { kind: ReasoningKind::Raw, text }) if text == "checking context"
+        ));
+    }
+
+    #[test]
+    fn parse_claude_thinking_block_progress() {
+        let line = r#"{"type":"assistant","message":{"content":[{"type":"thinking","thinking":"considering options"}]}}"#;
+        assert!(matches!(
+            parse_stdout_jsonl_line(line),
+            Some(CliProgress::ReasoningBlock { kind: ReasoningKind::Raw, text }) if text == "considering options"
+        ));
+    }
+
+    #[test]
+    fn reasoning_display_aliases() {
+        assert_eq!(
+            ReasoningDisplay::from_command_arg("thinking-chain"),
+            Some(ReasoningDisplay::RawIfAvailable)
         );
+        assert_eq!(
+            ReasoningDisplay::from_command_arg("off"),
+            Some(ReasoningDisplay::Off)
+        );
+        assert_eq!(ReasoningDisplay::from_command_arg("bogus"), None);
     }
 
     #[test]
