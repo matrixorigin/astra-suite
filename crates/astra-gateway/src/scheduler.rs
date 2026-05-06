@@ -222,12 +222,7 @@ impl CronScheduler {
             .get_user_preference(platform, user_id, &model_key)
             .await
         {
-            match &mut profile {
-                CliProfile::Astra { model, .. } | CliProfile::Claude { model, .. } => {
-                    *model = Some(model_name)
-                }
-                _ => {}
-            }
+            profile.set_model_override(model_name);
         }
         profile
     }

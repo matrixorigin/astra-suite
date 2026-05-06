@@ -37,10 +37,7 @@ impl GatewayContext {
         has_db: bool,
     ) -> Self {
         let caps = cli.capabilities();
-        let model = match cli {
-            CliProfile::Astra { model, .. } | CliProfile::Claude { model, .. } => model.clone(),
-            _ => None,
-        };
+        let model = cli.model_name().map(String::from);
         Self {
             user_id: user_id.to_string(),
             user_display_name: display_name.to_string(),

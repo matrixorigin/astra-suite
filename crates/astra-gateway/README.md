@@ -1,7 +1,7 @@
 # astra-gateway
 
 A chat-platform gateway that bridges WeChat / WeCom (and more) to AI agent CLIs —
-**Claude Code**, **Codex**, and **Astra** (Copilot planned). Point it at your chat
+**Claude Code**, **Codex**, **GitHub Copilot CLI**, and **Astra**. Point it at your chat
 bot and talk to an agent CLI from any chat app, with per-user sessions,
 scheduled tasks, durable long-running jobs, and full observability.
 
@@ -51,11 +51,11 @@ work on SQLite.
 |-----------|-------------------------------------------|
 | `claude`  | `claude` CLI on PATH (Claude Code)        |
 | `codex`   | `codex` CLI on PATH                       |
-| `copilot` | GitHub Copilot CLI *(planned)*            |
+| `copilot` | `copilot` CLI on PATH (GitHub Copilot CLI) |
 | `astra`   | An Astra agent server (closed-source today) |
 | `custom`  | Any CLI with JSON / plain-text output     |
 
-Users switch at runtime with `/cli claude`, `/cli codex`, etc.
+Users switch at runtime with `/cli claude`, `/cli codex`, `/cli copilot`, etc.
 
 ### Storage backends
 
@@ -102,6 +102,22 @@ cli:
   bin: claude
   model: claude-sonnet-4-6
   stream_json: true
+
+cli_profiles:                              # /cli switch targets
+  copilot:
+    type: copilot
+    bin: copilot
+    model: gpt-5.2
+    stream_json: true
+    allow_all_tools: true
+  copilot-script:
+    type: copilot
+    bin: copilot
+    launcher:
+      type: script
+      path: ~/.astra-gateway/copilot-launcher
+    stream_json: true
+    allow_all_tools: true
 
 platforms:
   weixin:

@@ -104,11 +104,7 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
             } else {
                 None
             };
-            let cli_model = match ctx.resolved_cli {
-                crate::cli_bridge::CliProfile::Astra { model, .. }
-                | crate::cli_bridge::CliProfile::Claude { model, .. } => model.as_deref(),
-                _ => None,
-            };
+            let cli_model = ctx.resolved_cli.model_name();
             let (model_display, model_source) = if let Some(m) = cli_model {
                 (m.to_string(), "user override")
             } else if let Some(m) = ctx.config.astra.default_model.as_deref() {
@@ -366,13 +362,11 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
 
         "/model" => {
             let cli_name = ctx.resolved_cli.name();
-            let current_model = match ctx.resolved_cli {
-                crate::cli_bridge::CliProfile::Astra { model, .. }
-                | crate::cli_bridge::CliProfile::Claude { model, .. } => model.as_deref(),
-                _ => None,
-            }
-            .or(ctx.config.astra.default_model.as_deref())
-            .unwrap_or("(server default)");
+            let current_model = ctx
+                .resolved_cli
+                .model_name()
+                .or(ctx.config.astra.default_model.as_deref())
+                .unwrap_or("(server default)");
 
             if arg.is_empty() {
                 let shortcuts = model_shortcuts();
@@ -412,8 +406,8 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
         "/cli" => {
             if arg.is_empty() {
                 // Show current CLI + available profiles + workspace
-                let current = ctx.config.cli.name();
-                let caps = ctx.config.cli.capabilities();
+                let current = ctx.resolved_cli.name();
+                let caps = ctx.resolved_cli.capabilities();
                 let workspace = if let Some(s) = ctx.store {
                     s.get_user_preference(ctx.platform, ctx.user_id, "workspace")
                         .await
@@ -1179,13 +1173,11 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
             let caps = ctx.resolved_cli.capabilities();
             let has_store = ctx.store.is_some();
 
-            let model = match ctx.resolved_cli {
-                crate::cli_bridge::CliProfile::Astra { model, .. }
-                | crate::cli_bridge::CliProfile::Claude { model, .. } => model.as_deref(),
-                _ => None,
-            }
-            .or(ctx.config.astra.default_model.as_deref())
-            .unwrap_or("default");
+            let model = ctx
+                .resolved_cli
+                .model_name()
+                .or(ctx.config.astra.default_model.as_deref())
+                .unwrap_or("default");
 
             let workspace = if let Some(store) = ctx.store {
                 store
