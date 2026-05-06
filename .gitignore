@@ -1,0 +1,31 @@
+# Rust
+target/
+**/*.rs.bk
+Cargo.lock.bak
+
+# Env
+.env
+.env.local
+.env.*.local
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local configs (users copy from .example)
+gateway.yaml
+!gateway.example.yaml
+
+# Logs / data
+*.log
+*.db
+*.db-journal
+*.sqlite
+*.sqlite-journal
+/data/

@@ -1,0 +1,62 @@
+[package]
+name = "astra-gateway"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Chat-platform gateway bridging WeChat/WeCom to AI agent CLIs"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "astra-gateway"
+path = "src/main.rs"
+
+[dependencies]
+astra = { workspace = true }
+astra-task-store = { workspace = true }
+
+# Async runtime
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tokio-tungstenite = { workspace = true }
+futures-util = { workspace = true }
+async-trait = { workspace = true }
+
+# HTTP / serialization
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml_ng = { workspace = true }
+
+# Storage
+sqlx = { workspace = true, features = ["sqlite", "mysql", "runtime-tokio-rustls", "chrono"] }
+
+# CLI / config
+clap = { workspace = true }
+dotenvy = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# Utilities
+base64 = { workspace = true }
+chrono = { workspace = true }
+libc = { workspace = true }
+regex = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+
+# WeChat media encryption
+aes = "0.8"
+ecb = "0.1"
+hex = "0.4"
+urlencoding = "2"
+rand = "0.9"
+dashmap = "6.1"
+fs2 = "0.4"
+
+[dev-dependencies]
+tempfile = "3"
