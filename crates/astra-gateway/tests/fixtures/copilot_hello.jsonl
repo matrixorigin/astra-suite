@@ -1,0 +1,4 @@
+{"type":"session.start","data":{"sessionId":"0cb916db-26aa-40f2-86b5-1ba81b225fd2","version":1,"producer":"copilot-agent","copilotVersion":"1.0.41","startTime":"2026-05-06T08:41:00Z","selectedModel":"gpt-5.2"},"id":"e1","timestamp":"2026-05-06T08:41:00Z","parentId":null}
+{"type":"assistant.message_delta","data":{"messageId":"m1","deltaContent":"Hello"},"id":"e2","timestamp":"2026-05-06T08:41:01Z","parentId":"e1","ephemeral":true}
+{"type":"assistant.message","data":{"messageId":"m1","content":"Hello","outputTokens":2},"id":"e3","timestamp":"2026-05-06T08:41:02Z","parentId":"e2"}
+{"type":"assistant.usage","data":{"model":"gpt-5.2","inputTokens":12,"outputTokens":2},"id":"e4","timestamp":"2026-05-06T08:41:02Z","parentId":"e3","ephemeral":true}

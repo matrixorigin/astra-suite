@@ -3,7 +3,7 @@
 //! Each inbound message spawns `astra chat -m "..." --session-id X`
 //! and streams CLI progress to the chat platform while waiting for output.
 
-use crate::cli_bridge::{self, CliProfile, CliProgress};
+use crate::cli_bridge::{self, CliProfile, CliProgress, ReasoningDisplay, ReasoningKind};
 use crate::commands::{self, CommandContext};
 use crate::config::GatewayConfig;
 use crate::gateway_context::GatewayContext;
@@ -584,12 +584,7 @@ impl GatewayRunner {
                 .get_user_preference(platform, user_id, &model_key)
                 .await
         {
-            match &mut profile {
-                CliProfile::Astra { model, .. } | CliProfile::Claude { model, .. } => {
-                    *model = Some(model_name);
-                }
-                _ => {}
-            }
+            profile.set_model_override(model_name);
         }
 
         profile
@@ -984,6 +979,19 @@ impl GatewayRunner {
         };
         let system_prompt = gw_context.to_system_prompt();
 
+        let reasoning_display = if let Some(ref store) = self.store {
+            store
+                .get_user_preference(msg.platform, &msg.user_id, cli_bridge::REASONING_PREF_KEY)
+                .await
+                .ok()
+                .flatten()
+                .as_deref()
+                .map(|value| ReasoningDisplay::from_pref(Some(value)))
+                .unwrap_or(ReasoningDisplay::Off)
+        } else {
+            ReasoningDisplay::Off
+        };
+
         // Save as pending (for crash recovery)
         let pending_id = if save_pending {
             if let Some(ref store) = self.store {
@@ -1027,7 +1035,7 @@ impl GatewayRunner {
         let kill_registry_key = trace
             .as_ref()
             .map(|t| t.trace_id.to_string())
-            .unwrap_or_else(|| format!("notrace:{}", request_tag));
+            .unwrap_or_else(|| format!("notrace:{request_tag}"));
         self.active_tasks
             .insert(kill_registry_key.clone(), cancel_token.clone());
 
@@ -1063,6 +1071,10 @@ impl GatewayRunner {
         let mut last_tool = String::new();
         let mut sent_initial_ack = false;
         let mut token_buf = String::new();
+        let mut reasoning_buf = String::new();
+        let mut reasoning_kind = ReasoningKind::Raw;
+        let mut reasoning_chunk_counter: u32 = 0;
+        let allow_answer_progressive_flush = answer_progressive_flush_enabled(reasoning_display);
         let mut think_filter = ThinkTagStreamFilter::default();
         let mut gateway_action_filter = GatewayActionStreamFilter::default();
         let mut progressive_text_len: usize = 0;
@@ -1110,6 +1122,39 @@ impl GatewayRunner {
             buf.clear();
             len
         };
+        let flush_reasoning_buf = |buf: &mut String,
+                                   kind: ReasoningKind,
+                                   agent_name: &str,
+                                   tx: &Option<tokio::sync::mpsc::Sender<OutboundMessage>>,
+                                   platform: &str,
+                                   chat: &str,
+                                   tag: &str,
+                                   chunk_num: u32|
+         -> usize {
+            let text = buf.trim().to_string();
+            if text.is_empty() {
+                return 0;
+            }
+            let Some(tx) = tx else {
+                buf.clear();
+                return 0;
+            };
+            let title = reasoning_block_title(kind, agent_name);
+            let len = text.len();
+            let tagged = format!("[{tag}:thinking{chunk_num}] {title}\n{text}");
+            if tx
+                .try_send(OutboundMessage::plain(
+                    platform.to_string(),
+                    chat.to_string(),
+                    tagged,
+                ))
+                .is_err()
+            {
+                return 0;
+            }
+            buf.clear();
+            len
+        };
 
         loop {
             tokio::select! {
@@ -1124,7 +1169,9 @@ impl GatewayRunner {
                             let filtered = gateway_action_filter.push(&filtered);
                             if !filtered.is_empty() {
                                 token_buf.push_str(&filtered);
-                                if token_buf.len() >= PROGRESSIVE_MIN_CHARS {
+                                if allow_answer_progressive_flush
+                                    && token_buf.len() >= PROGRESSIVE_MIN_CHARS
+                                {
                                     chunk_counter += 1;
                                     progressive_text_len += flush_buf(&mut token_buf, &self.outbound_tx, msg.platform, &chat_id, &request_tag, chunk_counter);
                                     next_timer.as_mut().reset(tokio::time::Instant::now() + PROGRESSIVE_FLUSH_INTERVAL);
@@ -1142,9 +1189,54 @@ impl GatewayRunner {
                             tool_count += 1;
                             last_tool = line;
                         }
+                        Some(CliProgress::ReasoningBlock { kind, text }) => {
+                            if reasoning_display.is_enabled() {
+                                if !reasoning_buf.is_empty() && reasoning_kind != kind {
+                                    reasoning_chunk_counter += 1;
+                                    let _ = flush_reasoning_buf(
+                                        &mut reasoning_buf,
+                                        reasoning_kind,
+                                        &cli_name,
+                                        &self.outbound_tx,
+                                        msg.platform,
+                                        &chat_id,
+                                        &request_tag,
+                                        reasoning_chunk_counter,
+                                    );
+                                }
+                                reasoning_kind = kind;
+                                reasoning_buf.push_str(&text);
+                                if reasoning_buf.len() >= PROGRESSIVE_MIN_CHARS {
+                                    reasoning_chunk_counter += 1;
+                                    let _ = flush_reasoning_buf(
+                                        &mut reasoning_buf,
+                                        reasoning_kind,
+                                        &cli_name,
+                                        &self.outbound_tx,
+                                        msg.platform,
+                                        &chat_id,
+                                        &request_tag,
+                                        reasoning_chunk_counter,
+                                    );
+                                }
+                            }
+                        }
                         Some(CliProgress::Thinking(_)) => {}
                         Some(CliProgress::Status(_) | CliProgress::Stderr(_)) => {}
                         None => {
+                            if reasoning_display.is_enabled() {
+                                reasoning_chunk_counter += 1;
+                                let _ = flush_reasoning_buf(
+                                    &mut reasoning_buf,
+                                    reasoning_kind,
+                                    &cli_name,
+                                    &self.outbound_tx,
+                                    msg.platform,
+                                    &chat_id,
+                                    &request_tag,
+                                    reasoning_chunk_counter,
+                                );
+                            }
                             let think_tail = think_filter.finish();
                             if !think_tail.is_empty() {
                                 let filtered = gateway_action_filter.push(&think_tail);
@@ -1166,7 +1258,7 @@ impl GatewayRunner {
                         next_timer.as_mut().reset(tokio::time::Instant::now() + HEARTBEAT_INTERVAL);
                         continue;
                     }
-                    if !token_buf.is_empty() {
+                    if allow_answer_progressive_flush && !token_buf.is_empty() {
                         chunk_counter += 1;
                         progressive_text_len += flush_buf(&mut token_buf, &self.outbound_tx, msg.platform, &chat_id, &request_tag, chunk_counter);
                         next_timer.as_mut().reset(tokio::time::Instant::now() + PROGRESSIVE_FLUSH_INTERVAL);
@@ -1630,12 +1722,7 @@ impl GatewayRunner {
                     platform: msg.platform.to_string(),
                     user_id: msg.user_id.clone(),
                     cli_profile: cli_name.clone(),
-                    model: match &cli_profile {
-                        CliProfile::Astra { model, .. } | CliProfile::Claude { model, .. } => {
-                            model.clone()
-                        }
-                        _ => None,
-                    },
+                    model: cli_profile.model_name().map(String::from),
                     tokens_prompt: result.tokens_prompt.unwrap_or(0),
                     tokens_completion: result.tokens_completion.unwrap_or(0),
                     tool_calls: result.tool_calls_count.unwrap_or(0),
@@ -1774,7 +1861,7 @@ impl GatewayRunner {
                     .saturating_sub(last_failure.elapsed())
                     .as_secs();
                 return Some(format!(
-                    "🔑 CLI `{cli_name}` 认证失败（连续 {} 次）\n\n\
+                    "🔑 CLI `{cli_name}` 认证失败（连续 {count} 次）\n\n\
                      可能原因:\n\
                      - API 密钥过期\n\
                      - 服务端 token 刷新失败\n\n\
@@ -1783,7 +1870,6 @@ impl GatewayRunner {
                      2. 或检查环境变量 ASTRA_API_KEY\n\
                      3. 或切换到其他 CLI: `/cli claude`\n\n\
                      {remaining} 秒后自动重试，或发送 `/auth` 手动重试。",
-                    count,
                 ));
             }
             // Cooldown expired — clear the counter
@@ -3700,6 +3786,18 @@ fn truncate(s: &str, max: usize) -> String {
     }
 }
 
+fn reasoning_block_title(kind: ReasoningKind, agent_name: &str) -> String {
+    let label = match kind {
+        ReasoningKind::Raw => "思考过程",
+        ReasoningKind::Summary => "思考摘要",
+    };
+    format!("【{agent_name} {label}】")
+}
+
+fn answer_progressive_flush_enabled(reasoning_display: ReasoningDisplay) -> bool {
+    !reasoning_display.is_enabled()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3990,6 +4088,26 @@ mod tests {
             msg.is_empty(),
             "nothing to send if progressive + no actions + no stats"
         );
+    }
+
+    #[test]
+    fn reasoning_block_title_includes_agent_name() {
+        assert_eq!(
+            reasoning_block_title(ReasoningKind::Raw, "copilot"),
+            "【copilot 思考过程】"
+        );
+        assert_eq!(
+            reasoning_block_title(ReasoningKind::Summary, "claude"),
+            "【claude 思考摘要】"
+        );
+    }
+
+    #[test]
+    fn answer_progressive_flush_waits_when_reasoning_is_enabled() {
+        assert!(answer_progressive_flush_enabled(ReasoningDisplay::Off));
+        assert!(!answer_progressive_flush_enabled(
+            ReasoningDisplay::RawIfAvailable
+        ));
     }
 
     // ── Tool status merged into buffer ──────────────────────────
@@ -4646,7 +4764,7 @@ async fn action_trace_kill_with_repo() {
     let writer = TraceWriter::begin(&repo, req).await.unwrap();
     let _ = writer.start_run("astra", None).await.unwrap();
 
-    let text = format!("[[GATEWAY:trace_kill:{}]]", trace_id);
+    let text = format!("[[GATEWAY:trace_kill:{trace_id}]]");
     let policy = crate::access_control::ActionPolicy {
         allow_slash_mutations: true,
         allow_model_generated_mutations: true,
@@ -4800,7 +4918,7 @@ fn is_mentioned(text: &str, bot_name: &str) -> bool {
     if bot_name.is_empty() {
         text.contains('@')
     } else {
-        let pattern = format!("@{}", bot_name);
+        let pattern = format!("@{bot_name}");
         text.to_lowercase().contains(&pattern.to_lowercase())
     }
 }

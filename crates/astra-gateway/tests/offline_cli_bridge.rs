@@ -105,6 +105,29 @@ fn offline_claude_session_id_format() {
     assert!(sid.len() > 20, "should be a UUID-like string: {sid}");
 }
 
+// ─── Copilot fixtures ───────────────────────────────────────────────────────
+
+#[test]
+fn offline_copilot_hello_parse() {
+    let jsonl = load_fixture("copilot_hello.jsonl");
+    let profile = CliProfile::Copilot {
+        bin: "copilot".into(),
+        model: Some("gpt-5.2".into()),
+        env: std::collections::BTreeMap::new(),
+        env_file: None,
+        launcher: None,
+        stream_json: true,
+        allow_all_tools: true,
+        extra_args: vec![],
+    };
+    let result = profile.parse_output(&jsonl, 0);
+
+    assert!(result.session_id.is_some(), "session_id");
+    assert_eq!(result.text.as_deref(), Some("Hello"));
+    assert_eq!(result.tokens_prompt, Some(12));
+    assert_eq!(result.tokens_completion, Some(2));
+}
+
 // ─── Cross-CLI comparison ───────────────────────────────────────────────────
 
 #[test]

@@ -1,6 +1,6 @@
 //! CLI bridge — spawn any coding agent CLI per message.
 //!
-//! Supports multiple CLI backends (astra, claude, codex) via CliProfile.
+//! Supports multiple CLI backends (astra, claude, copilot, codex) via CliProfile.
 //! Each profile defines how to construct the command, parse the output,
 //! and extract session/text/metadata.
 
@@ -71,6 +71,67 @@ pub enum CliProgress {
     },
     /// Thinking state changed.
     Thinking(bool),
+    /// Reasoning/thinking text explicitly emitted by the underlying CLI.
+    ReasoningBlock {
+        kind: ReasoningKind,
+        text: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReasoningKind {
+    Raw,
+    Summary,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReasoningDisplay {
+    Off,
+    RawIfAvailable,
+}
+
+pub const REASONING_PREF_KEY: &str = "reasoning_display";
+
+impl ReasoningDisplay {
+    pub fn from_pref(value: Option<&str>) -> Self {
+        match value
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "on" | "raw" | "raw-if-available" | "raw_if_available" | "thinking"
+            | "thinking-chain" | "thinking_chain" | "reasoning" => Self::RawIfAvailable,
+            _ => Self::Off,
+        }
+    }
+
+    pub fn from_command_arg(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "on" | "raw" | "raw-if-available" | "raw_if_available" | "thinking"
+            | "thinking-chain" | "thinking_chain" | "reasoning" => Some(Self::RawIfAvailable),
+            "off" | "none" | "false" => Some(Self::Off),
+            _ => None,
+        }
+    }
+
+    pub fn as_pref(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::RawIfAvailable => "raw-if-available",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::RawIfAvailable => "raw-if-available",
+        }
+    }
+
+    pub fn is_enabled(self) -> bool {
+        !matches!(self, Self::Off)
+    }
 }
 
 #[derive(Debug)]
@@ -119,6 +180,33 @@ pub enum CliProfile {
         #[serde(default)]
         extra_args: Vec<String>,
     },
+    #[serde(rename = "copilot")]
+    Copilot {
+        #[serde(default = "default_copilot_bin")]
+        bin: String,
+        model: Option<String>,
+        /// Environment variables injected into this CLI process. These are
+        /// explicit and reproducible; prefer them over shell startup files
+        /// when only env is needed.
+        #[serde(default)]
+        env: std::collections::BTreeMap<String, String>,
+        /// Optional dotenv-style KEY=VALUE file. Values from `env` override
+        /// values from this file.
+        env_file: Option<String>,
+        /// Optional launcher for non-binary commands, such as shell functions.
+        /// Default is direct binary execution.
+        launcher: Option<CliLauncher>,
+        /// Use Copilot's JSONL output so gateway can extract session, text,
+        /// usage, and tool events. Disable only for troubleshooting.
+        #[serde(default = "default_true")]
+        stream_json: bool,
+        /// Non-interactive Copilot needs pre-approved tools or it may block.
+        #[serde(default = "default_true")]
+        allow_all_tools: bool,
+        /// Extra args appended after gateway defaults.
+        #[serde(default)]
+        extra_args: Vec<String>,
+    },
     #[serde(rename = "codex")]
     Codex {
         #[serde(default = "default_codex_bin")]
@@ -138,20 +226,68 @@ pub enum CliProfile {
     },
 }
 
+#[derive(Debug, Clone, serde::Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum CliLauncher {
+    Script {
+        /// Script path. The script receives `<bin>` as argv[1], then the
+        /// gateway-generated CLI args. It may ignore `<bin>` and exec any
+        /// provider-specific command.
+        path: String,
+        /// Optional launcher-specific args inserted before `<bin>`.
+        #[serde(default)]
+        args: Vec<String>,
+    },
+}
+
 fn default_astra_bin() -> String {
     "astra".into()
 }
 fn default_claude_bin() -> String {
     "claude".into()
 }
+fn default_copilot_bin() -> String {
+    "copilot".into()
+}
 fn default_codex_bin() -> String {
     "codex".into()
+}
+fn default_true() -> bool {
+    true
 }
 fn default_permission_mode() -> String {
     "auto".into()
 }
 fn default_codex_approval() -> String {
     "full-auto".into()
+}
+
+fn build_command_launcher(bin: &str, launcher: Option<&CliLauncher>) -> Command {
+    match launcher {
+        Some(CliLauncher::Script { path, args }) => build_script_launcher(bin, path, args),
+        None => Command::new(bin),
+    }
+}
+
+fn build_script_launcher(bin: &str, path: &str, args: &[String]) -> Command {
+    let mut cmd = Command::new(expand_config_path(path));
+    for arg in args {
+        cmd.arg(arg);
+    }
+    cmd.arg(bin);
+    cmd
+}
+
+fn expand_config_path(path: &str) -> String {
+    if let Some(rest) = path.strip_prefix("~/")
+        && let Some(home) = std::env::var_os("HOME")
+    {
+        return std::path::PathBuf::from(home)
+            .join(rest)
+            .to_string_lossy()
+            .to_string();
+    }
+    path.to_string()
 }
 
 impl Default for CliProfile {
@@ -185,6 +321,13 @@ impl CliProfile {
                 supports_tools: true,
             },
             Self::Claude { .. } => CliCapabilities {
+                supports_session: true,
+                supports_model_switch: true,
+                supports_json_output: true,
+                supports_harness: false,
+                supports_tools: true,
+            },
+            Self::Copilot { .. } => CliCapabilities {
                 supports_session: true,
                 supports_model_switch: true,
                 supports_json_output: true,
@@ -307,6 +450,49 @@ impl CliProfile {
                 }
                 cmd
             }
+            Self::Copilot {
+                bin,
+                model,
+                env: _,
+                env_file: _,
+                launcher,
+                stream_json,
+                allow_all_tools,
+                extra_args,
+            } => {
+                let mut cmd = build_command_launcher(bin, launcher.as_ref());
+                let prompt = if let Some(sp) = system_prompt {
+                    format!("{sp}\n\nUser message:\n{message}")
+                } else {
+                    message.to_string()
+                };
+                cmd.arg("-p").arg(prompt).arg("--silent").arg("--no-color");
+                if *stream_json {
+                    cmd.arg("--output-format").arg("json");
+                } else {
+                    cmd.arg("--output-format")
+                        .arg("text")
+                        .arg("--stream")
+                        .arg("off");
+                }
+                if *allow_all_tools {
+                    cmd.arg("--allow-all-tools");
+                }
+                if let Some(sid) = session_id {
+                    cmd.arg(format!("--resume={sid}"));
+                }
+                if let Some(m) = model {
+                    cmd.arg("--model").arg(m);
+                }
+                for arg in extra_args {
+                    cmd.arg(arg);
+                }
+                if let Some(dir) = working_dir {
+                    cmd.current_dir(dir);
+                }
+                self.apply_inline_env(&mut cmd);
+                cmd
+            }
             Self::Codex { bin, approval_mode } => {
                 let mut cmd = Command::new(bin);
                 cmd.arg(message)
@@ -344,6 +530,13 @@ impl CliProfile {
                     parse_claude_stream_json_stdout(stdout, exit_code)
                 } else {
                     parse_claude_json(stdout, exit_code)
+                }
+            }
+            Self::Copilot { stream_json, .. } => {
+                if *stream_json {
+                    parse_copilot_jsonl(stdout, exit_code)
+                } else {
+                    plain_result(stdout, exit_code)
                 }
             }
             Self::Codex { .. } => parse_generic_json(stdout, exit_code, "result", "session_id"),
@@ -386,10 +579,107 @@ impl CliProfile {
         match self {
             Self::Astra { .. } => "astra",
             Self::Claude { .. } => "claude",
+            Self::Copilot { .. } => "copilot",
             Self::Codex { .. } => "codex",
             Self::Custom { bin, .. } => bin,
         }
     }
+
+    fn probe_cache_key(&self) -> String {
+        match self {
+            Self::Astra {
+                bin,
+                permission_mode,
+                ..
+            } => format!("astra:{bin}:permission={permission_mode}"),
+            Self::Claude {
+                bin,
+                stream_json,
+                extra_args,
+                ..
+            } => format!("claude:{bin}:stream={stream_json}:extra={extra_args:?}"),
+            Self::Copilot {
+                bin,
+                env,
+                env_file,
+                launcher,
+                stream_json,
+                allow_all_tools,
+                extra_args,
+                ..
+            } => {
+                let env_keys: Vec<&String> = env.keys().collect();
+                format!(
+                    "copilot:{bin}:stream={stream_json}:allow_all={allow_all_tools}:\
+                     extra={extra_args:?}:env_file={env_file:?}:env_keys={env_keys:?}:\
+                     launcher={launcher:?}"
+                )
+            }
+            Self::Codex { bin, approval_mode } => {
+                format!("codex:{bin}:approval={approval_mode}")
+            }
+            Self::Custom {
+                bin,
+                args_template,
+                json_output,
+                ..
+            } => format!("custom:{bin}:json={json_output}:args={args_template:?}"),
+        }
+    }
+
+    pub fn model_name(&self) -> Option<&str> {
+        match self {
+            Self::Astra { model, .. }
+            | Self::Claude { model, .. }
+            | Self::Copilot { model, .. } => model.as_deref(),
+            _ => None,
+        }
+    }
+
+    pub fn set_model_override(&mut self, model_name: String) {
+        match self {
+            Self::Astra { model, .. }
+            | Self::Claude { model, .. }
+            | Self::Copilot { model, .. } => {
+                *model = Some(model_name);
+            }
+            _ => {}
+        }
+    }
+
+    fn apply_inline_env(&self, cmd: &mut Command) {
+        if let Self::Copilot { env, .. } = self {
+            for (key, value) in env {
+                cmd.env(key, value);
+            }
+        }
+    }
+
+    fn apply_runtime_environment(&self, cmd: &mut Command) -> Result<(), String> {
+        if let Self::Copilot { env_file, env, .. } = self {
+            if let Some(path) = env_file.as_deref().filter(|p| !p.trim().is_empty()) {
+                for (key, value) in load_env_file(path)? {
+                    cmd.env(key, value);
+                }
+            }
+            for (key, value) in env {
+                cmd.env(key, value);
+            }
+        }
+        Ok(())
+    }
+}
+
+fn load_env_file(path: &str) -> Result<Vec<(String, String)>, String> {
+    let expanded = expand_config_path(path);
+    let iter = dotenvy::from_path_iter(&expanded)
+        .map_err(|e| format!("load env_file `{expanded}`: {e}"))?;
+    let mut vars = Vec::new();
+    for entry in iter {
+        let (key, value) = entry.map_err(|e| format!("parse env_file `{expanded}`: {e}"))?;
+        vars.push((key, value));
+    }
+    Ok(vars)
 }
 
 // ─── JSON parsers ───────────────────────────────────────────────────────────
@@ -570,7 +860,7 @@ fn parse_claude_stream_json_stdout(stdout: &str, exit_code: i32) -> CliResult {
     let mut tool_use_count: u32 = 0;
 
     for line in stdout.lines() {
-        let line = line.trim();
+        let line = strip_leading_osc(line.trim()).trim();
         if line.is_empty() {
             continue;
         }
@@ -665,6 +955,32 @@ fn parse_claude_stream_json_line(line: &str) -> Option<CliProgress> {
                             duration_ms: None,
                         });
                     }
+                    Some("thinking") | Some("reasoning") => {
+                        if let Some(text) = block["thinking"]
+                            .as_str()
+                            .or_else(|| block["text"].as_str())
+                            .or_else(|| block["content"].as_str())
+                            && !text.is_empty()
+                        {
+                            return Some(CliProgress::ReasoningBlock {
+                                kind: ReasoningKind::Raw,
+                                text: text.to_string(),
+                            });
+                        }
+                    }
+                    Some("thinking_summary") | Some("reasoning_summary") => {
+                        if let Some(text) = block["summary"]
+                            .as_str()
+                            .or_else(|| block["text"].as_str())
+                            .or_else(|| block["content"].as_str())
+                            && !text.is_empty()
+                        {
+                            return Some(CliProgress::ReasoningBlock {
+                                kind: ReasoningKind::Summary,
+                                text: text.to_string(),
+                            });
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -681,6 +997,214 @@ fn parse_claude_stream_json_line(line: &str) -> Option<CliProgress> {
         "result" | "system" => None,
         _ => None,
     }
+}
+
+fn parse_copilot_jsonl(stdout: &str, exit_code: i32) -> CliResult {
+    let mut session_id: Option<String> = None;
+    let mut final_text: Option<String> = None;
+    let mut delta_text = String::new();
+    let mut error_text: Option<String> = None;
+    let mut tokens_prompt: Option<u64> = None;
+    let mut tokens_completion: Option<u64> = None;
+    let mut message_output_tokens: Option<u64> = None;
+    let mut tools_used: Vec<String> = Vec::new();
+    let mut seen_tool_calls: Vec<String> = Vec::new();
+    let mut tool_calls_count: u32 = 0;
+    let mut non_json_lines: Vec<String> = Vec::new();
+
+    for line in stdout.lines() {
+        let line = strip_leading_osc(line.trim()).trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            non_json_lines.push(line.to_string());
+            continue;
+        };
+        match v["type"].as_str() {
+            Some("session.start") => {
+                session_id = v["data"]["sessionId"].as_str().map(String::from);
+            }
+            Some("session.resume") if session_id.is_none() => {
+                session_id = v["data"]["sessionId"].as_str().map(String::from);
+            }
+            Some("session.error") => {
+                error_text = v["data"]["message"].as_str().map(String::from);
+            }
+            Some("assistant.message_delta") => {
+                if let Some(delta) = v["data"]["deltaContent"].as_str() {
+                    delta_text.push_str(delta);
+                }
+            }
+            Some("assistant.message") => {
+                if let Some(content) = v["data"]["content"].as_str()
+                    && !content.trim().is_empty()
+                {
+                    final_text = Some(content.to_string());
+                }
+                if let Some(requests) = v["data"]["toolRequests"].as_array() {
+                    for request in requests {
+                        record_copilot_tool(
+                            request["toolCallId"].as_str(),
+                            request["name"].as_str(),
+                            &mut seen_tool_calls,
+                            &mut tools_used,
+                            &mut tool_calls_count,
+                        );
+                    }
+                }
+                if let Some(output) = v["data"]["outputTokens"].as_u64() {
+                    message_output_tokens = Some(message_output_tokens.unwrap_or(0) + output);
+                }
+            }
+            Some("assistant.usage") => {
+                if let Some(input) = v["data"]["inputTokens"].as_u64() {
+                    tokens_prompt = Some(tokens_prompt.unwrap_or(0) + input);
+                }
+                if let Some(output) = v["data"]["outputTokens"].as_u64() {
+                    tokens_completion = Some(tokens_completion.unwrap_or(0) + output);
+                }
+            }
+            Some("tool.execution_start") => {
+                record_copilot_tool(
+                    v["data"]["toolCallId"].as_str(),
+                    v["data"]["toolName"].as_str(),
+                    &mut seen_tool_calls,
+                    &mut tools_used,
+                    &mut tool_calls_count,
+                );
+            }
+            Some("session.task_complete") => {
+                if final_text.is_none()
+                    && let Some(summary) = v["data"]["summary"].as_str()
+                    && !summary.trim().is_empty()
+                {
+                    final_text = Some(summary.to_string());
+                }
+            }
+            Some("result") if session_id.is_none() => {
+                session_id = v["sessionId"].as_str().map(String::from);
+            }
+            _ => {}
+        }
+    }
+
+    let text = final_text
+        .or_else(|| (!delta_text.trim().is_empty()).then(|| delta_text.trim().to_string()))
+        .or(error_text)
+        .or_else(|| (!non_json_lines.is_empty()).then(|| non_json_lines.join("\n")));
+    let tokens_completion = tokens_completion.or(message_output_tokens);
+
+    if text.is_some()
+        || session_id.is_some()
+        || tokens_prompt.is_some()
+        || tokens_completion.is_some()
+    {
+        CliResult {
+            stdout: String::new(),
+            stderr: String::new(),
+            exit_code,
+            success: exit_code == 0,
+            error_kind: default_error_kind(exit_code),
+            trace_id: None,
+            request_id: None,
+            run_id: None,
+            session_id,
+            text,
+            tool_calls_count: (tool_calls_count > 0).then_some(tool_calls_count),
+            tools_used,
+            tokens_prompt,
+            tokens_completion,
+        }
+    } else {
+        plain_result(stdout, exit_code)
+    }
+}
+
+fn record_copilot_tool(
+    call_id: Option<&str>,
+    name: Option<&str>,
+    seen_tool_calls: &mut Vec<String>,
+    tools_used: &mut Vec<String>,
+    tool_calls_count: &mut u32,
+) {
+    if let Some(name) = name
+        && !name.is_empty()
+        && !tools_used.iter().any(|n| n == name)
+    {
+        tools_used.push(name.to_string());
+    }
+
+    if let Some(call_id) = call_id
+        && !call_id.is_empty()
+    {
+        if !seen_tool_calls.iter().any(|id| id == call_id) {
+            seen_tool_calls.push(call_id.to_string());
+            *tool_calls_count += 1;
+        }
+    } else {
+        *tool_calls_count += 1;
+    }
+}
+
+fn parse_copilot_jsonl_line(line: &str) -> Option<CliProgress> {
+    let v = serde_json::from_str::<serde_json::Value>(line).ok()?;
+    match v["type"].as_str()? {
+        "assistant.message_delta" => v["data"]["deltaContent"]
+            .as_str()
+            .filter(|text| !text.is_empty())
+            .map(|text| CliProgress::Token(text.to_string())),
+        "assistant.intent" => v["data"]["intent"]
+            .as_str()
+            .filter(|text| !text.is_empty())
+            .map(|text| CliProgress::Status(text.to_string())),
+        "assistant.reasoning_delta" => v["data"]["deltaContent"]
+            .as_str()
+            .filter(|text| !text.is_empty())
+            .map(|text| CliProgress::ReasoningBlock {
+                kind: ReasoningKind::Raw,
+                text: text.to_string(),
+            }),
+        "assistant.reasoning_summary" => v["data"]["summary"]
+            .as_str()
+            .or_else(|| v["data"]["content"].as_str())
+            .filter(|text| !text.is_empty())
+            .map(|text| CliProgress::ReasoningBlock {
+                kind: ReasoningKind::Summary,
+                text: text.to_string(),
+            }),
+        "session.warning" | "session.info" => v["data"]["message"]
+            .as_str()
+            .filter(|text| !text.is_empty())
+            .map(|text| CliProgress::Status(text.to_string())),
+        "tool.execution_start" => {
+            let name = v["data"]["toolName"].as_str().unwrap_or("tool").to_string();
+            Some(CliProgress::ToolStarted { name })
+        }
+        "tool.execution_complete" => {
+            let name = v["data"]["toolName"].as_str().unwrap_or("tool").to_string();
+            Some(CliProgress::ToolDone {
+                name,
+                duration_ms: None,
+            })
+        }
+        _ => None,
+    }
+}
+
+fn parse_stdout_jsonl_line(line: &str) -> Option<CliProgress> {
+    let line = strip_leading_osc(line.trim()).trim();
+    parse_claude_stream_json_line(line).or_else(|| parse_copilot_jsonl_line(line))
+}
+
+fn strip_leading_osc(mut s: &str) -> &str {
+    while let Some(rest) = s.strip_prefix("\x1b]") {
+        let Some(end) = rest.find('\x07') else {
+            break;
+        };
+        s = rest[end + 1..].trim_start();
+    }
+    s
 }
 
 fn parse_generic_json(
@@ -752,7 +1276,10 @@ fn parse_stderr_line(line: &str) -> CliProgress {
                 return CliProgress::Thinking(active);
             }
             Some("thinking_chunk") => {
-                return CliProgress::Status(v["text"].as_str().unwrap_or_default().to_string());
+                return CliProgress::ReasoningBlock {
+                    kind: ReasoningKind::Raw,
+                    text: v["text"].as_str().unwrap_or_default().to_string(),
+                };
             }
             Some("tool_started") => {
                 let name = v["name"].as_str().unwrap_or_default().to_string();
@@ -895,6 +1422,12 @@ pub async fn run_cli_with_cancel(
 ) -> Result<CliResult, String> {
     let mut cmd =
         profile.build_command_with_context(message, session_id, working_dir, system_prompt);
+    profile.apply_runtime_environment(&mut cmd).map_err(|e| {
+        format!(
+            "failed to prepare `{}` CLI environment: {e}",
+            profile.name()
+        )
+    })?;
     if let Some(trace_id) = trace_id {
         cmd.env("ASTRA_GATEWAY_TRACE_ID", trace_id);
     }
@@ -908,6 +1441,9 @@ pub async fn run_cli_with_cancel(
     let stream_stdout = matches!(
         profile,
         CliProfile::Claude {
+            stream_json: true,
+            ..
+        } | CliProfile::Copilot {
             stream_json: true,
             ..
         }
@@ -952,10 +1488,9 @@ pub(crate) async fn run_child_with_cancel(
     run_child_with_cancel_inner(cmd, progress_tx, timeout, cancel, name, false).await
 }
 
-/// Like `run_child_with_cancel` but also parses stdout as a JSONL progress stream
-/// (used by Claude's `--output-format stream-json` mode). Each stdout line is
-/// dispatched as a `CliProgress` event; the full stdout text is still returned
-/// for `parse_output` to extract the final result line.
+/// Like `run_child_with_cancel` but also parses stdout as a JSONL progress
+/// stream. Each stdout line is dispatched as a `CliProgress` event; the full
+/// stdout text is still returned for `parse_output` to extract the final result.
 pub(crate) async fn run_child_with_cancel_streaming(
     cmd: Command,
     progress_tx: Option<mpsc::Sender<CliProgress>>,
@@ -985,7 +1520,7 @@ async fn run_child_with_cancel_inner(
     let stdout = child.stdout.take().ok_or("no stdout")?;
     let stderr = child.stderr.take().ok_or("no stderr")?;
 
-    // In stream-json mode, stdout carries JSONL progress events.
+    // In JSONL stream mode, stdout carries progress events.
     // In normal mode, stderr carries --stream-events JSONL progress events.
     let (stderr_progress_tx, stdout_progress_tx) = if stream_stdout {
         (None, progress_tx)
@@ -1024,7 +1559,7 @@ async fn run_child_with_cancel_inner(
             }
             output.push_str(&line);
             if let Some(ref tx) = stdout_progress_tx
-                && let Some(ev) = parse_claude_stream_json_line(&line)
+                && let Some(ev) = parse_stdout_jsonl_line(&line)
             {
                 let _ = tx.send(ev).await;
             }
@@ -1102,7 +1637,7 @@ static CLI_PROBE_CACHE: LazyLock<dashmap::DashMap<String, (CliAvailability, Inst
 const PROBE_CACHE_TTL_SECS: u64 = 300;
 
 pub async fn probe_cli(profile: &CliProfile) -> CliAvailability {
-    let cache_key = profile.name().to_string();
+    let cache_key = profile.probe_cache_key();
     if let Some(entry) = CLI_PROBE_CACHE.get(&cache_key) {
         let (ref avail, created) = *entry;
         if created.elapsed().as_secs() < PROBE_CACHE_TTL_SECS {
@@ -1115,21 +1650,26 @@ pub async fn probe_cli(profile: &CliProfile) -> CliAvailability {
 }
 
 async fn probe_cli_uncached(profile: &CliProfile) -> CliAvailability {
-    let bin = match profile {
-        CliProfile::Astra { bin, .. } => bin.as_str(),
-        CliProfile::Claude { bin, .. } => bin.as_str(),
-        CliProfile::Codex { bin, .. } => bin.as_str(),
-        CliProfile::Custom { bin, .. } => bin.as_str(),
-    };
-
     let version_arg = match profile {
         CliProfile::Astra { .. } => "--version",
         CliProfile::Claude { .. } => "--version",
+        CliProfile::Copilot { .. } => "--version",
         CliProfile::Codex { .. } => "--version",
         CliProfile::Custom { .. } => "--version",
     };
 
-    match tokio::process::Command::new(bin)
+    let mut cmd = match profile {
+        CliProfile::Astra { bin, .. }
+        | CliProfile::Claude { bin, .. }
+        | CliProfile::Codex { bin, .. }
+        | CliProfile::Custom { bin, .. } => tokio::process::Command::new(bin),
+        CliProfile::Copilot { bin, launcher, .. } => build_command_launcher(bin, launcher.as_ref()),
+    };
+    if let Err(e) = profile.apply_runtime_environment(&mut cmd) {
+        return CliAvailability::NotExecutable(e);
+    }
+
+    match cmd
         .arg(version_arg)
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -1162,6 +1702,7 @@ pub fn onboarding_message(profile: &CliProfile, availability: &CliAvailability) 
              请先安装对应的 CLI 工具:\n\
              - **astra**: `cargo install astra-cli`\n\
              - **claude**: `npm install -g @anthropic-ai/claude-code`\n\
+             - **copilot**: `npm install -g @github/copilot`\n\
              - **codex**: `npm install -g @openai/codex`\n\n\
              安装完成后发送任意消息即可开始对话。\n\
              或使用 `/cli` 切换到其他已安装的 CLI。"
@@ -1182,8 +1723,11 @@ pub fn is_auth_error(stderr: &str) -> bool {
         || lower.contains("invalid api key")
         || lower.contains("401 unauthorized")
         || lower.contains("authentication failed")
+        || lower.contains("not logged in")
         || lower.contains("token expired")
         || lower.contains("token has expired")
+        || lower.contains("access denied by policy settings")
+        || lower.contains("copilot subscription does not include this feature")
         // Match bare "401" only when it looks like an HTTP status, not a random number.
         // We check for "401" preceded by a space, start-of-line, or common prefix.
         || lower.contains("status: 401")
@@ -1199,6 +1743,15 @@ pub fn invalidate_probe_cache() {
 pub fn translate_cli_error(profile: &CliProfile, exit_code: i32, stderr: &str) -> String {
     let name = profile.name();
     if is_auth_error(stderr) {
+        if matches!(profile, CliProfile::Copilot { .. }) {
+            return format!(
+                "🔑 `{name}` 认证或策略校验失败\n\n\
+                 请尝试:\n\
+                 1. 运行 `copilot login` 重新登录\n\
+                 2. 检查 GitHub Copilot 策略/订阅是否允许 Copilot CLI\n\
+                 3. 或切换到其他 CLI: `/cli astra`、`/cli claude`"
+            );
+        }
         return format!(
             "🔑 `{name}` 认证失败\n\n\
              请尝试:\n\
@@ -1349,6 +1902,60 @@ mod tests {
         assert_eq!(r.text.as_deref(), Some("Just plain text output"));
     }
 
+    // ── Copilot JSONL parsing ───────────────────────────────────────
+
+    #[test]
+    fn parse_copilot_jsonl_realistic_events() {
+        let jsonl = r#"{"type":"session.start","data":{"sessionId":"0cb916db-26aa-40f2-86b5-1ba81b225fd2","version":1,"producer":"copilot-agent","copilotVersion":"1.0.41","startTime":"2026-05-06T08:41:00Z"},"id":"e1","timestamp":"2026-05-06T08:41:00Z","parentId":null}
+{"type":"assistant.message_delta","data":{"messageId":"m1","deltaContent":"Hel"},"id":"e2","timestamp":"2026-05-06T08:41:01Z","parentId":"e1","ephemeral":true}
+{"type":"assistant.message_delta","data":{"messageId":"m1","deltaContent":"lo"},"id":"e3","timestamp":"2026-05-06T08:41:01Z","parentId":"e2","ephemeral":true}
+{"type":"assistant.message","data":{"messageId":"m1","content":"Hello!","toolRequests":[{"toolCallId":"tc1","name":"shell"}],"outputTokens":5},"id":"e4","timestamp":"2026-05-06T08:41:02Z","parentId":"e3"}
+{"type":"tool.execution_start","data":{"toolCallId":"tc1","toolName":"shell"},"id":"e5","timestamp":"2026-05-06T08:41:03Z","parentId":"e4"}
+{"type":"assistant.usage","data":{"model":"gpt-5.2","inputTokens":10,"outputTokens":5},"id":"e6","timestamp":"2026-05-06T08:41:04Z","parentId":"e5","ephemeral":true}"#;
+        let r = parse_copilot_jsonl(jsonl, 0);
+        assert_eq!(
+            r.session_id.as_deref(),
+            Some("0cb916db-26aa-40f2-86b5-1ba81b225fd2")
+        );
+        assert_eq!(r.text.as_deref(), Some("Hello!"));
+        assert_eq!(r.tool_calls_count, Some(1));
+        assert_eq!(r.tools_used, vec!["shell"]);
+        assert_eq!(r.tokens_prompt, Some(10));
+        assert_eq!(r.tokens_completion, Some(5));
+    }
+
+    #[test]
+    fn parse_copilot_policy_error_text() {
+        let output = r#"{"type":"session.warning","data":{"warningType":"policy","message":"Third-party MCP servers are disabled"},"id":"e1","timestamp":"2026-05-06T08:41:00Z","parentId":null,"ephemeral":true}
+Error: Access denied by policy settings
+
+Your Copilot CLI policy setting may be preventing access."#;
+        let r = parse_copilot_jsonl(output, 1);
+        assert!(!r.success);
+        assert!(
+            r.text
+                .as_deref()
+                .unwrap_or_default()
+                .contains("Access denied")
+        );
+    }
+
+    #[test]
+    fn parse_copilot_result_session_with_leading_osc() {
+        let output = concat!(
+            "\x1b]2;copilot \"$@\"\x07\x1b]1;\x07",
+            r#"{"type":"assistant.message","data":{"messageId":"m1","content":"收到","toolRequests":[],"outputTokens":2},"id":"e1","timestamp":"2026-05-06T09:08:34Z","parentId":null}"#,
+            "\n",
+            r#"{"type":"result","timestamp":"2026-05-06T09:08:34Z","sessionId":"5de42873-32fa-4856-b97e-2193d225d265","exitCode":0}"#,
+        );
+        let r = parse_copilot_jsonl(output, 0);
+        assert_eq!(r.text.as_deref(), Some("收到"));
+        assert_eq!(
+            r.session_id.as_deref(),
+            Some("5de42873-32fa-4856-b97e-2193d225d265")
+        );
+    }
+
     // ── Generic JSON parsing ────────────────────────────────────────
 
     #[test]
@@ -1425,6 +2032,113 @@ mod tests {
     }
 
     #[test]
+    fn build_copilot_command() {
+        let p = CliProfile::Copilot {
+            bin: "copilot".into(),
+            model: Some("gpt-5.2".into()),
+            env: std::collections::BTreeMap::new(),
+            env_file: None,
+            launcher: None,
+            stream_json: true,
+            allow_all_tools: true,
+            extra_args: vec!["--disable-builtin-mcps".into()],
+        };
+        let cmd = p.build_command_with_context("fix bug", Some("0cb916d"), None, Some("gateway"));
+        assert_eq!(cmd.as_std().get_program(), std::ffi::OsStr::new("copilot"));
+        let args: Vec<_> = cmd.as_std().get_args().collect();
+        assert!(args.contains(&std::ffi::OsStr::new("-p")));
+        assert!(args.contains(&std::ffi::OsStr::new("--output-format")));
+        assert!(args.contains(&std::ffi::OsStr::new("json")));
+        assert!(args.contains(&std::ffi::OsStr::new("--allow-all-tools")));
+        assert!(args.contains(&std::ffi::OsStr::new("--resume=0cb916d")));
+        assert!(args.contains(&std::ffi::OsStr::new("gpt-5.2")));
+        assert!(args.contains(&std::ffi::OsStr::new("--disable-builtin-mcps")));
+        let prompt = args
+            .iter()
+            .find_map(|arg| arg.to_str().filter(|s| s.contains("User message")));
+        assert!(
+            prompt.is_some(),
+            "gateway context should be folded into prompt"
+        );
+    }
+
+    #[test]
+    fn build_copilot_script_launcher_command() {
+        let p = CliProfile::Copilot {
+            bin: "copilot".into(),
+            model: None,
+            env: std::collections::BTreeMap::new(),
+            env_file: None,
+            launcher: Some(CliLauncher::Script {
+                path: "~/bin/copilot-launcher".into(),
+                args: vec!["--profile".into(), "bedrock".into()],
+            }),
+            stream_json: true,
+            allow_all_tools: true,
+            extra_args: vec![],
+        };
+        let cmd = p.build_command("hello", Some("sid-1"), None);
+        assert!(
+            cmd.as_std()
+                .get_program()
+                .to_str()
+                .is_some_and(|s| s.ends_with("/bin/copilot-launcher"))
+        );
+        let args: Vec<_> = cmd.as_std().get_args().collect();
+        assert_eq!(args.first().and_then(|arg| arg.to_str()), Some("--profile"));
+        assert_eq!(args.get(1).and_then(|arg| arg.to_str()), Some("bedrock"));
+        assert_eq!(args.get(2).and_then(|arg| arg.to_str()), Some("copilot"));
+        assert!(args.contains(&std::ffi::OsStr::new("-p")));
+        assert!(args.contains(&std::ffi::OsStr::new("--resume=sid-1")));
+    }
+
+    #[test]
+    fn copilot_env_file_is_loaded_with_inline_override() {
+        let dir = tempfile::tempdir().unwrap();
+        let env_path = dir.path().join("copilot.env");
+        std::fs::write(&env_path, "COPILOT_PROVIDER=file\nAWS_REGION=us-east-1\n").unwrap();
+        let mut env = std::collections::BTreeMap::new();
+        env.insert("COPILOT_PROVIDER".to_string(), "inline".to_string());
+        let p = CliProfile::Copilot {
+            bin: "copilot".into(),
+            model: None,
+            env,
+            env_file: Some(env_path.to_string_lossy().to_string()),
+            launcher: None,
+            stream_json: true,
+            allow_all_tools: true,
+            extra_args: vec![],
+        };
+        let mut cmd = Command::new("env");
+        p.apply_runtime_environment(&mut cmd).unwrap();
+        let envs: std::collections::BTreeMap<_, _> = cmd
+            .as_std()
+            .get_envs()
+            .filter_map(|(key, value)| Some((key.to_str()?, value?.to_str()?)))
+            .collect();
+        assert_eq!(envs.get("COPILOT_PROVIDER"), Some(&"inline"));
+        assert_eq!(envs.get("AWS_REGION"), Some(&"us-east-1"));
+    }
+
+    #[test]
+    fn copilot_missing_env_file_is_traceable() {
+        let p = CliProfile::Copilot {
+            bin: "copilot".into(),
+            model: None,
+            env: std::collections::BTreeMap::new(),
+            env_file: Some("/tmp/astra-gateway-missing-copilot.env".into()),
+            launcher: None,
+            stream_json: true,
+            allow_all_tools: true,
+            extra_args: vec![],
+        };
+        let mut cmd = Command::new("env");
+        let err = p.apply_runtime_environment(&mut cmd).unwrap_err();
+        assert!(err.contains("env_file"));
+        assert!(err.contains("/tmp/astra-gateway-missing-copilot.env"));
+    }
+
+    #[test]
     fn build_custom_command() {
         let p = CliProfile::Custom {
             bin: "my-agent".into(),
@@ -1461,6 +2175,57 @@ model: MiniMax-M2.7"#;
 model: claude-sonnet-4-6"#;
         let p: CliProfile = serde_yaml_ng::from_str(yaml).unwrap();
         assert_eq!(p.name(), "claude");
+    }
+
+    #[test]
+    fn deserialize_copilot_profile() {
+        let yaml = r#"type: copilot
+model: gpt-5.2
+env:
+  AWS_REGION: us-east-1
+env_file: ~/.astra-gateway/copilot.env
+extra_args:
+  - --disable-builtin-mcps"#;
+        let p: CliProfile = serde_yaml_ng::from_str(yaml).unwrap();
+        assert_eq!(p.name(), "copilot");
+        assert_eq!(p.model_name(), Some("gpt-5.2"));
+        match p {
+            CliProfile::Copilot {
+                env,
+                env_file,
+                launcher,
+                ..
+            } => {
+                assert_eq!(env.get("AWS_REGION").map(String::as_str), Some("us-east-1"));
+                assert_eq!(env_file.as_deref(), Some("~/.astra-gateway/copilot.env"));
+                assert_eq!(launcher, None);
+            }
+            other => panic!("expected copilot profile, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn deserialize_copilot_script_launcher_profile() {
+        let yaml = r#"type: copilot
+launcher:
+  type: script
+  path: ~/.astra-gateway/copilot-launcher
+  args:
+    - --provider
+    - bedrock"#;
+        let p: CliProfile = serde_yaml_ng::from_str(yaml).unwrap();
+        match p {
+            CliProfile::Copilot { launcher, .. } => {
+                assert_eq!(
+                    launcher,
+                    Some(CliLauncher::Script {
+                        path: "~/.astra-gateway/copilot-launcher".into(),
+                        args: vec!["--provider".into(), "bedrock".into()],
+                    })
+                );
+            }
+            other => panic!("expected copilot profile, got {other:?}"),
+        }
     }
 
     // ── Run tests ───────────────────────────────────────────────────
@@ -1595,6 +2360,53 @@ model: claude-sonnet-4-6"#;
     }
 
     #[tokio::test]
+    async fn run_copilot_script_launcher_invokes_script() {
+        let dir = tempfile::tempdir().unwrap();
+        let script_path = dir.path().join("copilot-launcher");
+        std::fs::write(
+            &script_path,
+            r#"#!/bin/sh
+bin="$1"
+shift
+if [ "$bin" != "copilot" ]; then
+  echo "unexpected bin: $bin" >&2
+  exit 2
+fi
+printf '%s\n' '{"type":"session.start","data":{"sessionId":"script-session"},"id":"e1"}'
+printf '%s\n' '{"type":"assistant.message_delta","data":{"deltaContent":"from script"},"id":"e2"}'
+"#,
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&script_path).unwrap().permissions();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&script_path, perms).unwrap();
+        }
+        let p = CliProfile::Copilot {
+            bin: "copilot".into(),
+            model: None,
+            env: std::collections::BTreeMap::new(),
+            env_file: None,
+            launcher: Some(CliLauncher::Script {
+                path: script_path.to_string_lossy().to_string(),
+                args: vec![],
+            }),
+            stream_json: true,
+            allow_all_tools: true,
+            extra_args: vec![],
+        };
+        let r = run_cli_with_context_trace_and_timeout(
+            &p, "ignored", None, None, None, None, None, None, None, None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(r.session_id.as_deref(), Some("script-session"));
+        assert_eq!(r.text.as_deref(), Some("from script"));
+    }
+
+    #[tokio::test]
     async fn run_nonexistent() {
         let p = CliProfile::Custom {
             bin: "/nonexistent/xyz".into(),
@@ -1688,6 +2500,24 @@ model: claude-sonnet-4-6"#;
     fn is_auth_error_token_expired() {
         assert!(is_auth_error("token expired"));
         assert!(is_auth_error("Token has expired"));
+    }
+
+    #[test]
+    fn is_auth_error_copilot_policy() {
+        assert!(is_auth_error("Access denied by policy settings"));
+        let p = CliProfile::Copilot {
+            bin: "copilot".into(),
+            model: None,
+            env: std::collections::BTreeMap::new(),
+            env_file: None,
+            launcher: None,
+            stream_json: true,
+            allow_all_tools: true,
+            extra_args: vec![],
+        };
+        let msg = translate_cli_error(&p, 1, "Access denied by policy settings");
+        assert!(msg.contains("copilot login"));
+        assert!(msg.contains("策略"));
     }
 
     #[test]
@@ -1809,9 +2639,41 @@ model: claude-sonnet-4-6"#;
     #[test]
     fn parse_thinking_chunk_event() {
         let line = r#"{"type":"thinking_chunk","text":"let me consider..."}"#;
-        assert!(
-            matches!(parse_stderr_line(line), CliProgress::Status(t) if t == "let me consider...")
+        assert!(matches!(
+            parse_stderr_line(line),
+            CliProgress::ReasoningBlock { kind: ReasoningKind::Raw, text } if text == "let me consider..."
+        ));
+    }
+
+    #[test]
+    fn parse_copilot_reasoning_delta_progress() {
+        let line = r#"{"type":"assistant.reasoning_delta","data":{"deltaContent":"checking context"},"id":"r1"}"#;
+        assert!(matches!(
+            parse_stdout_jsonl_line(line),
+            Some(CliProgress::ReasoningBlock { kind: ReasoningKind::Raw, text }) if text == "checking context"
+        ));
+    }
+
+    #[test]
+    fn parse_claude_thinking_block_progress() {
+        let line = r#"{"type":"assistant","message":{"content":[{"type":"thinking","thinking":"considering options"}]}}"#;
+        assert!(matches!(
+            parse_stdout_jsonl_line(line),
+            Some(CliProgress::ReasoningBlock { kind: ReasoningKind::Raw, text }) if text == "considering options"
+        ));
+    }
+
+    #[test]
+    fn reasoning_display_aliases() {
+        assert_eq!(
+            ReasoningDisplay::from_command_arg("thinking-chain"),
+            Some(ReasoningDisplay::RawIfAvailable)
         );
+        assert_eq!(
+            ReasoningDisplay::from_command_arg("off"),
+            Some(ReasoningDisplay::Off)
+        );
+        assert_eq!(ReasoningDisplay::from_command_arg("bogus"), None);
     }
 
     #[test]
@@ -1903,7 +2765,7 @@ model: claude-sonnet-4-6"#;
         let cmd = Command::new("true");
         let result =
             run_child_with_cancel(cmd, None, Some(Duration::from_secs(5)), None, "test").await;
-        assert!(result.is_ok(), "true must exit 0: {:?}", result);
+        assert!(result.is_ok(), "true must exit 0: {result:?}");
         let (stdout, _stderr, code) = result.unwrap();
         assert_eq!(code, 0);
         assert!(stdout.is_empty());

@@ -1,6 +1,7 @@
 //! Slash command handlers for the gateway.
 
 use crate::access_control::{ActionCapability, ActionSource};
+use crate::cli_bridge::{REASONING_PREF_KEY, ReasoningDisplay};
 use crate::config::GatewayConfig;
 use crate::store::{self, GatewayStore};
 use crate::trace_model::{
@@ -104,11 +105,7 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
             } else {
                 None
             };
-            let cli_model = match ctx.resolved_cli {
-                crate::cli_bridge::CliProfile::Astra { model, .. }
-                | crate::cli_bridge::CliProfile::Claude { model, .. } => model.as_deref(),
-                _ => None,
-            };
+            let cli_model = ctx.resolved_cli.model_name();
             let (model_display, model_source) = if let Some(m) = cli_model {
                 (m.to_string(), "user override")
             } else if let Some(m) = ctx.config.astra.default_model.as_deref() {
@@ -366,13 +363,11 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
 
         "/model" => {
             let cli_name = ctx.resolved_cli.name();
-            let current_model = match ctx.resolved_cli {
-                crate::cli_bridge::CliProfile::Astra { model, .. }
-                | crate::cli_bridge::CliProfile::Claude { model, .. } => model.as_deref(),
-                _ => None,
-            }
-            .or(ctx.config.astra.default_model.as_deref())
-            .unwrap_or("(server default)");
+            let current_model = ctx
+                .resolved_cli
+                .model_name()
+                .or(ctx.config.astra.default_model.as_deref())
+                .unwrap_or("(server default)");
 
             if arg.is_empty() {
                 let shortcuts = model_shortcuts();
@@ -411,11 +406,49 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
             Some(format!("🤖 模型已切换: `{target}`\n(下次消息生效)"))
         }
 
+        "/reasoning" => {
+            let store = require_store!(ctx);
+            if arg.is_empty() {
+                let current = store
+                    .get_user_preference(ctx.platform, ctx.user_id, REASONING_PREF_KEY)
+                    .await
+                    .ok()
+                    .flatten();
+                let current = ReasoningDisplay::from_pref(current.as_deref());
+                return Some(format!(
+                    "🧠 reasoning: `{}`\n\
+                     用 `/reasoning on` 展示底层 CLI 明确输出的 reasoning/thinking block。\n\
+                     用 `/reasoning off` 关闭。\n\
+                     也可用 `/cli <name> thinking-chain` 切换 CLI 并打开。",
+                    current.label()
+                ));
+            }
+
+            let Some(mode) = ReasoningDisplay::from_command_arg(arg) else {
+                return Some(
+                    "⚠️ 用法: `/reasoning on`、`/reasoning off`、`/reasoning raw-if-available`"
+                        .into(),
+                );
+            };
+            if let Err(e) = store
+                .set_user_preference(
+                    ctx.platform,
+                    ctx.user_id,
+                    REASONING_PREF_KEY,
+                    mode.as_pref(),
+                )
+                .await
+            {
+                return Some(format!("⚠️ reasoning 设置失败: {e}"));
+            }
+            Some(format!("🧠 reasoning 已设置为 `{}`", mode.label()))
+        }
+
         "/cli" => {
             if arg.is_empty() {
                 // Show current CLI + available profiles + workspace
-                let current = ctx.config.cli.name();
-                let caps = ctx.config.cli.capabilities();
+                let current = ctx.resolved_cli.name();
+                let caps = ctx.resolved_cli.capabilities();
                 let workspace = if let Some(s) = ctx.store {
                     s.get_user_preference(ctx.platform, ctx.user_id, "workspace")
                         .await
@@ -424,10 +457,21 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
                 } else {
                     None
                 };
+                let reasoning_display = if let Some(s) = ctx.store {
+                    let pref = s
+                        .get_user_preference(ctx.platform, ctx.user_id, REASONING_PREF_KEY)
+                        .await
+                        .ok()
+                        .flatten();
+                    ReasoningDisplay::from_pref(pref.as_deref())
+                } else {
+                    ReasoningDisplay::Off
+                };
                 let ws_display = workspace.as_deref().unwrap_or("(默认)");
                 let mut lines = vec![
                     format!("🔧 **当前 CLI: `{current}`**"),
                     format!("📂 工作目录: `{ws_display}`"),
+                    format!("🧠 reasoning: `{}`", reasoning_display.label()),
                     format!(
                         "  能力: {}session {}model {}harness {}tools",
                         if caps.supports_session { "✅" } else { "❌" },
@@ -481,7 +525,26 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
             }
 
             // Switch to a named profile
-            if let Some(profile) = ctx.config.cli_profiles.get(arg) {
+            let mut parts = arg.split_whitespace();
+            let profile_name = parts.next().unwrap_or_default();
+            let reasoning_arg = parts.next();
+            if parts.next().is_some() {
+                return Some("⚠️ 用法: `/cli <name>` 或 `/cli <name> thinking-chain`".into());
+            }
+
+            let reasoning_mode = match reasoning_arg {
+                Some(value) => match ReasoningDisplay::from_command_arg(value) {
+                    Some(mode) => Some(mode),
+                    None => {
+                        return Some(
+                            "⚠️ 用法: `/cli <name>` 或 `/cli <name> thinking-chain`".into(),
+                        );
+                    }
+                },
+                None => None,
+            };
+
+            if let Some(profile) = ctx.config.cli_profiles.get(profile_name) {
                 if let Some(denial) = slash_denial(ctx, ActionCapability::CliMutation) {
                     return Some(denial);
                 }
@@ -499,20 +562,40 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
                 );
                 if let Some(s) = ctx.store
                     && let Err(e) = s
-                        .set_user_preference(ctx.platform, ctx.user_id, "cli_profile", arg)
+                        .set_user_preference(ctx.platform, ctx.user_id, "cli_profile", profile_name)
                         .await
                 {
                     return Some(format!("⚠️ CLI 切换失败: {e}"));
                 }
-                Some(format!(
-                    "✅ 已切换到 `{arg}` ({name})\n{cap_str}",
-                    name = profile.name()
-                ))
+                if let Some(mode) = reasoning_mode {
+                    let store = require_store!(ctx);
+                    if let Err(e) = store
+                        .set_user_preference(
+                            ctx.platform,
+                            ctx.user_id,
+                            REASONING_PREF_KEY,
+                            mode.as_pref(),
+                        )
+                        .await
+                    {
+                        return Some(format!("⚠️ reasoning 设置失败: {e}"));
+                    }
+                    Some(format!(
+                        "✅ 已切换到 `{profile_name}` ({name})\n{cap_str}\n🧠 reasoning: `{reasoning}`",
+                        name = profile.name(),
+                        reasoning = mode.label(),
+                    ))
+                } else {
+                    Some(format!(
+                        "✅ 已切换到 `{profile_name}` ({name})\n{cap_str}",
+                        name = profile.name()
+                    ))
+                }
             } else {
                 let available: Vec<&str> =
                     ctx.config.cli_profiles.keys().map(|s| s.as_str()).collect();
                 Some(format!(
-                    "❌ 未找到 CLI `{arg}`\n可用: {}",
+                    "❌ 未找到 CLI `{profile_name}`\n可用: {}",
                     if available.is_empty() {
                         "(无配置)".into()
                     } else {
@@ -544,6 +627,8 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
              **CLI & 工作区**\n\
              `/cli` — 查看当前 CLI + 能力 + 工作目录\n\
              `/cli <name>` — 切换 CLI (astra/claude)\n\
+             `/cli <name> thinking-chain` — 切换 CLI 并展示可获取的思考块\n\
+             `/reasoning on|off` — 开关可获取的 reasoning/thinking block\n\
              `/ws` — 当前工作目录\n\
              `/ws ls` — 列出可用项目\n\
              `/ws <name|path>` — 切换工作目录\n\n\
@@ -1181,13 +1266,11 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
             let caps = ctx.resolved_cli.capabilities();
             let has_store = ctx.store.is_some();
 
-            let model = match ctx.resolved_cli {
-                crate::cli_bridge::CliProfile::Astra { model, .. }
-                | crate::cli_bridge::CliProfile::Claude { model, .. } => model.as_deref(),
-                _ => None,
-            }
-            .or(ctx.config.astra.default_model.as_deref())
-            .unwrap_or("default");
+            let model = ctx
+                .resolved_cli
+                .model_name()
+                .or(ctx.config.astra.default_model.as_deref())
+                .unwrap_or("default");
 
             let workspace = if let Some(store) = ctx.store {
                 store
@@ -1249,6 +1332,7 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
             lines.push("| `/status` | Status + harness |".to_string());
             lines.push("| `/model <name>` | Switch model |".to_string());
             lines.push("| `/cli <name>` | Switch CLI backend |".to_string());
+            lines.push("| `/reasoning on\\|off` | Toggle reasoning blocks |".to_string());
             lines.push("| `/ws ls` | List projects |".to_string());
             lines.push("| `/ws <name>` | Switch workspace |".to_string());
             lines.push("| `/session list` | Session history |".to_string());
@@ -2167,6 +2251,7 @@ mod tests {
         assert!(s.contains("/new"), "missing /new");
         assert!(s.contains("/reset"), "missing /reset alias");
         assert!(s.contains("/model"), "missing /model");
+        assert!(s.contains("/reasoning"), "missing /reasoning");
         assert!(s.contains("/session"), "missing /session");
         assert!(s.contains("/task"), "missing /task");
         assert!(s.contains("/trace"), "missing /trace");
@@ -2192,6 +2277,10 @@ mod tests {
     );
     cmd_test!(cmd_cli_no_arg_shows_current, "/cli", |r| {
         assert!(r.unwrap().contains("astra"));
+    });
+    cmd_test!(cmd_reasoning_requires_db, "/reasoning on", |r| {
+        let msg = r.unwrap();
+        assert!(msg.contains("存储"), "expected storage error, got: {msg}");
     });
     cmd_test!(cmd_new_requires_db, "/new", |r| {
         {

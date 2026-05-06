@@ -1,7 +1,7 @@
 # astra-gateway
 
 A chat-platform gateway that bridges WeChat / WeCom (and more) to AI agent CLIs —
-**Claude Code**, **Codex**, and **Astra** (Copilot planned). Point it at your chat
+**Claude Code**, **Codex**, **GitHub Copilot CLI**, and **Astra**. Point it at your chat
 bot and talk to an agent CLI from any chat app, with per-user sessions,
 scheduled tasks, durable long-running jobs, and full observability.
 
@@ -51,11 +51,11 @@ work on SQLite.
 |-----------|-------------------------------------------|
 | `claude`  | `claude` CLI on PATH (Claude Code)        |
 | `codex`   | `codex` CLI on PATH                       |
-| `copilot` | GitHub Copilot CLI *(planned)*            |
+| `copilot` | `copilot` CLI on PATH (GitHub Copilot CLI) |
 | `astra`   | An Astra agent server (closed-source today) |
 | `custom`  | Any CLI with JSON / plain-text output     |
 
-Users switch at runtime with `/cli claude`, `/cli codex`, etc.
+Users switch at runtime with `/cli claude`, `/cli codex`, `/cli copilot`, etc.
 
 ### Storage backends
 
@@ -75,6 +75,7 @@ Users switch at runtime with `/cli claude`, `/cli codex`, etc.
 | `/status`                      | CLI + model + session + harness summary |
 | `/new`                         | Start a new conversation |
 | `/cli` / `/cli claude`         | Show / switch CLI backend |
+| `/reasoning on\|off`           | Toggle explicit reasoning / thinking blocks |
 | `/model` / `/model opus`       | Show / switch model |
 | `/workspace <path>`            | Switch working directory |
 | `/session list\|switch`        | Session history |
@@ -103,6 +104,22 @@ cli:
   model: claude-sonnet-4-6
   stream_json: true
 
+cli_profiles:                              # /cli switch targets
+  copilot:
+    type: copilot
+    bin: copilot
+    model: gpt-5.2
+    stream_json: true
+    allow_all_tools: true
+  copilot-script:
+    type: copilot
+    bin: copilot
+    launcher:
+      type: script
+      path: ~/.astra-gateway/copilot-launcher
+    stream_json: true
+    allow_all_tools: true
+
 platforms:
   weixin:
     enabled: true
@@ -114,6 +131,10 @@ max_concurrent_runs: 4
 
 Environment variables (see [.env.example](.env.example)) override YAML values
 — useful for secrets and deployment-specific overrides.
+
+Reasoning blocks are opt-in per user. `/reasoning on` or
+`/cli <name> thinking-chain` forwards only reasoning/thinking events that the
+selected CLI explicitly exposes; WeChat renders them as separate text blocks.
 
 ## Development
 
