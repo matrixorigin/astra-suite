@@ -1035,7 +1035,7 @@ impl GatewayRunner {
         let kill_registry_key = trace
             .as_ref()
             .map(|t| t.trace_id.to_string())
-            .unwrap_or_else(|| format!("notrace:{}", request_tag));
+            .unwrap_or_else(|| format!("notrace:{request_tag}"));
         self.active_tasks
             .insert(kill_registry_key.clone(), cancel_token.clone());
 
@@ -1861,7 +1861,7 @@ impl GatewayRunner {
                     .saturating_sub(last_failure.elapsed())
                     .as_secs();
                 return Some(format!(
-                    "🔑 CLI `{cli_name}` 认证失败（连续 {} 次）\n\n\
+                    "🔑 CLI `{cli_name}` 认证失败（连续 {count} 次）\n\n\
                      可能原因:\n\
                      - API 密钥过期\n\
                      - 服务端 token 刷新失败\n\n\
@@ -1870,7 +1870,6 @@ impl GatewayRunner {
                      2. 或检查环境变量 ASTRA_API_KEY\n\
                      3. 或切换到其他 CLI: `/cli claude`\n\n\
                      {remaining} 秒后自动重试，或发送 `/auth` 手动重试。",
-                    count,
                 ));
             }
             // Cooldown expired — clear the counter
@@ -4749,7 +4748,7 @@ async fn action_trace_kill_with_repo() {
     let writer = TraceWriter::begin(&repo, req).await.unwrap();
     let _ = writer.start_run("astra", None).await.unwrap();
 
-    let text = format!("[[GATEWAY:trace_kill:{}]]", trace_id);
+    let text = format!("[[GATEWAY:trace_kill:{trace_id}]]");
     let policy = crate::access_control::ActionPolicy {
         allow_slash_mutations: true,
         allow_model_generated_mutations: true,
@@ -4903,7 +4902,7 @@ fn is_mentioned(text: &str, bot_name: &str) -> bool {
     if bot_name.is_empty() {
         text.contains('@')
     } else {
-        let pattern = format!("@{}", bot_name);
+        let pattern = format!("@{bot_name}");
         text.to_lowercase().contains(&pattern.to_lowercase())
     }
 }

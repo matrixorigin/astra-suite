@@ -383,7 +383,9 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
                     ));
                 }
                 lines.push(String::new());
-                lines.push("用编号、名称或完整 model ID: `/model 3` `/model opus` `/model xxx`".into());
+                lines.push(
+                    "用编号、名称或完整 model ID: `/model 3` `/model opus` `/model xxx`".into(),
+                );
                 return Some(lines.join("\n"));
             }
 
@@ -1926,10 +1928,11 @@ fn resolve_model_shortcut(input: &str) -> String {
     let shortcuts = model_shortcuts();
 
     // Try numeric index first (1-based)
-    if let Ok(idx) = input.parse::<usize>() {
-        if idx >= 1 && idx <= shortcuts.len() {
-            return shortcuts[idx - 1].1.to_string();
-        }
+    if let Ok(idx) = input.parse::<usize>()
+        && idx >= 1
+        && idx <= shortcuts.len()
+    {
+        return shortcuts[idx - 1].1.to_string();
     }
 
     // Try name shortcut
