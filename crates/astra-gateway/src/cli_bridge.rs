@@ -1025,10 +1025,8 @@ fn parse_copilot_jsonl(stdout: &str, exit_code: i32) -> CliResult {
             Some("session.start") => {
                 session_id = v["data"]["sessionId"].as_str().map(String::from);
             }
-            Some("session.resume") => {
-                if session_id.is_none() {
-                    session_id = v["data"]["sessionId"].as_str().map(String::from);
-                }
+            Some("session.resume") if session_id.is_none() => {
+                session_id = v["data"]["sessionId"].as_str().map(String::from);
             }
             Some("session.error") => {
                 error_text = v["data"]["message"].as_str().map(String::from);
@@ -1084,10 +1082,8 @@ fn parse_copilot_jsonl(stdout: &str, exit_code: i32) -> CliResult {
                     final_text = Some(summary.to_string());
                 }
             }
-            Some("result") => {
-                if session_id.is_none() {
-                    session_id = v["sessionId"].as_str().map(String::from);
-                }
+            Some("result") if session_id.is_none() => {
+                session_id = v["sessionId"].as_str().map(String::from);
             }
             _ => {}
         }
@@ -2769,7 +2765,7 @@ printf '%s\n' '{"type":"assistant.message_delta","data":{"deltaContent":"from sc
         let cmd = Command::new("true");
         let result =
             run_child_with_cancel(cmd, None, Some(Duration::from_secs(5)), None, "test").await;
-        assert!(result.is_ok(), "true must exit 0: {:?}", result);
+        assert!(result.is_ok(), "true must exit 0: {result:?}");
         let (stdout, _stderr, code) = result.unwrap();
         assert_eq!(code, 0);
         assert!(stdout.is_empty());

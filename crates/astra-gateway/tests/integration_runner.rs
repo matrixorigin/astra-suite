@@ -171,7 +171,7 @@ fn create_fake_cli_script_with_ids(
 
     let dir = tempfile::tempdir().unwrap();
     let script_path = dir.path().join("fake_cli.sh");
-    let content = format!("#!/bin/sh\ncat << 'HEREDOC_END'\n{}\nHEREDOC_END", json);
+    let content = format!("#!/bin/sh\ncat << 'HEREDOC_END'\n{json}\nHEREDOC_END");
     std::fs::write(&script_path, content).unwrap();
     #[cfg(unix)]
     {
@@ -190,7 +190,7 @@ fn script_path(dir: &tempfile::TempDir) -> String {
 fn create_failing_cli_script(exit_code: i32, stderr_msg: &str) -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("fake_cli.sh");
-    let content = format!("#!/bin/sh\necho '{}' >&2\nexit {}", stderr_msg, exit_code);
+    let content = format!("#!/bin/sh\necho '{stderr_msg}' >&2\nexit {exit_code}");
     std::fs::write(&path, content).unwrap();
     #[cfg(unix)]
     {
@@ -904,8 +904,7 @@ async fn allowlist_rejects_unauthorized_user() {
     assert!(text.is_some());
     assert!(
         text.as_ref().unwrap().contains("权限"),
-        "should reject unauthorized user: {:?}",
-        text
+        "should reject unauthorized user: {text:?}"
     );
 
     // Authorized user
@@ -916,8 +915,7 @@ async fn allowlist_rejects_unauthorized_user() {
     assert!(text.is_some());
     assert!(
         text.as_ref().unwrap().contains("状态") || text.as_ref().unwrap().contains("CLI"),
-        "authorized user should get status: {:?}",
-        text
+        "authorized user should get status: {text:?}"
     );
 }
 
@@ -1038,8 +1036,7 @@ async fn slash_help_returns_immediately() {
     // Fast path should be < 100ms (no CLI spawn)
     assert!(
         elapsed < Duration::from_millis(500),
-        "fast path should be instant, took {:?}",
-        elapsed
+        "fast path should be instant, took {elapsed:?}"
     );
 }
 
@@ -1217,7 +1214,7 @@ async fn cli_auth_error_triggers_circuit_breaker() {
     // Send multiple messages to trigger the circuit breaker
     // AUTH_FAILURE_THRESHOLD is 2, so after 3 failures it should trip
     for i in 0..4 {
-        let m = msg("chat-auth", "user-1", &format!("attempt {}", i));
+        let m = msg("chat-auth", "user-1", &format!("attempt {i}"));
         gw.runner.handle_message(&m, &adapter).await;
     }
 

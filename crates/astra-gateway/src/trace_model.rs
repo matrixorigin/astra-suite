@@ -3447,7 +3447,7 @@ mod tests {
                 assert_eq!(row.status, RequestStatus::Failed);
                 assert_eq!(row.error_message.as_deref(), Some("user cancelled"));
             }
-            other => panic!("expected Cancelled, got {:?}", other),
+            other => panic!("expected Cancelled, got {other:?}"),
         }
 
         // Verify underlying request was updated
@@ -3474,7 +3474,7 @@ mod tests {
                 assert_eq!(row.request_id, req_id);
                 assert_eq!(row.status, RequestStatus::Running);
             }
-            other => panic!("expected AlreadyRunning, got {:?}", other),
+            other => panic!("expected AlreadyRunning, got {other:?}"),
         }
     }
 
@@ -3488,7 +3488,7 @@ mod tests {
             .unwrap()
         {
             CancelRequestOutcome::NotFound => {}
-            other => panic!("expected NotFound, got {:?}", other),
+            other => panic!("expected NotFound, got {other:?}"),
         }
     }
 
@@ -3508,7 +3508,7 @@ mod tests {
             .unwrap()
         {
             CancelRequestOutcome::NotFound => {}
-            other => panic!("expected NotFound for completed request, got {:?}", other),
+            other => panic!("expected NotFound for completed request, got {other:?}"),
         }
     }
 
@@ -4242,7 +4242,7 @@ mod tests {
                 assert_eq!(row.status, RequestStatus::Failed);
                 assert_eq!(row.error_message.as_deref(), Some("user cancelled"));
             }
-            other => panic!("expected Cancelled, got {:?}", other),
+            other => panic!("expected Cancelled, got {other:?}"),
         }
 
         let r = repo.get_request(&req_id).await.unwrap().unwrap();
@@ -4267,7 +4267,7 @@ mod tests {
                 assert_eq!(row.request_id, req_id);
                 assert_eq!(row.status, RequestStatus::Running);
             }
-            other => panic!("expected AlreadyRunning, got {:?}", other),
+            other => panic!("expected AlreadyRunning, got {other:?}"),
         }
     }
 
@@ -4281,7 +4281,7 @@ mod tests {
             .unwrap()
         {
             CancelRequestOutcome::NotFound => {}
-            other => panic!("expected NotFound, got {:?}", other),
+            other => panic!("expected NotFound, got {other:?}"),
         }
     }
 
@@ -4300,7 +4300,7 @@ mod tests {
             .unwrap()
         {
             CancelRequestOutcome::NotFound => {}
-            other => panic!("expected NotFound for completed request, got {:?}", other),
+            other => panic!("expected NotFound for completed request, got {other:?}"),
         }
     }
 
