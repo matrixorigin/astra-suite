@@ -94,6 +94,12 @@ cli:
 #   #   path: ~/.astra-gateway/copilot-launcher
 #   #   args: []
 
+# Reasoning / thinking output is opt-in per user:
+#   /reasoning on
+#   /reasoning off
+#   /cli <name> thinking-chain
+# Only explicit reasoning/thinking events emitted by the selected CLI are shown.
+
 # ── Option D: Custom CLI ──
 # cli:
 #   type: custom

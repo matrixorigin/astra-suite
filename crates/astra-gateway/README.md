@@ -75,6 +75,7 @@ Users switch at runtime with `/cli claude`, `/cli codex`, `/cli copilot`, etc.
 | `/status`                      | CLI + model + session + harness summary |
 | `/new`                         | Start a new conversation |
 | `/cli` / `/cli claude`         | Show / switch CLI backend |
+| `/reasoning on\|off`           | Toggle explicit reasoning / thinking blocks |
 | `/model` / `/model opus`       | Show / switch model |
 | `/workspace <path>`            | Switch working directory |
 | `/session list\|switch`        | Session history |
@@ -130,6 +131,10 @@ max_concurrent_runs: 4
 
 Environment variables (see [.env.example](.env.example)) override YAML values
 — useful for secrets and deployment-specific overrides.
+
+Reasoning blocks are opt-in per user. `/reasoning on` or
+`/cli <name> thinking-chain` forwards only reasoning/thinking events that the
+selected CLI explicitly exposes; WeChat renders them as separate text blocks.
 
 ## Development
 
