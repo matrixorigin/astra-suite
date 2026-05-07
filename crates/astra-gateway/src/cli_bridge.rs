@@ -525,8 +525,8 @@ impl CliProfile {
                     }
                 } else {
                     cmd.arg("exec").arg(message);
+                    cmd.arg("--sandbox").arg(sandbox);
                 }
-                cmd.arg("--sandbox").arg(sandbox);
                 if *stream_json {
                     cmd.arg("--json");
                 }
@@ -1751,7 +1751,7 @@ async fn run_child_with_cancel_inner(
     name: &str,
     stream_stdout: bool,
 ) -> Result<(String, String, i32), String> {
-    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
 
     let mut child = cmd
         .spawn()
