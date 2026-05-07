@@ -24,6 +24,7 @@ jobs:
     if: always() && (needs.test.result == 'success' || needs.test.result == 'skipped')
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
         include:
           - target: x86_64-unknown-linux-musl
@@ -39,8 +40,6 @@ jobs:
           - target: aarch64-apple-darwin
             os: macos-latest
             strip_bin: strip
-          - target: x86_64-pc-windows-msvc
-            os: windows-latest
 
     steps:
       - uses: actions/checkout@v4
@@ -87,13 +86,6 @@ jobs:
           ${{ matrix.strip_bin }} dist/astra-gateway 2>/dev/null || true
           cd dist && tar czf ../astra-gateway-${{ matrix.target }}.tar.gz *
 
-      - name: Package (windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force dist
-          Copy-Item "target/${{ matrix.target }}/release/astra-gateway.exe" dist/
-          Compress-Archive -Path dist/* -DestinationPath "astra-gateway-${{ matrix.target }}.zip"
 
       - uses: actions/upload-artifact@v4
         with:
@@ -115,8 +107,8 @@ jobs:
       - name: Generate checksums
         run: |
           cd artifacts
-          find . \( -name '*.tar.gz' -o -name '*.zip' \) -exec cp {} . \;
-          sha256sum *.tar.gz *.zip > SHA256SUMS.txt
+          find . -name '*.tar.gz' -exec cp {} . \;
+          sha256sum *.tar.gz > SHA256SUMS.txt
           cat SHA256SUMS.txt
 
       - name: Create Release
@@ -125,7 +117,6 @@ jobs:
           tag_name: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
           files: |
             artifacts/*.tar.gz
-            artifacts/*.zip
             artifacts/SHA256SUMS.txt
           generate_release_notes: true
           prerelease: ${{ contains(github.ref_name, '-rc') || contains(github.ref_name, '-beta') || contains(github.ref_name, '-alpha') }}
