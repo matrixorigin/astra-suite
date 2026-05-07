@@ -29,11 +29,20 @@ Claude Code · Codex · Astra · Custom CLI
 - **Full observability** — per-request trace, audit chain, durable outbox with retry
 - **Multi-user** — per-user sessions, access control, group chat isolation
 
+**Install:**
+
 ```bash
-# Quick start
-make init           # generate gateway.yaml (Claude + SQLite)
-make login-weixin   # scan QR for WeChat
-make run            # start (background daemon)
+curl -sSL https://raw.githubusercontent.com/matrixorigin/astra-suite/main/scripts/install.sh | sh
+```
+
+Or download binaries directly from [GitHub Releases](https://github.com/matrixorigin/astra-suite/releases).
+
+**Quick start:**
+
+```bash
+astra-gateway init          # generate gateway.yaml (Claude + SQLite)
+astra-gateway login-weixin  # scan QR for WeChat
+astra-gateway               # start
 ```
 
 See [`crates/astra-gateway/README.md`](crates/astra-gateway/README.md) for full documentation.
