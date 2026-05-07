@@ -1,6 +1,6 @@
 //! CLI bridge — spawn any coding agent CLI per message.
 //!
-//! Supports multiple CLI backends (astra, claude, copilot, codex) via CliProfile.
+//! Supports multiple CLI backends (astra, claude, copilot, codex, custom) via CliProfile.
 //! Each profile defines how to construct the command, parse the output,
 //! and extract session/text/metadata.
 
@@ -211,8 +211,23 @@ pub enum CliProfile {
     Codex {
         #[serde(default = "default_codex_bin")]
         bin: String,
-        #[serde(default = "default_codex_approval")]
-        approval_mode: String,
+        model: Option<String>,
+        /// Sandbox policy: "read-only" | "workspace-write" | "danger-full-access".
+        #[serde(default = "default_codex_sandbox")]
+        sandbox: String,
+        /// Use `--json` for JSONL streaming output in exec mode.
+        /// Codex `--json` is inherently streaming (each event prints as it occurs).
+        #[serde(default)]
+        stream_json: bool,
+        /// Extra args appended to the codex invocation before the prompt.
+        #[serde(default)]
+        extra_args: Vec<String>,
+        /// Skip git repo check (useful for non-git directories).
+        #[serde(default)]
+        skip_git_repo_check: bool,
+        /// Ephemeral mode: don't persist session files to disk.
+        #[serde(default)]
+        ephemeral: bool,
     },
     #[serde(rename = "custom")]
     Custom {
@@ -258,8 +273,8 @@ fn default_true() -> bool {
 fn default_permission_mode() -> String {
     "auto".into()
 }
-fn default_codex_approval() -> String {
-    "full-auto".into()
+fn default_codex_sandbox() -> String {
+    "workspace-write".into()
 }
 
 fn build_command_launcher(bin: &str, launcher: Option<&CliLauncher>) -> Command {
@@ -335,8 +350,8 @@ impl CliProfile {
                 supports_tools: true,
             },
             Self::Codex { .. } => CliCapabilities {
-                supports_session: false,
-                supports_model_switch: false,
+                supports_session: true,
+                supports_model_switch: true,
                 supports_json_output: true,
                 supports_harness: false,
                 supports_tools: true,
@@ -493,11 +508,40 @@ impl CliProfile {
                 self.apply_inline_env(&mut cmd);
                 cmd
             }
-            Self::Codex { bin, approval_mode } => {
+            Self::Codex {
+                bin,
+                model,
+                sandbox,
+                stream_json,
+                extra_args,
+                skip_git_repo_check,
+                ephemeral,
+            } => {
                 let mut cmd = Command::new(bin);
-                cmd.arg(message)
-                    .arg(format!("--{approval_mode}"))
-                    .arg("--json");
+                if let Some(sid) = session_id {
+                    cmd.arg("exec").arg("resume").arg(sid);
+                    if !message.is_empty() {
+                        cmd.arg(message);
+                    }
+                } else {
+                    cmd.arg("exec").arg(message);
+                }
+                cmd.arg("--sandbox").arg(sandbox);
+                if *stream_json {
+                    cmd.arg("--json");
+                }
+                if *skip_git_repo_check {
+                    cmd.arg("--skip-git-repo-check");
+                }
+                if *ephemeral {
+                    cmd.arg("--ephemeral");
+                }
+                if let Some(m) = model {
+                    cmd.arg("--model").arg(m);
+                }
+                for arg in extra_args {
+                    cmd.arg(arg);
+                }
                 if let Some(dir) = working_dir {
                     cmd.current_dir(dir);
                 }
@@ -539,7 +583,13 @@ impl CliProfile {
                     plain_result(stdout, exit_code)
                 }
             }
-            Self::Codex { .. } => parse_generic_json(stdout, exit_code, "result", "session_id"),
+            Self::Codex { stream_json, .. } => {
+                if *stream_json {
+                    parse_codex_stream_json_stdout(stdout, exit_code)
+                } else {
+                    parse_generic_json(stdout, exit_code, "result", "session_id")
+                }
+            }
             Self::Custom {
                 json_output,
                 text_field,
@@ -615,8 +665,13 @@ impl CliProfile {
                      launcher={launcher:?}"
                 )
             }
-            Self::Codex { bin, approval_mode } => {
-                format!("codex:{bin}:approval={approval_mode}")
+            Self::Codex {
+                bin,
+                sandbox,
+                stream_json,
+                ..
+            } => {
+                format!("codex:{bin}:sandbox={sandbox}:stream={stream_json}")
             }
             Self::Custom {
                 bin,
@@ -631,7 +686,8 @@ impl CliProfile {
         match self {
             Self::Astra { model, .. }
             | Self::Claude { model, .. }
-            | Self::Copilot { model, .. } => model.as_deref(),
+            | Self::Copilot { model, .. }
+            | Self::Codex { model, .. } => model.as_deref(),
             _ => None,
         }
     }
@@ -640,7 +696,8 @@ impl CliProfile {
         match self {
             Self::Astra { model, .. }
             | Self::Claude { model, .. }
-            | Self::Copilot { model, .. } => {
+            | Self::Copilot { model, .. }
+            | Self::Codex { model, .. } => {
                 *model = Some(model_name);
             }
             _ => {}
@@ -1192,9 +1249,191 @@ fn parse_copilot_jsonl_line(line: &str) -> Option<CliProgress> {
     }
 }
 
-fn parse_stdout_jsonl_line(line: &str) -> Option<CliProgress> {
+/// Parse accumulated stdout of a Codex `--json` (JSONL streaming) run.
+///
+/// Codex exec --json emits these event types:
+///   - `thread.started`: session init with thread_id
+///   - `turn.started` / `turn.completed`: turn lifecycle with usage
+///   - `item.started` / `item.updated` / `item.completed`: content items
+///   - `error`: error events
+///
+/// Item types: agent_message, reasoning, command_execution, file_change, mcp_tool_call
+fn parse_codex_stream_json_stdout(stdout: &str, exit_code: i32) -> CliResult {
+    let mut session_id: Option<String> = None;
+    let mut text = String::new();
+    let mut tokens_prompt: Option<u64> = None;
+    let mut tokens_completion: Option<u64> = None;
+    let mut tools_used: Vec<String> = Vec::new();
+    let mut tool_use_count: u32 = 0;
+
+    for line in stdout.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        match v["type"].as_str() {
+            Some("thread.started") => {
+                session_id = v["thread_id"].as_str().map(String::from);
+            }
+            Some("turn.completed") => {
+                let usage = &v["usage"];
+                tokens_prompt = usage["input_tokens"]
+                    .as_u64()
+                    .or_else(|| usage["cached_input_tokens"].as_u64());
+                tokens_completion = usage["output_tokens"]
+                    .as_u64()
+                    .or_else(|| usage["reasoning_output_tokens"].as_u64());
+            }
+            Some("item.completed") => {
+                let item = &v["item"];
+                match item["type"].as_str() {
+                    Some("agent_message") => {
+                        if let Some(t) = item["text"].as_str() {
+                            if !text.is_empty() {
+                                text.push('\n');
+                            }
+                            text.push_str(t);
+                        }
+                    }
+                    Some("command_execution") => {
+                        tool_use_count += 1;
+                        if !tools_used.iter().any(|n| n == "command_execution") {
+                            tools_used.push("command_execution".to_string());
+                        }
+                    }
+                    Some("file_change") => {
+                        tool_use_count += 1;
+                        if !tools_used.iter().any(|n| n == "file_change") {
+                            tools_used.push("file_change".to_string());
+                        }
+                    }
+                    Some("mcp_tool_call") => {
+                        tool_use_count += 1;
+                        let tool_name =
+                            item["tool"].as_str().unwrap_or("mcp_tool").to_string();
+                        if !tools_used.iter().any(|n| n == &tool_name) {
+                            tools_used.push(tool_name);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if !text.is_empty() || session_id.is_some() {
+        let tool_calls_count = if tool_use_count == 0 {
+            None
+        } else {
+            Some(tool_use_count)
+        };
+        CliResult {
+            stdout: String::new(),
+            stderr: String::new(),
+            exit_code,
+            success: exit_code == 0,
+            error_kind: default_error_kind(exit_code),
+            trace_id: None,
+            request_id: None,
+            run_id: None,
+            session_id,
+            text: if text.is_empty() { None } else { Some(text) },
+            tool_calls_count,
+            tools_used,
+            tokens_prompt,
+            tokens_completion,
+        }
+    } else {
+        plain_result(stdout, exit_code)
+    }
+}
+
+/// Parse a single stdout JSONL line from Codex `--json` into a progress event.
+///
+/// Codex events: thread.started, turn.started, turn.completed, item.started,
+/// item.updated, item.completed, error.
+fn parse_codex_stream_json_line(line: &str) -> Option<CliProgress> {
+    let v = serde_json::from_str::<serde_json::Value>(line).ok()?;
+    match v["type"].as_str()? {
+        "item.started" | "item.updated" => {
+            let item = &v["item"];
+            match item["type"].as_str() {
+                Some("agent_message") => {
+                    if let Some(t) = item["text"].as_str()
+                        && !t.is_empty()
+                    {
+                        return Some(CliProgress::Token(t.to_string()));
+                    }
+                }
+                Some("reasoning") => {
+                    return Some(CliProgress::Thinking(true));
+                }
+                Some("command_execution") => {
+                    let cmd = item["command"].as_str().unwrap_or("shell").to_string();
+                    return Some(CliProgress::ToolStarted { name: cmd });
+                }
+                Some("file_change") => {
+                    return Some(CliProgress::ToolStarted {
+                        name: "file_change".to_string(),
+                    });
+                }
+                Some("mcp_tool_call") => {
+                    let tool = item["tool"].as_str().unwrap_or("mcp_tool").to_string();
+                    return Some(CliProgress::ToolStarted { name: tool });
+                }
+                _ => {}
+            }
+            None
+        }
+        "item.completed" => {
+            let item = &v["item"];
+            match item["type"].as_str() {
+                Some("command_execution") => {
+                    let cmd = item["command"].as_str().unwrap_or("shell").to_string();
+                    return Some(CliProgress::ToolDone {
+                        name: cmd,
+                        duration_ms: None,
+                    });
+                }
+                Some("file_change") => {
+                    return Some(CliProgress::ToolDone {
+                        name: "file_change".to_string(),
+                        duration_ms: None,
+                    });
+                }
+                Some("mcp_tool_call") => {
+                    let tool = item["tool"].as_str().unwrap_or("mcp_tool").to_string();
+                    return Some(CliProgress::ToolDone {
+                        name: tool,
+                        duration_ms: None,
+                    });
+                }
+                Some("reasoning") => {
+                    return Some(CliProgress::Thinking(false));
+                }
+                _ => {}
+            }
+            None
+        }
+        "turn.started" => Some(CliProgress::Status("codex turn started".to_string())),
+        "error" => {
+            let msg = v["message"].as_str().unwrap_or("unknown error").to_string();
+            Some(CliProgress::Status(format!("[error] {msg}")))
+        }
+        _ => None,
+    }
+}
+
+fn parse_stdout_jsonl_line(line: &str, cli_name: &str) -> Option<CliProgress> {
     let line = strip_leading_osc(line.trim()).trim();
-    parse_claude_stream_json_line(line).or_else(|| parse_copilot_jsonl_line(line))
+    match cli_name {
+        "codex" => parse_codex_stream_json_line(line),
+        _ => parse_claude_stream_json_line(line).or_else(|| parse_copilot_jsonl_line(line)),
+    }
 }
 
 fn strip_leading_osc(mut s: &str) -> &str {
@@ -1446,6 +1685,9 @@ pub async fn run_cli_with_cancel(
         } | CliProfile::Copilot {
             stream_json: true,
             ..
+        } | CliProfile::Codex {
+            stream_json: true,
+            ..
         }
     );
     let (stdout_text, stderr_text, exit_code) = if stream_stdout {
@@ -1549,6 +1791,7 @@ async fn run_child_with_cancel_inner(
         collected
     });
 
+    let cli_name = name.to_string();
     let stdout_task = tokio::spawn(async move {
         let reader = BufReader::new(stdout);
         let mut lines = reader.lines();
@@ -1559,7 +1802,7 @@ async fn run_child_with_cancel_inner(
             }
             output.push_str(&line);
             if let Some(ref tx) = stdout_progress_tx
-                && let Some(ev) = parse_stdout_jsonl_line(&line)
+                && let Some(ev) = parse_stdout_jsonl_line(&line, &cli_name)
             {
                 let _ = tx.send(ev).await;
             }
@@ -2649,7 +2892,7 @@ printf '%s\n' '{"type":"assistant.message_delta","data":{"deltaContent":"from sc
     fn parse_copilot_reasoning_delta_progress() {
         let line = r#"{"type":"assistant.reasoning_delta","data":{"deltaContent":"checking context"},"id":"r1"}"#;
         assert!(matches!(
-            parse_stdout_jsonl_line(line),
+            parse_stdout_jsonl_line(line, "copilot"),
             Some(CliProgress::ReasoningBlock { kind: ReasoningKind::Raw, text }) if text == "checking context"
         ));
     }
@@ -2658,7 +2901,7 @@ printf '%s\n' '{"type":"assistant.message_delta","data":{"deltaContent":"from sc
     fn parse_claude_thinking_block_progress() {
         let line = r#"{"type":"assistant","message":{"content":[{"type":"thinking","thinking":"considering options"}]}}"#;
         assert!(matches!(
-            parse_stdout_jsonl_line(line),
+            parse_stdout_jsonl_line(line, "claude"),
             Some(CliProgress::ReasoningBlock { kind: ReasoningKind::Raw, text }) if text == "considering options"
         ));
     }
@@ -2686,6 +2929,258 @@ printf '%s\n' '{"type":"assistant.message_delta","data":{"deltaContent":"from sc
     fn parse_status_event() {
         let line = r#"{"type":"status","text":"compiling..."}"#;
         assert!(matches!(parse_stderr_line(line), CliProgress::Status(t) if t == "compiling..."));
+    }
+
+    // ── Codex JSONL parsing ──────────────────────────────────────────
+
+    #[test]
+    fn parse_codex_stream_thread_started() {
+        let stdout = r#"{"type":"thread.started","thread_id":"th-abc123"}"#;
+        let r = parse_codex_stream_json_stdout(stdout, 0);
+        assert_eq!(r.session_id.as_deref(), Some("th-abc123"));
+    }
+
+    #[test]
+    fn parse_codex_stream_full_session() {
+        let stdout = concat!(
+            r#"{"type":"thread.started","thread_id":"th-001"}"#, "\n",
+            r#"{"type":"turn.started","turn_id":"t1"}"#, "\n",
+            r#"{"type":"item.started","item":{"type":"agent_message","text":""}}"#, "\n",
+            r#"{"type":"item.completed","item":{"type":"agent_message","text":"Hello from Codex!"}}"#, "\n",
+            r#"{"type":"item.started","item":{"type":"command_execution","command":"ls -la"}}"#, "\n",
+            r#"{"type":"item.completed","item":{"type":"command_execution","command":"ls -la","exit_code":0}}"#, "\n",
+            r#"{"type":"item.completed","item":{"type":"file_change","path":"src/main.rs"}}"#, "\n",
+            r#"{"type":"item.completed","item":{"type":"mcp_tool_call","tool":"search"}}"#, "\n",
+            r#"{"type":"turn.completed","usage":{"input_tokens":500,"output_tokens":120}}"#, "\n",
+        );
+        let r = parse_codex_stream_json_stdout(stdout, 0);
+        assert!(r.success);
+        assert_eq!(r.session_id.as_deref(), Some("th-001"));
+        assert_eq!(r.text.as_deref(), Some("Hello from Codex!"));
+        assert_eq!(r.tool_calls_count, Some(3));
+        assert_eq!(r.tools_used, vec!["command_execution", "file_change", "search"]);
+        assert_eq!(r.tokens_prompt, Some(500));
+        assert_eq!(r.tokens_completion, Some(120));
+    }
+
+    #[test]
+    fn parse_codex_stream_line_item_started_message() {
+        let line = r#"{"type":"item.started","item":{"type":"agent_message","text":"thinking..."}}"#;
+        assert!(matches!(
+            parse_codex_stream_json_line(line),
+            Some(CliProgress::Token(t)) if t == "thinking..."
+        ));
+    }
+
+    #[test]
+    fn parse_codex_stream_line_reasoning() {
+        let line = r#"{"type":"item.started","item":{"type":"reasoning"}}"#;
+        assert!(matches!(
+            parse_codex_stream_json_line(line),
+            Some(CliProgress::Thinking(true))
+        ));
+    }
+
+    #[test]
+    fn parse_codex_stream_line_reasoning_completed() {
+        let line = r#"{"type":"item.completed","item":{"type":"reasoning"}}"#;
+        assert!(matches!(
+            parse_codex_stream_json_line(line),
+            Some(CliProgress::Thinking(false))
+        ));
+    }
+
+    #[test]
+    fn parse_codex_stream_line_command_started() {
+        let line = r#"{"type":"item.started","item":{"type":"command_execution","command":"cargo test"}}"#;
+        assert!(matches!(
+            parse_codex_stream_json_line(line),
+            Some(CliProgress::ToolStarted { name }) if name == "cargo test"
+        ));
+    }
+
+    #[test]
+    fn parse_codex_stream_line_command_completed() {
+        let line = r#"{"type":"item.completed","item":{"type":"command_execution","command":"cargo test"}}"#;
+        assert!(matches!(
+            parse_codex_stream_json_line(line),
+            Some(CliProgress::ToolDone { name, duration_ms: None }) if name == "cargo test"
+        ));
+    }
+
+    #[test]
+    fn parse_codex_stream_line_file_change() {
+        let line = r#"{"type":"item.started","item":{"type":"file_change","path":"src/lib.rs"}}"#;
+        assert!(matches!(
+            parse_codex_stream_json_line(line),
+            Some(CliProgress::ToolStarted { name }) if name == "file_change"
+        ));
+    }
+
+    #[test]
+    fn parse_codex_stream_line_mcp_tool() {
+        let line = r#"{"type":"item.started","item":{"type":"mcp_tool_call","tool":"web_search"}}"#;
+        assert!(matches!(
+            parse_codex_stream_json_line(line),
+            Some(CliProgress::ToolStarted { name }) if name == "web_search"
+        ));
+    }
+
+    #[test]
+    fn parse_codex_stream_line_turn_started() {
+        let line = r#"{"type":"turn.started","turn_id":"t1"}"#;
+        assert!(matches!(
+            parse_codex_stream_json_line(line),
+            Some(CliProgress::Status(s)) if s.contains("codex turn started")
+        ));
+    }
+
+    #[test]
+    fn parse_codex_stream_line_error() {
+        let line = r#"{"type":"error","message":"rate limit exceeded"}"#;
+        assert!(matches!(
+            parse_codex_stream_json_line(line),
+            Some(CliProgress::Status(s)) if s.contains("rate limit exceeded")
+        ));
+    }
+
+    #[test]
+    fn parse_codex_non_streaming_fallback() {
+        let stdout = r#"{"result":"done","session_id":"sid-xyz"}"#;
+        let r = parse_generic_json(stdout, 0, "result", "session_id");
+        assert_eq!(r.text.as_deref(), Some("done"));
+        assert_eq!(r.session_id.as_deref(), Some("sid-xyz"));
+    }
+
+    // ── Codex command building ─────────────────────────────────────
+
+    #[test]
+    fn build_codex_exec_command() {
+        let p = CliProfile::Codex {
+            bin: "codex".into(),
+            model: Some("o3".into()),
+            sandbox: "workspace-write".into(),
+            stream_json: true,
+            extra_args: vec![],
+            skip_git_repo_check: false,
+            ephemeral: false,
+        };
+        let cmd = p.build_command("fix the bug", None, None);
+        let args: Vec<_> = cmd.as_std().get_args().collect();
+        assert_eq!(cmd.as_std().get_program(), std::ffi::OsStr::new("codex"));
+        assert!(args.contains(&std::ffi::OsStr::new("exec")));
+        assert!(args.contains(&std::ffi::OsStr::new("fix the bug")));
+        assert!(args.contains(&std::ffi::OsStr::new("--sandbox")));
+        assert!(args.contains(&std::ffi::OsStr::new("workspace-write")));
+        assert!(args.contains(&std::ffi::OsStr::new("--json")));
+        assert!(args.contains(&std::ffi::OsStr::new("--model")));
+        assert!(args.contains(&std::ffi::OsStr::new("o3")));
+    }
+
+    #[test]
+    fn build_codex_resume_command() {
+        let p = CliProfile::Codex {
+            bin: "codex".into(),
+            model: None,
+            sandbox: "read-only".into(),
+            stream_json: true,
+            extra_args: vec![],
+            skip_git_repo_check: true,
+            ephemeral: true,
+        };
+        let cmd = p.build_command("follow up", Some("th-abc123"), None);
+        let args: Vec<_> = cmd.as_std().get_args().collect();
+        assert!(args.contains(&std::ffi::OsStr::new("exec")));
+        assert!(args.contains(&std::ffi::OsStr::new("resume")));
+        assert!(args.contains(&std::ffi::OsStr::new("th-abc123")));
+        assert!(args.contains(&std::ffi::OsStr::new("follow up")));
+        assert!(args.contains(&std::ffi::OsStr::new("--skip-git-repo-check")));
+        assert!(args.contains(&std::ffi::OsStr::new("--ephemeral")));
+    }
+
+    #[test]
+    fn build_codex_no_json_without_stream() {
+        let p = CliProfile::Codex {
+            bin: "codex".into(),
+            model: None,
+            sandbox: "workspace-write".into(),
+            stream_json: false,
+            extra_args: vec!["--quiet".into()],
+            skip_git_repo_check: false,
+            ephemeral: false,
+        };
+        let cmd = p.build_command("hello", None, None);
+        let args: Vec<_> = cmd.as_std().get_args().collect();
+        assert!(!args.contains(&std::ffi::OsStr::new("--json")));
+        assert!(args.contains(&std::ffi::OsStr::new("--quiet")));
+    }
+
+    // ── Codex profile deserialization ──────────────────────────────
+
+    #[test]
+    fn deserialize_codex_profile_full() {
+        let yaml = r#"type: codex
+bin: /usr/local/bin/codex
+model: o3
+sandbox: danger-full-access
+stream_json: true
+skip_git_repo_check: true
+ephemeral: true
+extra_args:
+  - --quiet"#;
+        let p: CliProfile = serde_yaml_ng::from_str(yaml).unwrap();
+        assert_eq!(p.name(), "codex");
+        assert_eq!(p.model_name(), Some("o3"));
+        match p {
+            CliProfile::Codex {
+                sandbox,
+                stream_json,
+                skip_git_repo_check,
+                ephemeral,
+                extra_args,
+                ..
+            } => {
+                assert_eq!(sandbox, "danger-full-access");
+                assert!(stream_json);
+                assert!(skip_git_repo_check);
+                assert!(ephemeral);
+                assert_eq!(extra_args, vec!["--quiet"]);
+            }
+            other => panic!("expected codex profile, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn deserialize_codex_profile_minimal() {
+        let yaml = "type: codex";
+        let p: CliProfile = serde_yaml_ng::from_str(yaml).unwrap();
+        assert_eq!(p.name(), "codex");
+        match p {
+            CliProfile::Codex {
+                bin,
+                model,
+                sandbox,
+                stream_json,
+                ..
+            } => {
+                assert_eq!(bin, "codex");
+                assert_eq!(model, None);
+                assert_eq!(sandbox, "workspace-write");
+                assert!(!stream_json);
+            }
+            other => panic!("expected codex profile, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn codex_dispatch_via_parse_stdout_jsonl_line() {
+        let line = r#"{"type":"item.started","item":{"type":"agent_message","text":"hi"}}"#;
+        assert!(matches!(
+            parse_stdout_jsonl_line(line, "codex"),
+            Some(CliProgress::Token(t)) if t == "hi"
+        ));
+        // Same line should NOT parse via claude/copilot path
+        assert!(parse_stdout_jsonl_line(line, "claude").is_none());
     }
 
     // ── Cancellation tests ─────────────────────────────────────────────
