@@ -1312,8 +1312,7 @@ fn parse_codex_stream_json_stdout(stdout: &str, exit_code: i32) -> CliResult {
                     }
                     Some("mcp_tool_call") => {
                         tool_use_count += 1;
-                        let tool_name =
-                            item["tool"].as_str().unwrap_or("mcp_tool").to_string();
+                        let tool_name = item["tool"].as_str().unwrap_or("mcp_tool").to_string();
                         if !tools_used.iter().any(|n| n == &tool_name) {
                             tools_used.push(tool_name);
                         }
@@ -1751,7 +1750,9 @@ async fn run_child_with_cancel_inner(
     name: &str,
     stream_stdout: bool,
 ) -> Result<(String, String, i32), String> {
-    cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
 
     let mut child = cmd
         .spawn()
@@ -2943,29 +2944,42 @@ printf '%s\n' '{"type":"assistant.message_delta","data":{"deltaContent":"from sc
     #[test]
     fn parse_codex_stream_full_session() {
         let stdout = concat!(
-            r#"{"type":"thread.started","thread_id":"th-001"}"#, "\n",
-            r#"{"type":"turn.started","turn_id":"t1"}"#, "\n",
-            r#"{"type":"item.started","item":{"type":"agent_message","text":""}}"#, "\n",
-            r#"{"type":"item.completed","item":{"type":"agent_message","text":"Hello from Codex!"}}"#, "\n",
-            r#"{"type":"item.started","item":{"type":"command_execution","command":"ls -la"}}"#, "\n",
-            r#"{"type":"item.completed","item":{"type":"command_execution","command":"ls -la","exit_code":0}}"#, "\n",
-            r#"{"type":"item.completed","item":{"type":"file_change","path":"src/main.rs"}}"#, "\n",
-            r#"{"type":"item.completed","item":{"type":"mcp_tool_call","tool":"search"}}"#, "\n",
-            r#"{"type":"turn.completed","usage":{"input_tokens":500,"output_tokens":120}}"#, "\n",
+            r#"{"type":"thread.started","thread_id":"th-001"}"#,
+            "\n",
+            r#"{"type":"turn.started","turn_id":"t1"}"#,
+            "\n",
+            r#"{"type":"item.started","item":{"type":"agent_message","text":""}}"#,
+            "\n",
+            r#"{"type":"item.completed","item":{"type":"agent_message","text":"Hello from Codex!"}}"#,
+            "\n",
+            r#"{"type":"item.started","item":{"type":"command_execution","command":"ls -la"}}"#,
+            "\n",
+            r#"{"type":"item.completed","item":{"type":"command_execution","command":"ls -la","exit_code":0}}"#,
+            "\n",
+            r#"{"type":"item.completed","item":{"type":"file_change","path":"src/main.rs"}}"#,
+            "\n",
+            r#"{"type":"item.completed","item":{"type":"mcp_tool_call","tool":"search"}}"#,
+            "\n",
+            r#"{"type":"turn.completed","usage":{"input_tokens":500,"output_tokens":120}}"#,
+            "\n",
         );
         let r = parse_codex_stream_json_stdout(stdout, 0);
         assert!(r.success);
         assert_eq!(r.session_id.as_deref(), Some("th-001"));
         assert_eq!(r.text.as_deref(), Some("Hello from Codex!"));
         assert_eq!(r.tool_calls_count, Some(3));
-        assert_eq!(r.tools_used, vec!["command_execution", "file_change", "search"]);
+        assert_eq!(
+            r.tools_used,
+            vec!["command_execution", "file_change", "search"]
+        );
         assert_eq!(r.tokens_prompt, Some(500));
         assert_eq!(r.tokens_completion, Some(120));
     }
 
     #[test]
     fn parse_codex_stream_line_item_started_message() {
-        let line = r#"{"type":"item.started","item":{"type":"agent_message","text":"thinking..."}}"#;
+        let line =
+            r#"{"type":"item.started","item":{"type":"agent_message","text":"thinking..."}}"#;
         assert!(matches!(
             parse_codex_stream_json_line(line),
             Some(CliProgress::Token(t)) if t == "thinking..."
@@ -2992,7 +3006,8 @@ printf '%s\n' '{"type":"assistant.message_delta","data":{"deltaContent":"from sc
 
     #[test]
     fn parse_codex_stream_line_command_started() {
-        let line = r#"{"type":"item.started","item":{"type":"command_execution","command":"cargo test"}}"#;
+        let line =
+            r#"{"type":"item.started","item":{"type":"command_execution","command":"cargo test"}}"#;
         assert!(matches!(
             parse_codex_stream_json_line(line),
             Some(CliProgress::ToolStarted { name }) if name == "cargo test"
