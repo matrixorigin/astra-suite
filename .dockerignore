@@ -1,5 +1,0 @@
-target/
-.git/
-*.log
-gateway.yaml
-data/
