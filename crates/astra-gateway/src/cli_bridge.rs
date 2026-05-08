@@ -987,28 +987,9 @@ fn parse_claude_stream_json_line(line: &str) -> Option<CliProgress> {
     let v = serde_json::from_str::<serde_json::Value>(line).ok()?;
     match v["type"].as_str()? {
         // Assistant message — used for tool_use/tool_result detection.
-        // Text tokens are now handled via stream_event/content_block_delta above.
-        "assistant" => {
-            let content = v["message"]["content"].as_array()?;
-            for block in content {
-                match block["type"].as_str() {
-                    Some("text") => {
-                        // Skip — already emitted token-by-token via stream_event deltas.
-                    }
-                    Some("tool_use") | Some("tool_result") => {
-                        // Skip — already handled via stream_event/content_block_start.
-                    }
-                    Some("thinking")
-                    | Some("reasoning")
-                    | Some("thinking_summary")
-                    | Some("reasoning_summary") => {
-                        // Skip — already handled via stream_event/content_block_delta.
-                    }
-                    _ => {}
-                }
-            }
-            None
-        }
+        // All assistant content blocks are already handled via stream_event deltas.
+        // Tool tracking for final stats is done in parse_claude_stream_json_stdout.
+        "assistant" => None,
         // Real-time streaming events from --include-partial-messages.
         // content_block_delta carries incremental text tokens as they're generated.
         "stream_event" => {

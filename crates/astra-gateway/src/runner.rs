@@ -871,7 +871,7 @@ impl GatewayRunner {
         }
 
         // Request tag for user-facing message correlation
-        let _ = self.request_counter.fetch_add(1, Ordering::Relaxed) + 1;
+        self.request_counter.fetch_add(1, Ordering::Relaxed);
         let request_tag = session_id
             .as_deref()
             .and_then(|s| s.get(s.len().saturating_sub(8)..))
@@ -1146,6 +1146,9 @@ impl GatewayRunner {
             let Some(tx) = tx else {
                 return;
             };
+            if stream_id.is_none() {
+                return;
+            }
             if accumulated.is_empty() && !finish {
                 return;
             }
@@ -1210,19 +1213,20 @@ impl GatewayRunner {
                                 if allow_answer_progressive_flush
                                     && token_buf.len() >= next_flush_at
                                 {
+                                    // Check if appending would exceed stream limit — if so, close current stream first
+                                    if stream_id.is_some()
+                                        && accumulated.len() + token_buf.len() > STREAM_MAX_BYTES
+                                    {
+                                        send_stream(&accumulated, &self.outbound_tx, msg.platform, &chat_id, reply_token.clone(), stream_id.clone(), true);
+                                        accumulated.clear();
+                                        stream_id = reply_token.as_ref().map(|_| uuid::Uuid::new_v4().to_string());
+                                    }
                                     accumulated.push_str(&token_buf);
                                     token_buf.clear();
                                     next_flush_at = 5 + (rand::random::<u8>() % 16) as usize;
                                     _chunk_counter += 1;
                                     progressive_text_len = accumulated.len();
-                                    // If accumulated exceeds stream limit, close current stream and start a new one
-                                    if accumulated.len() > STREAM_MAX_BYTES {
-                                        send_stream(&accumulated, &self.outbound_tx, msg.platform, &chat_id, reply_token.clone(), stream_id.clone(), true);
-                                        accumulated.clear();
-                                        stream_id = reply_token.as_ref().map(|_| uuid::Uuid::new_v4().to_string());
-                                    } else {
-                                        send_stream(&accumulated, &self.outbound_tx, msg.platform, &chat_id, reply_token.clone(), stream_id.clone(), false);
-                                    }
+                                    send_stream(&accumulated, &self.outbound_tx, msg.platform, &chat_id, reply_token.clone(), stream_id.clone(), false);
                                 }
                             }
                         }
@@ -2661,17 +2665,8 @@ async fn send_text_to_platform(
     let chunks = split_message(text);
     let chunk_count = chunks.len();
     for (i, chunk) in chunks.into_iter().enumerate() {
-        let is_last = i == chunk_count - 1;
-        if let Err(e) = adapter
-            .send_stream_chunk(
-                chat_id,
-                chunk,
-                reply_token,
-                stream_id,
-                stream_finish && is_last,
-            )
-            .await
-        {
+        let _is_last = i == chunk_count - 1;
+        if let Err(e) = adapter.send_text(chat_id, chunk, reply_token).await {
             tracing::warn!(platform, chat_id = %safe_id(chat_id), error = %e, "failed to send platform message");
             return Err((i, e));
         }
@@ -5947,7 +5942,16 @@ mod stream_tests {
             Ok(())
         }
         async fn stop(&mut self) {}
-        async fn send_text(&self, _: &str, _: &str, _: Option<&str>) -> Result<(), String> {
+        async fn send_text(
+            &self,
+            _chat_id: &str,
+            text: &str,
+            _reply_token: Option<&str>,
+        ) -> Result<(), String> {
+            self.frames
+                .lock()
+                .await
+                .push((text.to_string(), None, true));
             Ok(())
         }
         async fn send_stream_chunk(

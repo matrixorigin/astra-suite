@@ -323,11 +323,8 @@ async fn wait_reconnect_delay(
 }
 
 fn build_send_frame(bot_id: &str, out: &OutboundMessage) -> Value {
-    if let Some(ref req_id) = out.reply_token {
-        let stream_id = out
-            .stream_id
-            .clone()
-            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    if let (Some(req_id), Some(stream_id)) = (&out.reply_token, &out.stream_id) {
+        // Streaming reply (full-replacement semantics)
         json!({
             "cmd": "aibot_respond_msg",
             "headers": {"req_id": req_id},
@@ -338,6 +335,16 @@ fn build_send_frame(bot_id: &str, out: &OutboundMessage) -> Value {
                     "finish": out.stream_finish,
                     "content": &out.text
                 }
+            }
+        })
+    } else if let Some(ref req_id) = out.reply_token {
+        // Non-stream reply (one-shot markdown via respond)
+        json!({
+            "cmd": "aibot_respond_msg",
+            "headers": {"req_id": req_id},
+            "body": {
+                "msgtype": "markdown",
+                "markdown": {"content": &out.text}
             }
         })
     } else if !out.chat_id.is_empty() {
@@ -428,16 +435,23 @@ async fn handle_wecom_message(
 }
 
 fn strip_at_mentions(text: &str) -> String {
-    // Remove all @mentions (format: @name followed by space or end of string).
-    // WeCom sends "@BotName actual message" in group chats.
-    let mut result = text.to_string();
-    while let Some(start) = result.find('@') {
-        let rest = &result[start + 1..];
-        let end = rest
-            .find(' ')
-            .map(|i| start + 1 + i + 1)
-            .unwrap_or(result.len());
-        result = format!("{}{}", &result[..start], &result[end..]);
+    // Remove @mentions only at word boundaries (start of string or after whitespace).
+    // WeCom group messages arrive as "@BotName actual message".
+    // Preserves @-signs in emails, code, etc.
+    let mut result = String::with_capacity(text.len());
+    let mut chars = text.char_indices().peekable();
+    while let Some((i, ch)) = chars.next() {
+        if ch == '@' && (i == 0 || text.as_bytes()[i - 1] == b' ') {
+            // Skip the mention token (until next space or end)
+            while let Some(&(_, c)) = chars.peek() {
+                if c == ' ' {
+                    break;
+                }
+                chars.next();
+            }
+        } else {
+            result.push(ch);
+        }
     }
     result.trim().to_string()
 }
@@ -863,6 +877,8 @@ mod tests {
         assert_eq!(strip_at_mentions("@Bot"), "");
         assert_eq!(strip_at_mentions("你好"), "你好");
         assert_eq!(strip_at_mentions("@A @B 消息"), "消息");
-        assert_eq!(strip_at_mentions("hello @user world"), "hello world");
+        assert_eq!(strip_at_mentions("hello @user world"), "hello  world");
+        // Preserves @ in emails/code (not at word boundary)
+        assert_eq!(strip_at_mentions("test@example.com"), "test@example.com");
     }
 }
