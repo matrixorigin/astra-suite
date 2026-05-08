@@ -25,6 +25,7 @@ use tokio_util::sync::CancellationToken;
 const MAX_CHUNK_LEN: usize = 3800;
 const INITIAL_ACK_DELAY: Duration = Duration::from_secs(3);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(25);
+#[allow(dead_code)]
 const PROGRESSIVE_FLUSH_INTERVAL: Duration = Duration::from_secs(8);
 const PROGRESSIVE_MIN_CHARS: usize = 200;
 
@@ -35,6 +36,7 @@ const SEND_FAILURE_THRESHOLD: u32 = 3;
 /// without a success call. This matters for long-running tasks that recover
 /// the platform but don't emit sends (so `record_success` is never called).
 /// Without the cooldown, such tasks would stay silent forever.
+#[allow(dead_code)]
 const SEND_FAILURE_COOLDOWN: Duration = Duration::from_secs(60);
 
 /// Injectable clock so cooldown tests don't need real sleeps.
@@ -200,6 +202,7 @@ impl SendCircuitBreaker {
         }
     }
 
+    #[allow(dead_code)]
     fn is_open(&self, key: &str) -> bool {
         let Some(entry) = self.state.get(key) else {
             return false;
@@ -1049,7 +1052,9 @@ impl GatewayRunner {
         let chat_id = effective_chat_id.clone();
         let reply_token = msg.reply_token.clone();
         // Shared stream_id for all chunks of this reply (WeCom streaming).
-        let mut stream_id = reply_token.as_ref().map(|_| uuid::Uuid::new_v4().to_string());
+        let mut stream_id = reply_token
+            .as_ref()
+            .map(|_| uuid::Uuid::new_v4().to_string());
         let cli_name = cli_profile.name().to_string();
         let cli_timeout = Duration::from_secs(self.config.cli_timeout_secs.max(1));
 
@@ -1101,18 +1106,18 @@ impl GatewayRunner {
         });
 
         let start = Instant::now();
-        let mut tool_count: u32 = 0;
-        let mut last_tool = String::new();
+        let mut _tool_count: u32 = 0;
+        let mut _last_tool = String::new();
         let mut sent_initial_ack = false;
         let mut token_buf = String::new();
         let mut reasoning_buf = String::new();
         let mut reasoning_kind = ReasoningKind::Raw;
-        let mut reasoning_chunk_counter: u32 = 0;
+        let mut _reasoning_chunk_counter: u32 = 0;
         let allow_answer_progressive_flush = answer_progressive_flush_enabled(reasoning_display);
         let mut think_filter = ThinkTagStreamFilter::default();
         let mut gateway_action_filter = GatewayActionStreamFilter::default();
         let mut progressive_text_len: usize = 0;
-        let mut chunk_counter: u32 = 0;
+        let mut _chunk_counter: u32 = 0;
         let next_timer = tokio::time::sleep(INITIAL_ACK_DELAY);
         tokio::pin!(next_timer);
 
@@ -1138,8 +1143,12 @@ impl GatewayRunner {
                            reply_token: Option<String>,
                            stream_id: Option<String>,
                            finish: bool| {
-            let Some(tx) = tx else { return; };
-            if accumulated.is_empty() && !finish { return; }
+            let Some(tx) = tx else {
+                return;
+            };
+            if accumulated.is_empty() && !finish {
+                return;
+            }
             let _ = tx.try_send(OutboundMessage::stream_chunk(
                 platform.to_string(),
                 chat.to_string(),
@@ -1161,12 +1170,18 @@ impl GatewayRunner {
          -> usize {
             let text = buf.trim().to_string();
             buf.clear();
-            if text.is_empty() { return 0; }
-            let Some(tx) = tx else { return 0; };
+            if text.is_empty() {
+                return 0;
+            }
+            let Some(tx) = tx else {
+                return 0;
+            };
             let title = reasoning_block_title(kind, agent_name);
             let block = format!("{title}\n{text}");
             let len = block.len();
-            if !accumulated.is_empty() { accumulated.push('\n'); }
+            if !accumulated.is_empty() {
+                accumulated.push('\n');
+            }
             accumulated.push_str(&block);
             let _ = tx.try_send(OutboundMessage::stream_chunk(
                 platform.to_string(),
@@ -1198,7 +1213,7 @@ impl GatewayRunner {
                                     accumulated.push_str(&token_buf);
                                     token_buf.clear();
                                     next_flush_at = 5 + (rand::random::<u8>() % 16) as usize;
-                                    chunk_counter += 1;
+                                    _chunk_counter += 1;
                                     progressive_text_len = accumulated.len();
                                     // If accumulated exceeds stream limit, close current stream and start a new one
                                     if accumulated.len() > STREAM_MAX_BYTES {
@@ -1212,20 +1227,20 @@ impl GatewayRunner {
                             }
                         }
                         Some(CliProgress::ToolStarted { ref name }) => {
-                            tool_count += 1;
-                            last_tool = name.clone();
+                            _tool_count += 1;
+                            _last_tool = name.clone();
                         }
                         Some(CliProgress::ToolDone { name, .. }) => {
-                            last_tool = name;
+                            _last_tool = name;
                         }
                         Some(CliProgress::ToolCall(line)) => {
-                            tool_count += 1;
-                            last_tool = line;
+                            _tool_count += 1;
+                            _last_tool = line;
                         }
                         Some(CliProgress::ReasoningBlock { kind, text }) => {
                             if reasoning_display.is_enabled() {
                                 if !reasoning_buf.is_empty() && reasoning_kind != kind {
-                                    reasoning_chunk_counter += 1;
+                                    _reasoning_chunk_counter += 1;
                                     let _ = flush_reasoning_buf(
                                         &mut reasoning_buf,
                                         &mut accumulated,
@@ -1241,7 +1256,7 @@ impl GatewayRunner {
                                 reasoning_kind = kind;
                                 reasoning_buf.push_str(&text);
                                 if reasoning_buf.len() >= PROGRESSIVE_MIN_CHARS {
-                                    reasoning_chunk_counter += 1;
+                                    _reasoning_chunk_counter += 1;
                                     let _ = flush_reasoning_buf(
                                         &mut reasoning_buf,
                                         &mut accumulated,
@@ -2609,6 +2624,7 @@ async fn recv_from_any(adapters: &[Box<dyn PlatformAdapter>]) -> Option<AdapterR
     Some(event)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn send_text_to_platform(
     adapters: &[Box<dyn PlatformAdapter>],
     adapter_indices: &HashMap<&'static str, usize>,
@@ -2631,7 +2647,10 @@ async fn send_text_to_platform(
     // Stream mode: send full text as one frame. WeCom stream semantics are
     // full-replacement per frame — splitting would corrupt the display.
     if stream_id.is_some() {
-        if let Err(e) = adapter.send_stream_chunk(chat_id, text, reply_token, stream_id, stream_finish).await {
+        if let Err(e) = adapter
+            .send_stream_chunk(chat_id, text, reply_token, stream_id, stream_finish)
+            .await
+        {
             tracing::warn!(platform, chat_id = %safe_id(chat_id), error = %e, "failed to send stream chunk");
             return Err((0, e));
         }
@@ -2643,7 +2662,16 @@ async fn send_text_to_platform(
     let chunk_count = chunks.len();
     for (i, chunk) in chunks.into_iter().enumerate() {
         let is_last = i == chunk_count - 1;
-        if let Err(e) = adapter.send_stream_chunk(chat_id, chunk, reply_token, stream_id, stream_finish && is_last).await {
+        if let Err(e) = adapter
+            .send_stream_chunk(
+                chat_id,
+                chunk,
+                reply_token,
+                stream_id,
+                stream_finish && is_last,
+            )
+            .await
+        {
             tracing::warn!(platform, chat_id = %safe_id(chat_id), error = %e, "failed to send platform message");
             return Err((i, e));
         }
@@ -5104,9 +5132,11 @@ async fn send_text_routes_to_matching_platform_only() {
         indices.insert(adapter.name(), idx);
     }
 
-    let sent = send_text_to_platform(&adapters, &indices, "weixin", "chat", "hello", None, None, true)
-        .await
-        .unwrap();
+    let sent = send_text_to_platform(
+        &adapters, &indices, "weixin", "chat", "hello", None, None, true,
+    )
+    .await
+    .unwrap();
     assert_eq!(sent, 1);
 
     assert!(wecom_sent.lock().await.is_empty());
@@ -5901,6 +5931,7 @@ mod db_retry_tests {
 mod stream_tests {
     use super::*;
 
+    #[allow(clippy::type_complexity)]
     struct StreamRecordingAdapter {
         name: &'static str,
         frames: std::sync::Arc<tokio::sync::Mutex<Vec<(String, Option<String>, bool)>>>,
@@ -5909,10 +5940,16 @@ mod stream_tests {
 
     #[async_trait::async_trait]
     impl PlatformAdapter for StreamRecordingAdapter {
-        fn name(&self) -> &'static str { self.name }
-        async fn start(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) }
+        fn name(&self) -> &'static str {
+            self.name
+        }
+        async fn start(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            Ok(())
+        }
         async fn stop(&mut self) {}
-        async fn send_text(&self, _: &str, _: &str, _: Option<&str>) -> Result<(), String> { Ok(()) }
+        async fn send_text(&self, _: &str, _: &str, _: Option<&str>) -> Result<(), String> {
+            Ok(())
+        }
         async fn send_stream_chunk(
             &self,
             _chat_id: &str,
@@ -5921,11 +5958,10 @@ mod stream_tests {
             stream_id: Option<&str>,
             finish: bool,
         ) -> Result<(), String> {
-            self.frames.lock().await.push((
-                text.to_string(),
-                stream_id.map(String::from),
-                finish,
-            ));
+            self.frames
+                .lock()
+                .await
+                .push((text.to_string(), stream_id.map(String::from), finish));
             Ok(())
         }
         async fn recv(&self) -> Option<InboundMessage> {
@@ -5937,13 +5973,11 @@ mod stream_tests {
     async fn stream_mode_never_splits_large_content() {
         let frames = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new()));
         let (_tx, rx) = tokio::sync::mpsc::channel(1);
-        let adapters: Vec<Box<dyn PlatformAdapter>> = vec![
-            Box::new(StreamRecordingAdapter {
-                name: "wecom",
-                frames: frames.clone(),
-                rx: tokio::sync::Mutex::new(rx),
-            }),
-        ];
+        let adapters: Vec<Box<dyn PlatformAdapter>> = vec![Box::new(StreamRecordingAdapter {
+            name: "wecom",
+            frames: frames.clone(),
+            rx: tokio::sync::Mutex::new(rx),
+        })];
         let mut indices = HashMap::new();
         indices.insert("wecom", 0usize);
 
@@ -5952,26 +5986,49 @@ mod stream_tests {
 
         // Stream mode: should NOT split
         send_text_to_platform(
-            &adapters, &indices, "wecom", "chat", &long_text,
-            Some("req-1"), Some("stream-1"), false,
-        ).await.unwrap();
+            &adapters,
+            &indices,
+            "wecom",
+            "chat",
+            &long_text,
+            Some("req-1"),
+            Some("stream-1"),
+            false,
+        )
+        .await
+        .unwrap();
 
         let recorded = frames.lock().await;
         assert_eq!(recorded.len(), 1, "stream mode must send exactly 1 frame");
-        assert_eq!(recorded[0].0.len(), 6000, "full content must be sent unsplit");
+        assert_eq!(
+            recorded[0].0.len(),
+            6000,
+            "full content must be sent unsplit"
+        );
         assert_eq!(recorded[0].1.as_deref(), Some("stream-1"));
-        assert_eq!(recorded[0].2, false);
+        assert!(!recorded[0].2);
         drop(recorded);
 
         // Non-stream mode: should split
         frames.lock().await.clear();
         send_text_to_platform(
-            &adapters, &indices, "wecom", "chat", &long_text,
-            Some("req-1"), None, true,
-        ).await.unwrap();
+            &adapters,
+            &indices,
+            "wecom",
+            "chat",
+            &long_text,
+            Some("req-1"),
+            None,
+            true,
+        )
+        .await
+        .unwrap();
 
         let recorded = frames.lock().await;
-        assert!(recorded.len() > 1, "non-stream mode must split long messages");
+        assert!(
+            recorded.len() > 1,
+            "non-stream mode must split long messages"
+        );
     }
 
     #[test]
@@ -6027,7 +6084,8 @@ mod stream_tests {
             assert!(
                 window[1] >= window[0],
                 "accumulated must never shrink: {} -> {}",
-                window[0], window[1]
+                window[0],
+                window[1]
             );
         }
 

@@ -998,8 +998,10 @@ fn parse_claude_stream_json_line(line: &str) -> Option<CliProgress> {
                     Some("tool_use") | Some("tool_result") => {
                         // Skip — already handled via stream_event/content_block_start.
                     }
-                    Some("thinking") | Some("reasoning")
-                    | Some("thinking_summary") | Some("reasoning_summary") => {
+                    Some("thinking")
+                    | Some("reasoning")
+                    | Some("thinking_summary")
+                    | Some("reasoning_summary") => {
                         // Skip — already handled via stream_event/content_block_delta.
                     }
                     _ => {}
@@ -3343,7 +3345,8 @@ extra_args:
             r#"{"type":"result","result":"final","session_id":"abc"}"#,
         ];
 
-        let events: Vec<Option<CliProgress>> = lines.iter()
+        let events: Vec<Option<CliProgress>> = lines
+            .iter()
             .map(|l| parse_claude_stream_json_line(l))
             .collect();
 
@@ -3354,7 +3357,9 @@ extra_args:
         // thinking content_block_start → None
         assert!(events[2].is_none());
         // thinking_delta → ReasoningBlock
-        assert!(matches!(&events[3], Some(CliProgress::ReasoningBlock { kind: ReasoningKind::Raw, text }) if text == "let me think about this"));
+        assert!(
+            matches!(&events[3], Some(CliProgress::ReasoningBlock { kind: ReasoningKind::Raw, text }) if text == "let me think about this")
+        );
         // thinking content_block_stop → None
         assert!(events[4].is_none());
         // text content_block_start → None
@@ -3370,7 +3375,11 @@ extra_args:
         // tool_use content_block_stop → None
         assert!(events[10].is_none());
         // assistant complete message → None (no duplicates!)
-        assert!(events[11].is_none(), "assistant message must not emit duplicate events, got: {:?}", events[11]);
+        assert!(
+            events[11].is_none(),
+            "assistant message must not emit duplicate events, got: {:?}",
+            events[11]
+        );
         // message_delta → None
         assert!(events[12].is_none());
         // message_stop → None

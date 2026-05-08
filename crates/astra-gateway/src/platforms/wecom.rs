@@ -140,7 +140,8 @@ impl PlatformAdapter for WeComAdapter {
         text: &str,
         reply_token: Option<&str>,
     ) -> Result<(), String> {
-        self.send_stream_chunk(chat_id, text, reply_token, None, true).await
+        self.send_stream_chunk(chat_id, text, reply_token, None, true)
+            .await
     }
 
     async fn send_stream_chunk(
@@ -323,7 +324,9 @@ async fn wait_reconnect_delay(
 
 fn build_send_frame(bot_id: &str, out: &OutboundMessage) -> Value {
     if let Some(ref req_id) = out.reply_token {
-        let stream_id = out.stream_id.clone()
+        let stream_id = out
+            .stream_id
+            .clone()
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         json!({
             "cmd": "aibot_respond_msg",
@@ -350,7 +353,10 @@ fn build_send_frame(bot_id: &str, out: &OutboundMessage) -> Value {
             }
         })
     } else {
-        tracing::warn!(text_len = out.text.len(), "wecom: dropping message, no chat_id or reply_token");
+        tracing::warn!(
+            text_len = out.text.len(),
+            "wecom: dropping message, no chat_id or reply_token"
+        );
         json!({"cmd": "noop"})
     }
 }
@@ -427,7 +433,10 @@ fn strip_at_mentions(text: &str) -> String {
     let mut result = text.to_string();
     while let Some(start) = result.find('@') {
         let rest = &result[start + 1..];
-        let end = rest.find(' ').map(|i| start + 1 + i + 1).unwrap_or(result.len());
+        let end = rest
+            .find(' ')
+            .map(|i| start + 1 + i + 1)
+            .unwrap_or(result.len());
         result = format!("{}{}", &result[..start], &result[end..]);
     }
     result.trim().to_string()

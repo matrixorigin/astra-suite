@@ -66,6 +66,7 @@ impl std::fmt::Debug for DatabaseConfig {
     }
 }
 
+#[allow(dead_code)]
 fn default_true() -> bool {
     true
 }
