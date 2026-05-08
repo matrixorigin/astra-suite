@@ -16,6 +16,7 @@ use tokio::sync::{Mutex, mpsc};
 use tokio_tungstenite::tungstenite::Message;
 
 const HEARTBEAT_INTERVAL_SECS: u64 = 30;
+const PONG_TIMEOUT_SECS: u64 = 60;
 const MAX_TEXT_LENGTH: usize = 4000;
 const RECONNECT_DELAYS: &[u64] = &[2, 5, 10, 30, 60];
 const WECOM_CAPABILITIES: &[AdapterCapability] = &[
@@ -225,8 +226,13 @@ async fn run_wecom_connection(
         tokio::time::interval(std::time::Duration::from_secs(HEARTBEAT_INTERVAL_SECS));
     heartbeat.tick().await;
     let bot_id = config.bot_id.clone();
+    let mut last_recv = tokio::time::Instant::now();
 
     loop {
+        if last_recv.elapsed().as_secs() > PONG_TIMEOUT_SECS {
+            return Err("wecom connection timed out (no message received)".into());
+        }
+
         let mut out_guard = out_rx.lock().await;
 
         tokio::select! {
@@ -276,6 +282,7 @@ async fn run_wecom_connection(
             msg = ws_read.next() => {
                 match msg {
                     Some(Ok(Message::Text(text))) => {
+                        last_recv = tokio::time::Instant::now();
                         if let Ok(data) = serde_json::from_str::<Value>(&text) {
                             handle_wecom_message(&data, msg_tx, &mut dedup).await;
                         }
