@@ -355,7 +355,6 @@ async fn handle_wecom_message(
         return;
     }
 
-    let chat_id = body["chatid"].as_str().unwrap_or("").to_string();
     let user_id = body["from"]["userid"]
         .as_str()
         .unwrap_or("unknown")
@@ -364,6 +363,15 @@ async fn handle_wecom_message(
         ChatType::Group
     } else {
         ChatType::DirectMessage
+    };
+    // WeCom 1:1 DMs don't carry a `chatid` field, so the raw value is always
+    // the empty string. Without a fallback, every DM from every user collapses
+    // to the same `(platform, chat_id, cli_profile)` session key, which makes
+    // unrelated users share one Claude session. Use the sender's `user_id` as
+    // the session partition key for DMs; group chats still use the group id.
+    let chat_id = match chat_type {
+        ChatType::DirectMessage => user_id.clone(),
+        ChatType::Group => body["chatid"].as_str().unwrap_or("").to_string(),
     };
     let reply_token = data["headers"]["req_id"].as_str().map(String::from);
 
@@ -461,7 +469,8 @@ mod tests {
             handle_wecom_message(&data, &tx, &mut dedup).await;
             let msg = rx.recv().await.unwrap();
             assert_eq!(msg.platform, "wecom");
-            assert_eq!(msg.chat_id, "chat-1");
+            // DM: chat_id falls back to user_id (WeCom doesn't emit `chatid` for 1:1).
+            assert_eq!(msg.chat_id, "user-1");
             assert_eq!(msg.user_id, "user-1");
             assert_eq!(msg.text, "hello world");
             assert_eq!(msg.chat_type, ChatType::DirectMessage);
