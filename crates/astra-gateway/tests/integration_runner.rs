@@ -300,6 +300,7 @@ impl TestGateway {
             group_sessions_per_user: true,
             group_require_mention: false,
             bot_name: String::new(),
+            timezone: None,
             project_dirs: vec![],
         }
     }
@@ -678,6 +679,7 @@ async fn runner_init_invalid_config_errors() {
         group_sessions_per_user: true,
         group_require_mention: false,
         bot_name: String::new(),
+        timezone: None,
         project_dirs: vec![],
     };
 

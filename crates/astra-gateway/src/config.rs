@@ -47,6 +47,9 @@ pub struct GatewayConfig {
     /// When empty, any @mention triggers the bot.
     #[serde(default)]
     pub bot_name: String,
+    /// Timezone for cron scheduling (e.g. "Asia/Shanghai"). Defaults to UTC.
+    #[serde(default)]
+    pub timezone: Option<String>,
     /// Directories to scan for git projects (e.g. ["~/github", "~/work"]).
     #[serde(default)]
     pub project_dirs: Vec<String>,
