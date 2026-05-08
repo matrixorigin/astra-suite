@@ -202,6 +202,18 @@ pub trait PlatformAdapter: Send + Sync + 'static {
         text: &str,
         reply_token: Option<&str>,
     ) -> Result<(), String>;
+    /// Send a streaming chunk. Platforms that support streaming (e.g. WeCom) should
+    /// override this; others fall back to send_text.
+    async fn send_stream_chunk(
+        &self,
+        chat_id: &str,
+        text: &str,
+        reply_token: Option<&str>,
+        _stream_id: Option<&str>,
+        _finish: bool,
+    ) -> Result<(), String> {
+        self.send_text(chat_id, text, reply_token).await
+    }
     /// Send typing indicator (start). No-op for platforms that don't support it.
     async fn send_typing(&self, _chat_id: &str) -> Result<(), String> {
         Ok(())

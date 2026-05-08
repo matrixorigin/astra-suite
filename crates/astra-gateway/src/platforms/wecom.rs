@@ -29,8 +29,9 @@ const WECOM_CAPABILITIES: &[AdapterCapability] = &[
 struct OutboundMessage {
     chat_id: String,
     text: String,
-    /// For group chats: the inbound req_id to use aibot_respond_msg.
     reply_token: Option<String>,
+    stream_id: Option<String>,
+    stream_finish: bool,
 }
 
 pub struct WeComAdapter {
@@ -139,7 +140,21 @@ impl PlatformAdapter for WeComAdapter {
         text: &str,
         reply_token: Option<&str>,
     ) -> Result<(), String> {
-        let text = if text.len() > MAX_TEXT_LENGTH {
+        self.send_stream_chunk(chat_id, text, reply_token, None, true)
+            .await
+    }
+
+    async fn send_stream_chunk(
+        &self,
+        chat_id: &str,
+        text: &str,
+        reply_token: Option<&str>,
+        stream_id: Option<&str>,
+        finish: bool,
+    ) -> Result<(), String> {
+        // Stream mode: no truncation here — runner handles 20480 byte limit by splitting streams.
+        // Non-stream (aibot_send_msg): truncate to MAX_TEXT_LENGTH.
+        let text = if stream_id.is_none() && text.len() > MAX_TEXT_LENGTH {
             crate::text::truncate_with_suffix(text, MAX_TEXT_LENGTH, "…\n\n(truncated)")
         } else {
             text.to_string()
@@ -150,6 +165,8 @@ impl PlatformAdapter for WeComAdapter {
                 chat_id: chat_id.to_string(),
                 text,
                 reply_token: reply_token.map(String::from),
+                stream_id: stream_id.map(String::from),
+                stream_finish: finish,
             })
             .await
             .map_err(|e| format!("outbound channel send failed: {e}"))
@@ -223,6 +240,12 @@ async fn run_wecom_connection(
                     return Err("wecom outbound channel closed".into());
                 };
                 let frame = build_send_frame(&bot_id, &out);
+                tracing::debug!(
+                    cmd = frame["cmd"].as_str().unwrap_or("?"),
+                    finish = %frame["body"]["stream"]["finish"],
+                    content_len = out.text.len(),
+                    "wecom outbound frame"
+                );
                 match ws_write.send(Message::Text(frame.to_string().into())).await {
                     Ok(()) => {
                         emit_adapter_health(AdapterHealthEvent::new(
@@ -300,8 +323,22 @@ async fn wait_reconnect_delay(
 }
 
 fn build_send_frame(bot_id: &str, out: &OutboundMessage) -> Value {
-    if let Some(ref req_id) = out.reply_token {
-        // Group chat: respond to the inbound request
+    if let (Some(req_id), Some(stream_id)) = (&out.reply_token, &out.stream_id) {
+        // Streaming reply (full-replacement semantics)
+        json!({
+            "cmd": "aibot_respond_msg",
+            "headers": {"req_id": req_id},
+            "body": {
+                "msgtype": "stream",
+                "stream": {
+                    "id": stream_id,
+                    "finish": out.stream_finish,
+                    "content": &out.text
+                }
+            }
+        })
+    } else if let Some(ref req_id) = out.reply_token {
+        // Non-stream reply (one-shot markdown via respond)
         json!({
             "cmd": "aibot_respond_msg",
             "headers": {"req_id": req_id},
@@ -310,8 +347,8 @@ fn build_send_frame(bot_id: &str, out: &OutboundMessage) -> Value {
                 "markdown": {"content": &out.text}
             }
         })
-    } else {
-        // DM: proactive send
+    } else if !out.chat_id.is_empty() {
+        // Proactive send (DM or group without req_id)
         json!({
             "cmd": "aibot_send_msg",
             "headers": {"req_id": format!("send-{}", uuid::Uuid::new_v4())},
@@ -322,6 +359,12 @@ fn build_send_frame(bot_id: &str, out: &OutboundMessage) -> Value {
                 "markdown": {"content": &out.text}
             }
         })
+    } else {
+        tracing::warn!(
+            text_len = out.text.len(),
+            "wecom: dropping message, no chat_id or reply_token"
+        );
+        json!({"cmd": "noop"})
     }
 }
 
@@ -339,26 +382,34 @@ async fn handle_wecom_message(
     }
 
     let body = &data["body"];
+    tracing::trace!(raw = %data, "wecom inbound raw");
     let msg_id = body["msgid"].as_str().unwrap_or("").to_string();
     if msg_id.is_empty() || !dedup.check(&msg_id) {
         return;
     }
 
-    let text = body["text"]["content"]
+    let raw_text = body["text"]["content"]
         .as_str()
         .or_else(|| body["voice"]["content"].as_str())
         .unwrap_or("")
-        .trim()
-        .to_string();
+        .trim();
+
+    // Strip @mentions (e.g. "@BotName ") so the model receives clean user text
+    let text = strip_at_mentions(raw_text);
 
     if text.is_empty() {
         return;
     }
 
-    let chat_id = body["chatid"].as_str().unwrap_or("").to_string();
     let user_id = body["from"]["userid"]
         .as_str()
         .unwrap_or("unknown")
+        .to_string();
+    // DM messages don't carry chatid; fall back to userid so chat_id is always non-empty
+    let chat_id = body["chatid"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .unwrap_or(&user_id)
         .to_string();
     let chat_type = if body["chattype"].as_str() == Some("group") {
         ChatType::Group
@@ -381,6 +432,28 @@ async fn handle_wecom_message(
     if msg_tx.send(msg).await.is_err() {
         tracing::warn!("wecom message channel full, dropping message");
     }
+}
+
+fn strip_at_mentions(text: &str) -> String {
+    // Remove @mentions only at word boundaries (start of string or after whitespace).
+    // WeCom group messages arrive as "@BotName actual message".
+    // Preserves @-signs in emails, code, etc.
+    let mut result = String::with_capacity(text.len());
+    let mut chars = text.char_indices().peekable();
+    while let Some((i, ch)) = chars.next() {
+        if ch == '@' && (i == 0 || text.as_bytes()[i - 1] == b' ') {
+            // Skip the mention token (until next space or end)
+            while let Some(&(_, c)) = chars.peek() {
+                if c == ' ' {
+                    break;
+                }
+                chars.next();
+            }
+        } else {
+            result.push(ch);
+        }
+    }
+    result.trim().to_string()
 }
 
 fn classify_wecom_control_message(
@@ -539,6 +612,8 @@ mod tests {
             chat_id: "chat-123".into(),
             text: "hello".into(),
             reply_token: None,
+            stream_id: None,
+            stream_finish: true,
         };
         let frame = build_send_frame("bot-1", &out);
         assert_eq!(frame["cmd"], "aibot_send_msg");
@@ -552,11 +627,14 @@ mod tests {
             chat_id: "group-456".into(),
             text: "response".into(),
             reply_token: Some("req-original".into()),
+            stream_id: Some("stream-1".into()),
+            stream_finish: true,
         };
         let frame = build_send_frame("bot-1", &out);
         assert_eq!(frame["cmd"], "aibot_respond_msg");
         assert_eq!(frame["headers"]["req_id"], "req-original");
-        assert_eq!(frame["body"]["markdown"]["content"], "response");
+        assert_eq!(frame["body"]["stream"]["content"], "response");
+        assert_eq!(frame["body"]["stream"]["finish"], true);
     }
 
     #[test]
@@ -626,6 +704,8 @@ mod tests {
                 chat_id: "chat-1".into(),
                 text: "wake now".into(),
                 reply_token: None,
+                stream_id: None,
+                stream_finish: true,
             })
             .await
             .unwrap();
@@ -789,5 +869,16 @@ mod tests {
             handle_wecom_message(&data, &tx, &mut dedup).await;
             assert!(rx.try_recv().is_err());
         });
+    }
+
+    #[test]
+    fn strip_at_mentions_basic() {
+        assert_eq!(strip_at_mentions("@Bot 你好"), "你好");
+        assert_eq!(strip_at_mentions("@Bot"), "");
+        assert_eq!(strip_at_mentions("你好"), "你好");
+        assert_eq!(strip_at_mentions("@A @B 消息"), "消息");
+        assert_eq!(strip_at_mentions("hello @user world"), "hello  world");
+        // Preserves @ in emails/code (not at word boundary)
+        assert_eq!(strip_at_mentions("test@example.com"), "test@example.com");
     }
 }

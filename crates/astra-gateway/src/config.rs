@@ -38,7 +38,7 @@ pub struct GatewayConfig {
     #[serde(default = "default_max_concurrent_runs")]
     pub max_concurrent_runs: usize,
     /// Group chat: isolate sessions per user (true) or share per group (false).
-    #[serde(default = "default_true")]
+    #[serde(default)]
     pub group_sessions_per_user: bool,
     /// Group chat: require @mention to activate (reduces noise).
     #[serde(default)]
@@ -66,6 +66,7 @@ impl std::fmt::Debug for DatabaseConfig {
     }
 }
 
+#[allow(dead_code)]
 fn default_true() -> bool {
     true
 }
