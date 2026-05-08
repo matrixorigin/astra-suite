@@ -17,11 +17,11 @@
 
 storage:
   backend: sqlite
-  path: ~/.astra-gateway/gateway-tmp.db
+  # path: ~/.astra-gateway/gateway.db   # default; uncomment to override
 
 cli:
   type: claude
-  bin: /home/mo/.local/share/claude/versions/2.1.132
+  bin: claude               # assumes `claude` is on PATH; or set full path
   model: sonnet  # override per-session with /model
   stream_json: true         # enables --output-format stream-json + --include-partial-messages + --include-hook-events
   # Optional: Claude Code hooks for tool/stop event streaming.
@@ -40,8 +40,6 @@ action_policy:
 
 platforms:
   weixin:
-    enabled: false
-  wecom:
     enabled: true
-    bot_id: "aibSuks2XBtMtUMPu0TxYrSBtU1bXDWGwPR"
-    secret: "L6dl8crJ4GLOVJRxfLONkg7MCjuO6uu4kE8JtnTW58M"
+    token: ""       # set here or via WEIXIN_TOKEN env var
+    account_id: ""  # set here or via WEIXIN_ACCOUNT_ID env var
