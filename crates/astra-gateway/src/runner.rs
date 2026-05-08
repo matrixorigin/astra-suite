@@ -639,6 +639,22 @@ impl GatewayRunner {
             return Ok(None);
         }
 
+        // Strip @mention prefix so slash commands and CLI see clean text
+        let msg = &{
+            let mut m = msg.clone();
+            m.text = strip_mention(&m.text, &self.config.bot_name);
+            m
+        };
+
+        // Bare @mention with no content → treat as greeting
+        let msg = &if msg.text.is_empty() {
+            let mut m = msg.clone();
+            m.text = "你好".to_string();
+            m
+        } else {
+            msg.clone()
+        };
+
         // Group chat: per-user session isolation
         let effective_chat_id = if msg.chat_type == crate::platforms::ChatType::Group
             && self.config.group_sessions_per_user
@@ -4988,6 +5004,29 @@ fn is_mentioned(text: &str, bot_name: &str) -> bool {
     } else {
         let pattern = format!("@{bot_name}");
         text.to_lowercase().contains(&pattern.to_lowercase())
+    }
+}
+
+/// Remove `@BotName` prefix from group messages so downstream handlers see clean text.
+fn strip_mention(text: &str, bot_name: &str) -> String {
+    if bot_name.is_empty() {
+        let trimmed = text.trim_start();
+        if let Some(rest) = trimmed.strip_prefix('@') {
+            let after_word = rest.trim_start_matches(|c: char| !c.is_whitespace());
+            after_word.trim_start().to_string()
+        } else {
+            text.to_string()
+        }
+    } else {
+        let lower = text.to_lowercase();
+        let pattern = format!("@{}", bot_name).to_lowercase();
+        if let Some(pos) = lower.find(&pattern) {
+            let before = &text[..pos];
+            let after = &text[pos + pattern.len()..];
+            format!("{before}{after}").trim().to_string()
+        } else {
+            text.to_string()
+        }
     }
 }
 
