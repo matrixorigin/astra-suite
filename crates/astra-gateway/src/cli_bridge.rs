@@ -986,62 +986,67 @@ fn parse_claude_stream_json_stdout(stdout: &str, exit_code: i32) -> CliResult {
 fn parse_claude_stream_json_line(line: &str) -> Option<CliProgress> {
     let v = serde_json::from_str::<serde_json::Value>(line).ok()?;
     match v["type"].as_str()? {
-        // Assistant message — may contain text tokens or tool_use blocks.
+        // Assistant message — used for tool_use/tool_result detection.
+        // Text tokens are now handled via stream_event/content_block_delta above.
         "assistant" => {
             let content = v["message"]["content"].as_array()?;
             for block in content {
                 match block["type"].as_str() {
                     Some("text") => {
-                        if let Some(text) = block["text"].as_str()
-                            && !text.is_empty()
-                        {
-                            return Some(CliProgress::Token(text.to_string()));
-                        }
+                        // Skip — already emitted token-by-token via stream_event deltas.
                     }
-                    Some("tool_use") => {
-                        let name = block["name"].as_str().unwrap_or("tool").to_string();
-                        return Some(CliProgress::ToolStarted { name });
+                    Some("tool_use") | Some("tool_result") => {
+                        // Skip — already handled via stream_event/content_block_start.
                     }
-                    Some("tool_result") => {
-                        let name = block["tool_use"]["name"]
-                            .as_str()
-                            .unwrap_or("tool")
-                            .to_string();
-                        return Some(CliProgress::ToolDone {
-                            name,
-                            duration_ms: None,
-                        });
-                    }
-                    Some("thinking") | Some("reasoning") => {
-                        if let Some(text) = block["thinking"]
-                            .as_str()
-                            .or_else(|| block["text"].as_str())
-                            .or_else(|| block["content"].as_str())
-                            && !text.is_empty()
-                        {
-                            return Some(CliProgress::ReasoningBlock {
-                                kind: ReasoningKind::Raw,
-                                text: text.to_string(),
-                            });
-                        }
-                    }
-                    Some("thinking_summary") | Some("reasoning_summary") => {
-                        if let Some(text) = block["summary"]
-                            .as_str()
-                            .or_else(|| block["text"].as_str())
-                            .or_else(|| block["content"].as_str())
-                            && !text.is_empty()
-                        {
-                            return Some(CliProgress::ReasoningBlock {
-                                kind: ReasoningKind::Summary,
-                                text: text.to_string(),
-                            });
-                        }
+                    Some("thinking") | Some("reasoning")
+                    | Some("thinking_summary") | Some("reasoning_summary") => {
+                        // Skip — already handled via stream_event/content_block_delta.
                     }
                     _ => {}
                 }
             }
             None
+        }
+        // Real-time streaming events from --include-partial-messages.
+        // content_block_delta carries incremental text tokens as they're generated.
+        "stream_event" => {
+            let event = &v["event"];
+            match event["type"].as_str() {
+                Some("content_block_delta") => {
+                    let delta = &event["delta"];
+                    match delta["type"].as_str() {
+                        Some("text_delta") => {
+                            if let Some(text) = delta["text"].as_str()
+                                && !text.is_empty()
+                            {
+                                return Some(CliProgress::Token(text.to_string()));
+                            }
+                            None
+                        }
+                        Some("thinking_delta") => {
+                            if let Some(text) = delta["thinking"].as_str()
+                                && !text.is_empty()
+                            {
+                                return Some(CliProgress::ReasoningBlock {
+                                    kind: ReasoningKind::Raw,
+                                    text: text.to_string(),
+                                });
+                            }
+                            None
+                        }
+                        _ => None,
+                    }
+                }
+                Some("content_block_start") => {
+                    let block = &event["content_block"];
+                    if block["type"].as_str() == Some("tool_use") {
+                        let name = block["name"].as_str().unwrap_or("tool").to_string();
+                        return Some(CliProgress::ToolStarted { name });
+                    }
+                    None
+                }
+                _ => None,
+            }
         }
         // Hook lifecycle events forwarded via --include-hook-events.
         // Claude emits the event name as `hook_event_name`
@@ -1798,6 +1803,7 @@ async fn run_child_with_cancel_inner(
         let mut lines = reader.lines();
         let mut output = String::new();
         while let Ok(Some(line)) = lines.next_line().await {
+            tracing::trace!(cli = %cli_name, raw = %line, "cli stdout");
             if !output.is_empty() {
                 output.push('\n');
             }
@@ -2899,12 +2905,10 @@ printf '%s\n' '{"type":"assistant.message_delta","data":{"deltaContent":"from sc
     }
 
     #[test]
-    fn parse_claude_thinking_block_progress() {
+    fn parse_claude_thinking_block_skipped_in_assistant() {
+        // thinking blocks in assistant messages are now skipped — handled via stream_event deltas
         let line = r#"{"type":"assistant","message":{"content":[{"type":"thinking","thinking":"considering options"}]}}"#;
-        assert!(matches!(
-            parse_stdout_jsonl_line(line, "claude"),
-            Some(CliProgress::ReasoningBlock { kind: ReasoningKind::Raw, text }) if text == "considering options"
-        ));
+        assert!(parse_stdout_jsonl_line(line, "claude").is_none());
     }
 
     #[test]
@@ -3305,5 +3309,73 @@ extra_args:
             !token.is_cancelled(),
             "token must NOT be cancelled by timeout"
         );
+    }
+
+    #[test]
+    fn stream_event_parsing_matches_real_cli_output() {
+        use super::*;
+
+        // Simulate the exact sequence from a real Claude CLI session:
+        // thinking → text → tool_use → text(final)
+        let lines = vec![
+            // system (ignored)
+            r#"{"type":"system","subtype":"init","session_id":"abc"}"#,
+            // message_start (ignored)
+            r#"{"type":"stream_event","event":{"type":"message_start","message":{"model":"claude"}}}"#,
+            // thinking block
+            r#"{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"let me think about this"}}}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_stop","index":0}}"#,
+            // text block
+            r#"{"type":"stream_event","event":{"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"Let me "}}}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"check."}}}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_stop","index":1}}"#,
+            // tool_use block
+            r#"{"type":"stream_event","event":{"type":"content_block_start","index":2,"content_block":{"type":"tool_use","id":"t1","name":"Bash","input":{}}}}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_stop","index":2}}"#,
+            // assistant complete message (should NOT duplicate events)
+            r#"{"type":"assistant","message":{"content":[{"type":"thinking","thinking":"let me think"},{"type":"text","text":"Let me check."},{"type":"tool_use","name":"Bash","id":"t1","input":{}}]}}"#,
+            // message end
+            r#"{"type":"stream_event","event":{"type":"message_delta","delta":{"stop_reason":"tool_use"}}}"#,
+            r#"{"type":"stream_event","event":{"type":"message_stop"}}"#,
+            // result
+            r#"{"type":"result","result":"final","session_id":"abc"}"#,
+        ];
+
+        let events: Vec<Option<CliProgress>> = lines.iter()
+            .map(|l| parse_claude_stream_json_line(l))
+            .collect();
+
+        // system → None
+        assert!(events[0].is_none());
+        // message_start → None
+        assert!(events[1].is_none());
+        // thinking content_block_start → None
+        assert!(events[2].is_none());
+        // thinking_delta → ReasoningBlock
+        assert!(matches!(&events[3], Some(CliProgress::ReasoningBlock { kind: ReasoningKind::Raw, text }) if text == "let me think about this"));
+        // thinking content_block_stop → None
+        assert!(events[4].is_none());
+        // text content_block_start → None
+        assert!(events[5].is_none());
+        // text_delta "Let me " → Token
+        assert!(matches!(&events[6], Some(CliProgress::Token(t)) if t == "Let me "));
+        // text_delta "check." → Token
+        assert!(matches!(&events[7], Some(CliProgress::Token(t)) if t == "check."));
+        // text content_block_stop → None
+        assert!(events[8].is_none());
+        // tool_use content_block_start → ToolStarted
+        assert!(matches!(&events[9], Some(CliProgress::ToolStarted { name }) if name == "Bash"));
+        // tool_use content_block_stop → None
+        assert!(events[10].is_none());
+        // assistant complete message → None (no duplicates!)
+        assert!(events[11].is_none(), "assistant message must not emit duplicate events, got: {:?}", events[11]);
+        // message_delta → None
+        assert!(events[12].is_none());
+        // message_stop → None
+        assert!(events[13].is_none());
+        // result → None
+        assert!(events[14].is_none());
     }
 }

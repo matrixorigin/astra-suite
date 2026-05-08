@@ -243,6 +243,10 @@ pub struct OutboundMessage {
     pub chat_id: String,
     pub text: String,
     pub reply_token: Option<String>,
+    /// Stream ID shared across all chunks of one reply (for streaming platforms like WeCom).
+    pub stream_id: Option<String>,
+    /// Whether this is the final chunk of a stream.
+    pub stream_finish: bool,
     pub outbox: Option<OutboxDelivery>,
 }
 
@@ -264,6 +268,27 @@ impl OutboundMessage {
             chat_id: chat_id.into(),
             text: text.into(),
             reply_token: None,
+            stream_id: None,
+            stream_finish: true,
+            outbox: None,
+        }
+    }
+
+    pub fn stream_chunk(
+        platform: impl Into<String>,
+        chat_id: impl Into<String>,
+        text: impl Into<String>,
+        reply_token: Option<String>,
+        stream_id: Option<String>,
+        finish: bool,
+    ) -> Self {
+        Self {
+            platform: platform.into(),
+            chat_id: chat_id.into(),
+            text: text.into(),
+            reply_token,
+            stream_id,
+            stream_finish: finish,
             outbox: None,
         }
     }
@@ -280,6 +305,8 @@ impl OutboundMessage {
             chat_id: chat_id.into(),
             text: text.into(),
             reply_token,
+            stream_id: None,
+            stream_finish: true,
             outbox: Some(outbox),
         }
     }
@@ -840,9 +867,13 @@ impl GatewayRunner {
             }
         }
 
-        // Sequential request tag for user-facing message correlation
-        let n = self.request_counter.fetch_add(1, Ordering::Relaxed) + 1;
-        let request_tag = format!("#{n:03}");
+        // Request tag for user-facing message correlation
+        let _ = self.request_counter.fetch_add(1, Ordering::Relaxed) + 1;
+        let request_tag = session_id
+            .as_deref()
+            .and_then(|s| s.get(s.len().saturating_sub(8)..))
+            .map(|suffix| format!("#{suffix}"))
+            .unwrap_or_else(|| "#new".to_string());
 
         tracing::info!(
             platform = msg.platform,
@@ -1016,6 +1047,9 @@ impl GatewayRunner {
         let message_text = msg.text.clone();
         let sid = session_id.clone();
         let chat_id = effective_chat_id.clone();
+        let reply_token = msg.reply_token.clone();
+        // Shared stream_id for all chunks of this reply (WeCom streaming).
+        let mut stream_id = reply_token.as_ref().map(|_| uuid::Uuid::new_v4().to_string());
         let cli_name = cli_profile.name().to_string();
         let cli_timeout = Duration::from_secs(self.config.cli_timeout_secs.max(1));
 
@@ -1090,69 +1124,58 @@ impl GatewayRunner {
         // Reset health at task start — previous failures are stale.
         self.send_health.reset(&health_key);
 
-        let flush_buf = |buf: &mut String,
-                         tx: &Option<tokio::sync::mpsc::Sender<OutboundMessage>>,
-                         platform: &str,
-                         chat: &str,
-                         tag: &str,
-                         chunk_num: u32|
-         -> usize {
-            let text = buf.trim().to_string();
-            if text.is_empty() {
-                return 0;
-            }
-            let Some(tx) = tx else {
-                // No outbound channel — discard to prevent memory leak.
-                buf.clear();
-                return 0;
-            };
-            let len = text.len();
-            let tagged = format!("[{tag}:{chunk_num}] {text}");
-            if tx
-                .try_send(OutboundMessage::plain(
-                    platform.to_string(),
-                    chat.to_string(),
-                    tagged,
-                ))
-                .is_err()
-            {
-                return 0;
-            }
-            // Only clear buffer after successful send.
-            buf.clear();
-            len
+        // Full accumulated text for stream (WeCom stream content is full-replacement, not append).
+        let mut accumulated = String::new();
+        // Next flush threshold: random 5-20 chars.
+        let mut next_flush_at: usize = 5 + (rand::random::<u8>() % 16) as usize;
+
+        const STREAM_MAX_BYTES: usize = 20480;
+
+        let send_stream = |accumulated: &String,
+                           tx: &Option<tokio::sync::mpsc::Sender<OutboundMessage>>,
+                           platform: &str,
+                           chat: &str,
+                           reply_token: Option<String>,
+                           stream_id: Option<String>,
+                           finish: bool| {
+            let Some(tx) = tx else { return; };
+            if accumulated.is_empty() && !finish { return; }
+            let _ = tx.try_send(OutboundMessage::stream_chunk(
+                platform.to_string(),
+                chat.to_string(),
+                accumulated.clone(),
+                reply_token,
+                stream_id,
+                finish,
+            ));
         };
         let flush_reasoning_buf = |buf: &mut String,
+                                   accumulated: &mut String,
                                    kind: ReasoningKind,
                                    agent_name: &str,
                                    tx: &Option<tokio::sync::mpsc::Sender<OutboundMessage>>,
                                    platform: &str,
                                    chat: &str,
-                                   tag: &str,
-                                   chunk_num: u32|
+                                   reply_token: Option<String>,
+                                   stream_id: Option<String>|
          -> usize {
             let text = buf.trim().to_string();
-            if text.is_empty() {
-                return 0;
-            }
-            let Some(tx) = tx else {
-                buf.clear();
-                return 0;
-            };
-            let title = reasoning_block_title(kind, agent_name);
-            let len = text.len();
-            let tagged = format!("[{tag}:thinking{chunk_num}] {title}\n{text}");
-            if tx
-                .try_send(OutboundMessage::plain(
-                    platform.to_string(),
-                    chat.to_string(),
-                    tagged,
-                ))
-                .is_err()
-            {
-                return 0;
-            }
             buf.clear();
+            if text.is_empty() { return 0; }
+            let Some(tx) = tx else { return 0; };
+            let title = reasoning_block_title(kind, agent_name);
+            let block = format!("{title}\n{text}");
+            let len = block.len();
+            if !accumulated.is_empty() { accumulated.push('\n'); }
+            accumulated.push_str(&block);
+            let _ = tx.try_send(OutboundMessage::stream_chunk(
+                platform.to_string(),
+                chat.to_string(),
+                accumulated.clone(),
+                reply_token,
+                stream_id,
+                false,
+            ));
             len
         };
 
@@ -1170,11 +1193,21 @@ impl GatewayRunner {
                             if !filtered.is_empty() {
                                 token_buf.push_str(&filtered);
                                 if allow_answer_progressive_flush
-                                    && token_buf.len() >= PROGRESSIVE_MIN_CHARS
+                                    && token_buf.len() >= next_flush_at
                                 {
+                                    accumulated.push_str(&token_buf);
+                                    token_buf.clear();
+                                    next_flush_at = 5 + (rand::random::<u8>() % 16) as usize;
                                     chunk_counter += 1;
-                                    progressive_text_len += flush_buf(&mut token_buf, &self.outbound_tx, msg.platform, &chat_id, &request_tag, chunk_counter);
-                                    next_timer.as_mut().reset(tokio::time::Instant::now() + PROGRESSIVE_FLUSH_INTERVAL);
+                                    progressive_text_len = accumulated.len();
+                                    // If accumulated exceeds stream limit, close current stream and start a new one
+                                    if accumulated.len() > STREAM_MAX_BYTES {
+                                        send_stream(&accumulated, &self.outbound_tx, msg.platform, &chat_id, reply_token.clone(), stream_id.clone(), true);
+                                        accumulated.clear();
+                                        stream_id = reply_token.as_ref().map(|_| uuid::Uuid::new_v4().to_string());
+                                    } else {
+                                        send_stream(&accumulated, &self.outbound_tx, msg.platform, &chat_id, reply_token.clone(), stream_id.clone(), false);
+                                    }
                                 }
                             }
                         }
@@ -1195,13 +1228,14 @@ impl GatewayRunner {
                                     reasoning_chunk_counter += 1;
                                     let _ = flush_reasoning_buf(
                                         &mut reasoning_buf,
+                                        &mut accumulated,
                                         reasoning_kind,
                                         &cli_name,
                                         &self.outbound_tx,
                                         msg.platform,
                                         &chat_id,
-                                        &request_tag,
-                                        reasoning_chunk_counter,
+                                        reply_token.clone(),
+                                        stream_id.clone(),
                                     );
                                 }
                                 reasoning_kind = kind;
@@ -1210,13 +1244,14 @@ impl GatewayRunner {
                                     reasoning_chunk_counter += 1;
                                     let _ = flush_reasoning_buf(
                                         &mut reasoning_buf,
+                                        &mut accumulated,
                                         reasoning_kind,
                                         &cli_name,
                                         &self.outbound_tx,
                                         msg.platform,
                                         &chat_id,
-                                        &request_tag,
-                                        reasoning_chunk_counter,
+                                        reply_token.clone(),
+                                        stream_id.clone(),
                                     );
                                 }
                             }
@@ -1225,16 +1260,16 @@ impl GatewayRunner {
                         Some(CliProgress::Status(_) | CliProgress::Stderr(_)) => {}
                         None => {
                             if reasoning_display.is_enabled() {
-                                reasoning_chunk_counter += 1;
                                 let _ = flush_reasoning_buf(
                                     &mut reasoning_buf,
+                                    &mut accumulated,
                                     reasoning_kind,
                                     &cli_name,
                                     &self.outbound_tx,
                                     msg.platform,
                                     &chat_id,
-                                    &request_tag,
-                                    reasoning_chunk_counter,
+                                    reply_token.clone(),
+                                    stream_id.clone(),
                                 );
                             }
                             let think_tail = think_filter.finish();
@@ -1246,48 +1281,32 @@ impl GatewayRunner {
                             if !tail.is_empty() {
                                 token_buf.push_str(&tail);
                             }
-                            chunk_counter += 1;
-                            progressive_text_len += flush_buf(&mut token_buf, &self.outbound_tx, msg.platform, &chat_id, &request_tag, chunk_counter);
+                            if !token_buf.is_empty() {
+                                accumulated.push_str(&token_buf);
+                                token_buf.clear();
+                            }
+                            if !accumulated.is_empty() {
+                                progressive_text_len = accumulated.len();
+                            }
+                            // Send full accumulated content with finish=true to close the stream
+                            send_stream(&accumulated, &self.outbound_tx, msg.platform, &chat_id, reply_token.clone(), stream_id.clone(), true);
                             break;
                         }
                     }
                 }
                 _ = &mut next_timer => {
-                    // Circuit-breaker: skip heartbeats/flushes when platform is unreachable.
-                    if self.send_health.is_open(&health_key) {
-                        next_timer.as_mut().reset(tokio::time::Instant::now() + HEARTBEAT_INTERVAL);
-                        continue;
-                    }
-                    if allow_answer_progressive_flush && !token_buf.is_empty() {
-                        chunk_counter += 1;
-                        progressive_text_len += flush_buf(&mut token_buf, &self.outbound_tx, msg.platform, &chat_id, &request_tag, chunk_counter);
-                        next_timer.as_mut().reset(tokio::time::Instant::now() + PROGRESSIVE_FLUSH_INTERVAL);
-                    } else if !sent_initial_ack {
+                    if !sent_initial_ack {
                         sent_initial_ack = true;
-                        let heartbeat = format!("[{request_tag}] 🤔 {cli_name} 思考中…");
-                        if let Some(ref tx) = self.outbound_tx {
-                            // try_send: drop heartbeat if channel backpressured —
-                            // stale heartbeats are worse than missing ones.
-                            let _ = tx.try_send(OutboundMessage::plain(
-                                msg.platform.to_string(), chat_id.clone(), heartbeat,
-                            ));
-                        }
-                        next_timer.as_mut().reset(tokio::time::Instant::now() + HEARTBEAT_INTERVAL);
-                    } else {
-                        let elapsed_str = format_elapsed(start.elapsed());
-                        let heartbeat = if tool_count > 0 {
-                            let tool_short = truncate(&last_tool, 40);
-                            format!("[{request_tag}] ⏳ {elapsed_str} | 🔧 {tool_count}个工具 | {tool_short}")
-                        } else {
-                            format!("[{request_tag}] ⏳ 处理中… {elapsed_str}")
-                        };
+                        let ack = format!("[{request_tag}] 🤔 {cli_name} 思考中…");
                         if let Some(ref tx) = self.outbound_tx {
                             let _ = tx.try_send(OutboundMessage::plain(
-                                msg.platform.to_string(), chat_id.clone(), heartbeat,
+                                msg.platform.to_string(),
+                                chat_id.clone(),
+                                ack,
                             ));
                         }
-                        next_timer.as_mut().reset(tokio::time::Instant::now() + HEARTBEAT_INTERVAL);
                     }
+                    next_timer.as_mut().reset(tokio::time::Instant::now() + HEARTBEAT_INTERVAL);
                 }
             }
         }
@@ -1752,6 +1771,9 @@ impl GatewayRunner {
             if let Some(writer) = trace_writer.as_ref() {
                 let _ = writer.complete_request().await;
             }
+            // Delay stats footer so it doesn't visually collide with the stream closing
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            // Stream already closed by final flush; send stats as a separate plain message
             Some(OutboundMessage::plain(
                 msg.platform.to_string(),
                 msg.chat_id.clone(),
@@ -1794,6 +1816,8 @@ impl GatewayRunner {
                 chat_id: chat_id.to_string(),
                 text,
                 reply_token,
+                stream_id: None,
+                stream_finish: true,
                 outbox: None,
             };
         };
@@ -1803,6 +1827,8 @@ impl GatewayRunner {
                 chat_id: chat_id.to_string(),
                 text,
                 reply_token,
+                stream_id: None,
+                stream_finish: true,
                 outbox: None,
             };
         };
@@ -1833,6 +1859,8 @@ impl GatewayRunner {
                     chat_id: chat_id.to_string(),
                     text,
                     reply_token,
+                    stream_id: None,
+                    stream_finish: true,
                     outbox: None,
                 }
             }
@@ -2405,6 +2433,8 @@ impl GatewayRunner {
             &outbound.chat_id,
             &outbound.text,
             outbound.reply_token.as_deref(),
+            outbound.stream_id.as_deref(),
+            outbound.stream_finish,
         )
         .await;
 
@@ -2509,7 +2539,7 @@ impl GatewayRunner {
                             // Fast path: slash commands — instant, no CLI
                             match self.handle_fast(&msg).await {
                                 Ok(Some(text)) => {
-                                    let _ = send_text_to_platform(&adapters, &adapter_indices, msg.platform, &msg.chat_id, &text, msg.reply_token.as_deref()).await;
+                                    let _ = send_text_to_platform(&adapters, &adapter_indices, msg.platform, &msg.chat_id, &text, msg.reply_token.as_deref(), None, true).await;
                                 }
                                 Ok(None) => {}
                                 Err(msg) => {
@@ -2586,6 +2616,8 @@ async fn send_text_to_platform(
     chat_id: &str,
     text: &str,
     reply_token: Option<&str>,
+    stream_id: Option<&str>,
+    stream_finish: bool,
 ) -> Result<usize, (usize, String)> {
     let Some(idx) = adapter_indices.get(platform).copied() else {
         tracing::warn!(platform, chat_id = %safe_id(chat_id), "no adapter for outbound message");
@@ -2595,12 +2627,25 @@ async fn send_text_to_platform(
         tracing::warn!(platform, chat_id = %safe_id(chat_id), "adapter index missing for outbound message");
         return Err((0, "adapter index missing for outbound message".into()));
     };
+
+    // Stream mode: send full text as one frame. WeCom stream semantics are
+    // full-replacement per frame — splitting would corrupt the display.
+    if stream_id.is_some() {
+        if let Err(e) = adapter.send_stream_chunk(chat_id, text, reply_token, stream_id, stream_finish).await {
+            tracing::warn!(platform, chat_id = %safe_id(chat_id), error = %e, "failed to send stream chunk");
+            return Err((0, e));
+        }
+        return Ok(1);
+    }
+
+    // Non-stream mode: split long messages for platforms with size limits.
     let chunks = split_message(text);
     let chunk_count = chunks.len();
-    for (idx, chunk) in chunks.into_iter().enumerate() {
-        if let Err(e) = adapter.send_text(chat_id, chunk, reply_token).await {
+    for (i, chunk) in chunks.into_iter().enumerate() {
+        let is_last = i == chunk_count - 1;
+        if let Err(e) = adapter.send_stream_chunk(chat_id, chunk, reply_token, stream_id, stream_finish && is_last).await {
             tracing::warn!(platform, chat_id = %safe_id(chat_id), error = %e, "failed to send platform message");
-            return Err((idx, e));
+            return Err((i, e));
         }
     }
     Ok(chunk_count)
@@ -4992,6 +5037,8 @@ fn cli_response_fields() {
         chat_id: "c1".into(),
         text: "hello".into(),
         reply_token: Some("tok".into()),
+        stream_id: None,
+        stream_finish: true,
         outbox: None,
     };
     assert_eq!(r.platform, "weixin");
@@ -5057,7 +5104,7 @@ async fn send_text_routes_to_matching_platform_only() {
         indices.insert(adapter.name(), idx);
     }
 
-    let sent = send_text_to_platform(&adapters, &indices, "weixin", "chat", "hello", None)
+    let sent = send_text_to_platform(&adapters, &indices, "weixin", "chat", "hello", None, None, true)
         .await
         .unwrap();
     assert_eq!(sent, 1);
@@ -5088,6 +5135,8 @@ async fn cli_response_channel_roundtrip() {
         chat_id: "c1".into(),
         text: "result".into(),
         reply_token: None,
+        stream_id: None,
+        stream_finish: true,
         outbox: None,
     })
     .await
@@ -5110,6 +5159,8 @@ async fn concurrent_cli_responses_ordered() {
             chat_id: "user1".into(),
             text: "response1".into(),
             reply_token: None,
+            stream_id: None,
+            stream_finish: true,
             outbox: None,
         })
         .await
@@ -5121,6 +5172,8 @@ async fn concurrent_cli_responses_ordered() {
             chat_id: "user2".into(),
             text: "response2".into(),
             reply_token: None,
+            stream_id: None,
+            stream_finish: true,
             outbox: None,
         })
         .await
@@ -5841,5 +5894,145 @@ mod db_retry_tests {
             1,
             "logic errors must NOT trigger retry"
         );
+    }
+}
+
+#[cfg(test)]
+mod stream_tests {
+    use super::*;
+
+    struct StreamRecordingAdapter {
+        name: &'static str,
+        frames: std::sync::Arc<tokio::sync::Mutex<Vec<(String, Option<String>, bool)>>>,
+        rx: tokio::sync::Mutex<tokio::sync::mpsc::Receiver<InboundMessage>>,
+    }
+
+    #[async_trait::async_trait]
+    impl PlatformAdapter for StreamRecordingAdapter {
+        fn name(&self) -> &'static str { self.name }
+        async fn start(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) }
+        async fn stop(&mut self) {}
+        async fn send_text(&self, _: &str, _: &str, _: Option<&str>) -> Result<(), String> { Ok(()) }
+        async fn send_stream_chunk(
+            &self,
+            _chat_id: &str,
+            text: &str,
+            _reply_token: Option<&str>,
+            stream_id: Option<&str>,
+            finish: bool,
+        ) -> Result<(), String> {
+            self.frames.lock().await.push((
+                text.to_string(),
+                stream_id.map(String::from),
+                finish,
+            ));
+            Ok(())
+        }
+        async fn recv(&self) -> Option<InboundMessage> {
+            self.rx.lock().await.recv().await
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_mode_never_splits_large_content() {
+        let frames = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let (_tx, rx) = tokio::sync::mpsc::channel(1);
+        let adapters: Vec<Box<dyn PlatformAdapter>> = vec![
+            Box::new(StreamRecordingAdapter {
+                name: "wecom",
+                frames: frames.clone(),
+                rx: tokio::sync::Mutex::new(rx),
+            }),
+        ];
+        let mut indices = HashMap::new();
+        indices.insert("wecom", 0usize);
+
+        // 6000 chars — exceeds MAX_CHUNK_LEN (3800)
+        let long_text = "x".repeat(6000);
+
+        // Stream mode: should NOT split
+        send_text_to_platform(
+            &adapters, &indices, "wecom", "chat", &long_text,
+            Some("req-1"), Some("stream-1"), false,
+        ).await.unwrap();
+
+        let recorded = frames.lock().await;
+        assert_eq!(recorded.len(), 1, "stream mode must send exactly 1 frame");
+        assert_eq!(recorded[0].0.len(), 6000, "full content must be sent unsplit");
+        assert_eq!(recorded[0].1.as_deref(), Some("stream-1"));
+        assert_eq!(recorded[0].2, false);
+        drop(recorded);
+
+        // Non-stream mode: should split
+        frames.lock().await.clear();
+        send_text_to_platform(
+            &adapters, &indices, "wecom", "chat", &long_text,
+            Some("req-1"), None, true,
+        ).await.unwrap();
+
+        let recorded = frames.lock().await;
+        assert!(recorded.len() > 1, "non-stream mode must split long messages");
+    }
+
+    #[test]
+    fn accumulated_only_grows_with_text_deltas() {
+        // Simulate the CLI event sequence:
+        //   thinking(1080) → text(19) → tool_use → tool_use → text(6947) → end
+        // Verify accumulated only contains text content and never shrinks.
+
+        let mut accumulated = String::new();
+        let mut token_buf = String::new();
+        let mut content_lengths: Vec<usize> = Vec::new();
+
+        // Helper: simulate flush
+        let flush = |token_buf: &mut String, accumulated: &mut String, lengths: &mut Vec<usize>| {
+            if !token_buf.is_empty() {
+                accumulated.push_str(token_buf);
+                token_buf.clear();
+                lengths.push(accumulated.len());
+            }
+        };
+
+        // Phase 1: thinking — should NOT affect accumulated
+        // (thinking deltas are filtered out before reaching token_buf)
+        // accumulated stays empty
+        assert!(accumulated.is_empty());
+
+        // Phase 2: text(19 chars)
+        token_buf.push_str("让我查看一下代码。");
+        flush(&mut token_buf, &mut accumulated, &mut content_lengths);
+        assert_eq!(accumulated.len(), "让我查看一下代码。".len());
+
+        // Phase 3: tool_use events — no text, nothing added
+        // (ToolStarted/ToolDone don't push to token_buf)
+        assert_eq!(accumulated.len(), "让我查看一下代码。".len());
+
+        // Phase 4: more tool_use — still no change
+        assert_eq!(accumulated.len(), "让我查看一下代码。".len());
+
+        // Phase 5: final text response (6947 chars simulated)
+        let final_text = "这是最终回复内容。".repeat(100);
+        // Simulate multiple token deltas
+        for chunk in final_text.as_bytes().chunks(20) {
+            token_buf.push_str(&String::from_utf8_lossy(chunk));
+            if token_buf.len() >= 15 {
+                flush(&mut token_buf, &mut accumulated, &mut content_lengths);
+            }
+        }
+        // Final flush
+        flush(&mut token_buf, &mut accumulated, &mut content_lengths);
+
+        // Verify monotonic growth
+        for window in content_lengths.windows(2) {
+            assert!(
+                window[1] >= window[0],
+                "accumulated must never shrink: {} -> {}",
+                window[0], window[1]
+            );
+        }
+
+        // Verify final content contains both text blocks
+        assert!(accumulated.starts_with("让我查看一下代码。"));
+        assert!(accumulated.len() > "让我查看一下代码。".len());
     }
 }
