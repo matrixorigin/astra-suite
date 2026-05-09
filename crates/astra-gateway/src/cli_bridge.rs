@@ -249,6 +249,33 @@ pub enum CliProfile {
         session_id_field: Option<String>,
         text_field: Option<String>,
     },
+    /// Rust-native agent runtime. No subprocess; gateway calls Bedrock
+    /// Converse streaming API directly and runs a tool-use loop in-process.
+    /// Abort via `CancellationToken` drops the HTTP stream cleanly; no SIGKILL,
+    /// no jsonl residue. Messages persist in `gw_session_messages` table.
+    #[serde(rename = "claude-direct")]
+    NativeRust {
+        #[serde(default = "default_native_rust_model")]
+        model: String,
+        /// Max tool-use iterations before the loop bails out to avoid runaway.
+        #[serde(default = "default_native_max_iters")]
+        max_iters: u32,
+        /// Max tokens per Bedrock response.
+        #[serde(default = "default_native_max_tokens")]
+        max_tokens: u32,
+        /// Enable Claude extended thinking blocks.
+        #[serde(default)]
+        reasoning: bool,
+        /// AWS region for Bedrock. Defaults to us-east-1 if unset.
+        #[serde(default)]
+        region: Option<String>,
+        /// Bash tool per-invocation timeout.
+        #[serde(default = "default_native_bash_timeout_ms")]
+        bash_timeout_ms: u64,
+        /// Bash tool max captured bytes per stream (stdout or stderr).
+        #[serde(default = "default_native_bash_max_bytes")]
+        bash_max_bytes: usize,
+    },
 }
 
 #[derive(Debug, Clone, serde::Deserialize, PartialEq, Eq)]
@@ -285,6 +312,21 @@ fn default_permission_mode() -> String {
 }
 fn default_codex_sandbox() -> String {
     "workspace-write".into()
+}
+fn default_native_rust_model() -> String {
+    "us.anthropic.claude-opus-4-7".into()
+}
+fn default_native_max_iters() -> u32 {
+    20
+}
+fn default_native_max_tokens() -> u32 {
+    8192
+}
+fn default_native_bash_timeout_ms() -> u64 {
+    120_000
+}
+fn default_native_bash_max_bytes() -> usize {
+    32 * 1024
 }
 
 fn build_command_launcher(bin: &str, launcher: Option<&CliLauncher>) -> Command {
@@ -372,6 +414,13 @@ impl CliProfile {
                 supports_json_output: *json_output,
                 supports_harness: false,
                 supports_tools: false,
+            },
+            Self::NativeRust { .. } => CliCapabilities {
+                supports_session: true,
+                supports_model_switch: true,
+                supports_json_output: true,
+                supports_harness: false,
+                supports_tools: true,
             },
         }
     }
@@ -575,6 +624,15 @@ impl CliProfile {
                 }
                 cmd
             }
+            // NativeRust runs in-process (no subprocess). Runner dispatches
+            // these profiles through `native_rust::run_native_rust` before
+            // calling `build_command_with_context`, so this branch is never
+            // reached at runtime. Keep the arm for exhaustiveness.
+            Self::NativeRust { .. } => {
+                unreachable!(
+                    "NativeRust profile must be dispatched via native_rust::run_native_rust"
+                );
+            }
         }
     }
 
@@ -635,6 +693,13 @@ impl CliProfile {
                     }
                 }
             }
+            // NativeRust yields a `CliResult` directly from its in-process
+            // run; gateway never calls `parse_output` for this profile.
+            Self::NativeRust { .. } => {
+                unreachable!(
+                    "NativeRust profile produces CliResult directly; parse_output is not used"
+                );
+            }
         }
     }
 
@@ -645,6 +710,7 @@ impl CliProfile {
             Self::Copilot { .. } => "copilot",
             Self::Codex { .. } => "codex",
             Self::Custom { bin, .. } => bin,
+            Self::NativeRust { .. } => "claude-direct",
         }
     }
 
@@ -700,6 +766,9 @@ impl CliProfile {
                 json_output,
                 ..
             } => format!("custom:{bin}:json={json_output}:args={args_template:?}"),
+            Self::NativeRust { model, region, .. } => {
+                format!("claude-direct:{model}:region={region:?}")
+            }
         }
     }
 
@@ -709,6 +778,7 @@ impl CliProfile {
             | Self::Claude { model, .. }
             | Self::Copilot { model, .. }
             | Self::Codex { model, .. } => model.as_deref(),
+            Self::NativeRust { model, .. } => Some(model.as_str()),
             _ => None,
         }
     }
@@ -720,6 +790,9 @@ impl CliProfile {
             | Self::Copilot { model, .. }
             | Self::Codex { model, .. } => {
                 *model = Some(model_name);
+            }
+            Self::NativeRust { model, .. } => {
+                *model = model_name;
             }
             _ => {}
         }
@@ -1940,12 +2013,21 @@ pub async fn probe_cli(profile: &CliProfile) -> CliAvailability {
 }
 
 async fn probe_cli_uncached(profile: &CliProfile) -> CliAvailability {
+    // NativeRust has no binary to probe — it's always available (actual
+    // Bedrock reachability is exercised on the first real request).
+    if matches!(profile, CliProfile::NativeRust { .. }) {
+        return CliAvailability::Available {
+            version: Some("claude-direct".into()),
+        };
+    }
+
     let version_arg = match profile {
         CliProfile::Astra { .. } => "--version",
         CliProfile::Claude { .. } => "--version",
         CliProfile::Copilot { .. } => "--version",
         CliProfile::Codex { .. } => "--version",
         CliProfile::Custom { .. } => "--version",
+        CliProfile::NativeRust { .. } => unreachable!("handled by early return above"),
     };
 
     let mut cmd = match profile {
@@ -1954,6 +2036,7 @@ async fn probe_cli_uncached(profile: &CliProfile) -> CliAvailability {
         | CliProfile::Codex { bin, .. }
         | CliProfile::Custom { bin, .. } => tokio::process::Command::new(bin),
         CliProfile::Copilot { bin, launcher, .. } => build_command_launcher(bin, launcher.as_ref()),
+        CliProfile::NativeRust { .. } => unreachable!("handled by early return above"),
     };
     if let Err(e) = profile.apply_runtime_environment(&mut cmd) {
         return CliAvailability::NotExecutable(e);

@@ -59,5 +59,13 @@ dashmap = "6.1"
 fs2 = "0.4"
 self-replace = "1.5.0"
 
+# NativeRust runtime: Bedrock Converse streaming API.
+aws-config = "1"
+aws-sdk-bedrockruntime = "1"
+aws-smithy-types = "1"
+# Explicit rustls provider so we can install_default() and avoid the
+# ambiguity panic when multiple rustls-backed deps get linked.
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs"] }
+
 [dev-dependencies]
 tempfile = "3"

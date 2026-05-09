@@ -222,6 +222,36 @@ pub trait GatewayStore: Send + Sync + 'static {
         cli_profile: &str,
     ) -> Result<(), StoreError>;
 
+    // ── Session messages (NativeRust only) ──────────────────────────────
+    //
+    // The subprocess CLI profiles (claude/astra/...) store conversation
+    // history inside their own jsonl files; gateway only needs the
+    // session_id. NativeRust runs the tool-use loop in-process, so
+    // gateway owns the full `Vec<Message>` and must persist it across
+    // restarts. Stored as an opaque JSON blob keyed by the same
+    // (platform, chat_id, cli_profile, session_id) tuple as `gw_sessions`.
+
+    /// Load the serialized message array for a session. Returns `None` if
+    /// no row exists (new session or non-NativeRust profile).
+    async fn load_session_messages(
+        &self,
+        platform: &str,
+        chat_id: &str,
+        cli_profile: &str,
+        session_id: &str,
+    ) -> Result<Option<Vec<u8>>, StoreError>;
+
+    /// Upsert the serialized message array for a session. Called after
+    /// each tool-use-loop turn completes.
+    async fn save_session_messages(
+        &self,
+        platform: &str,
+        chat_id: &str,
+        cli_profile: &str,
+        session_id: &str,
+        messages_json: &[u8],
+    ) -> Result<(), StoreError>;
+
     // ── Cron jobs ───────────────────────────────────────────────────────
     async fn create_cron_job(&self, spec: &CronJobSpec) -> Result<(), StoreError>;
 

@@ -183,6 +183,23 @@ impl GatewayStore for MysqlGatewayStore {
         .await
         .map_err(|e| StoreError::Database(e.to_string()))?;
 
+        // Message history for NativeRust agent runtime.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS gw_session_messages (
+                platform      VARCHAR(32)  NOT NULL,
+                chat_id       VARCHAR(128) NOT NULL,
+                cli_profile   VARCHAR(32)  NOT NULL,
+                session_id    VARCHAR(64)  NOT NULL,
+                messages_json LONGBLOB     NOT NULL,
+                updated_at    DATETIME(6) DEFAULT NOW(6),
+                PRIMARY KEY (platform, chat_id, cli_profile, session_id),
+                INDEX idx_session_msgs_session (session_id)
+            )",
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| StoreError::Database(e.to_string()))?;
+
         tracing::info!("gateway schema ensured");
         Ok(())
     }
@@ -492,6 +509,56 @@ impl GatewayStore for MysqlGatewayStore {
         .bind(platform)
         .bind(chat_id)
         .bind(cli_profile)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| StoreError::Database(e.to_string()))?;
+        Ok(())
+    }
+
+    // ── Session messages (NativeRust) ───────────────────────────────────
+
+    async fn load_session_messages(
+        &self,
+        platform: &str,
+        chat_id: &str,
+        cli_profile: &str,
+        session_id: &str,
+    ) -> Result<Option<Vec<u8>>, StoreError> {
+        let row: Option<(Vec<u8>,)> = sqlx::query_as(
+            "SELECT messages_json FROM gw_session_messages
+             WHERE platform = ? AND chat_id = ? AND cli_profile = ? AND session_id = ?",
+        )
+        .bind(platform)
+        .bind(chat_id)
+        .bind(cli_profile)
+        .bind(session_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| StoreError::Database(e.to_string()))?;
+        Ok(row.map(|r| r.0))
+    }
+
+    async fn save_session_messages(
+        &self,
+        platform: &str,
+        chat_id: &str,
+        cli_profile: &str,
+        session_id: &str,
+        messages_json: &[u8],
+    ) -> Result<(), StoreError> {
+        sqlx::query(
+            "INSERT INTO gw_session_messages
+                 (platform, chat_id, cli_profile, session_id, messages_json, updated_at)
+             VALUES (?, ?, ?, ?, ?, NOW(6))
+             ON DUPLICATE KEY UPDATE
+                 messages_json = VALUES(messages_json),
+                 updated_at = NOW(6)",
+        )
+        .bind(platform)
+        .bind(chat_id)
+        .bind(cli_profile)
+        .bind(session_id)
+        .bind(messages_json)
         .execute(&self.pool)
         .await
         .map_err(|e| StoreError::Database(e.to_string()))?;

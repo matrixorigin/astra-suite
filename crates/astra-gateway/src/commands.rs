@@ -89,6 +89,112 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
             }
         }
 
+        "/undo" => {
+            if let Some(denial) = slash_denial(ctx, ActionCapability::SessionMutation) {
+                return Some(denial);
+            }
+            let store = require_store!(ctx);
+            let cli_name = ctx.resolved_cli.name();
+
+            // Parse N turns (default 1). Reject garbage arg to avoid silent 0.
+            let n: usize = if arg.is_empty() {
+                1
+            } else {
+                match arg.parse::<usize>() {
+                    Ok(v) if v >= 1 => v,
+                    _ => return Some("用法: `/undo` 或 `/undo N`（N≥1）".into()),
+                }
+            };
+
+            let sid = match store
+                .get_current_session(ctx.platform, ctx.chat_id, cli_name)
+                .await
+            {
+                Ok(Some(s)) => s,
+                _ => return Some("ℹ️ 没有可撤销的对话。再聊几轮再试。".into()),
+            };
+
+            // Load history; if this CLI profile doesn't persist to
+            // gw_session_messages (e.g. claude-fallback), there's nothing
+            // to rewind at the gateway level.
+            let blob = match store
+                .load_session_messages(ctx.platform, ctx.chat_id, cli_name, &sid)
+                .await
+            {
+                Ok(Some(b)) => b,
+                _ => {
+                    return Some(
+                        "ℹ️ 当前 CLI 不支持 `/undo`（仅 `claude-direct` profile 有完整历史）。".into(),
+                    );
+                }
+            };
+            let mut msgs: Vec<crate::native_rust::history::Message> =
+                match serde_json::from_slice(&blob) {
+                    Ok(m) => m,
+                    Err(e) => return Some(format!("⚠️ 历史解析失败: {e}")),
+                };
+
+            // Indices of "real" user turn starts. A user message with a
+            // Text block begins a new turn; user messages carrying only
+            // ToolResult blocks don't count — they're part of the prior
+            // assistant's tool_use round-trip.
+            let turn_starts: Vec<usize> = msgs
+                .iter()
+                .enumerate()
+                .filter_map(|(i, m)| {
+                    use crate::native_rust::history::{ContentBlock, Role};
+                    let is_user_text = matches!(m.role, Role::User)
+                        && m.content
+                            .iter()
+                            .any(|b| matches!(b, ContentBlock::Text { .. }));
+                    if is_user_text { Some(i) } else { None }
+                })
+                .collect();
+
+            if turn_starts.len() < n {
+                return Some(format!(
+                    "ℹ️ 只有 {} 轮对话，无法撤销 {n} 轮。",
+                    turn_starts.len()
+                ));
+            }
+
+            let cut = turn_starts[turn_starts.len() - n];
+            msgs.truncate(cut);
+
+            let new_blob = match serde_json::to_vec(&msgs) {
+                Ok(b) => b,
+                Err(e) => return Some(format!("⚠️ 历史序列化失败: {e}")),
+            };
+            if let Err(e) = store
+                .save_session_messages(ctx.platform, ctx.chat_id, cli_name, &sid, &new_blob)
+                .await
+            {
+                return Some(format!("⚠️ 历史写入失败: {e}"));
+            }
+
+            // Build the head preview: first Text block of the new last
+            // user message, if any remaining.
+            let last_user_preview = msgs
+                .iter()
+                .rev()
+                .find_map(|m| {
+                    use crate::native_rust::history::{ContentBlock, Role};
+                    if !matches!(m.role, Role::User) {
+                        return None;
+                    }
+                    m.content.iter().find_map(|b| match b {
+                        ContentBlock::Text { text } => Some(truncate_text(text.trim(), 60)),
+                        _ => None,
+                    })
+                })
+                .unwrap_or_else(|| "(会话已空)".to_string());
+
+            Some(format!(
+                "↩️ 已撤销 {n} 轮。\n- 剩余: {} 条消息\n- 当前末尾 user: {last_user_preview}",
+                msgs.len()
+            ))
+        }
+
         "/status" => {
             let cli_name = ctx.resolved_cli.name();
             let session = if let Some(store) = ctx.store {
@@ -201,11 +307,44 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
                     .await
                     .ok()
                     .flatten();
-                if sid.is_some() {
-                    return Some(format!(
-                        "📋 **当前会话** (CLI: `{cli_name}`)\n- ID: `{}`",
-                        sid.as_deref().unwrap_or("(无)")
-                    ));
+                if let Some(ref sid) = sid {
+                    let short = &sid[..8.min(sid.len())];
+                    let last_active = store
+                        .get_session_last_active(ctx.platform, ctx.chat_id, cli_name)
+                        .await
+                        .ok()
+                        .flatten();
+                    let summary =
+                        load_session_summary(store, ctx.platform, ctx.chat_id, cli_name, sid).await;
+
+                    let mut lines = vec![format!("📋 **当前会话** (CLI: `{cli_name}`)")];
+                    lines.push(format!("- ID: `{sid}`"));
+                    lines.push(format!("  short: `{short}…`"));
+                    if let Some(ts) = last_active.as_deref() {
+                        lines.push(format!("- 最后活跃: {}", short_timestamp(ts)));
+                    }
+                    if let Some(s) = &summary {
+                        lines.push(format!(
+                            "- 消息: {} 条 · {}",
+                            s.message_count,
+                            format_bytes(s.byte_size)
+                        ));
+                        if let Some(ref first) = s.first_user_preview {
+                            lines.push(format!("- 起始: {first}"));
+                        }
+                        if !s.tail_previews.is_empty() {
+                            lines.push(String::new());
+                            lines.push(format!("**最近 {} 条:**", s.tail_previews.len()));
+                            for t in &s.tail_previews {
+                                lines.push(format!("  • {t}"));
+                            }
+                        }
+                    } else {
+                        // Non-NativeRust profile or no blob — no message
+                        // summary to show. Still list the ID above.
+                        lines.push("- 消息: (不可用，非 claude-direct profile 或尚未写入)".into());
+                    }
+                    return Some(lines.join("\n"));
                 }
                 // Current CLI has no session — check all CLIs (including default) and show which ones do.
                 let mut found = Vec::new();
@@ -249,20 +388,45 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
             }
 
             if arg == "list" {
-                let sessions = require_store!(ctx)
+                let store = require_store!(ctx);
+                let sessions = store
                     .list_sessions(ctx.platform, ctx.chat_id, cli_name)
                     .await
                     .unwrap_or_default();
                 if sessions.is_empty() {
                     return Some(format!("📋 `{cli_name}` 没有历史会话。"));
                 }
-                let mut lines = vec![format!("📋 **`{cli_name}` 会话列表**")];
+                let mut lines = vec![format!(
+                    "📋 **`{cli_name}` 会话列表** ({} 条)",
+                    sessions.len()
+                )];
                 for s in &sessions {
-                    let marker = if s.is_current { "→ " } else { "  " };
+                    let marker = if s.is_current { "→" } else { " " };
                     let short = &s.session_id[..8.min(s.session_id.len())];
-                    lines.push(format!("{marker}`{short}…` ({})", s.created_at));
+                    let summary = load_session_summary(
+                        store,
+                        ctx.platform,
+                        ctx.chat_id,
+                        cli_name,
+                        &s.session_id,
+                    )
+                    .await;
+                    let count_str = summary
+                        .as_ref()
+                        .map(|x| format!("{} 条", x.message_count))
+                        .unwrap_or_else(|| "—".into());
+                    let preview = summary
+                        .as_ref()
+                        .and_then(|x| x.first_user_preview.clone())
+                        .unwrap_or_else(|| "(无首条消息)".into());
+                    lines.push(format!(
+                        "{marker} `{short}…` | {count_str} | {} | {}",
+                        short_timestamp(&s.created_at),
+                        preview
+                    ));
                 }
-                lines.push("\n使用 `/session switch <id>` 切换".into());
+                lines.push(String::new());
+                lines.push("用 `/session switch <id>` 切换，`→` 标记当前。".into());
                 return Some(lines.join("\n"));
             }
 
@@ -619,6 +783,7 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
             "💡 **命令列表**\n\n\
              **对话**\n\
              `/new` (`/reset`) — 新建会话\n\
+             `/undo` / `/undo N` — 撤销最后 N 轮对话（仅 claude-direct）\n\
              `/session list` — 历史会话\n\
              `/session switch <id>` — 切换会话\n\n\
              **模型**\n\
@@ -1599,6 +1764,108 @@ fn short_timestamp(ts: &str) -> &str {
     }
 }
 
+/// Summary pulled from `gw_session_messages` for the UI. `None` if no row.
+/// Used by `/session` / `/session list` so users can tell sessions apart
+/// without having to send a probing message first.
+struct SessionBlobSummary {
+    message_count: usize,
+    byte_size: usize,
+    /// The first user message, text-truncated to ~60 chars.
+    first_user_preview: Option<String>,
+    /// Up to the last 3 messages, each rendered as `role: text/tool preview`.
+    tail_previews: Vec<String>,
+}
+
+async fn load_session_summary(
+    store: &dyn GatewayStore,
+    platform: &str,
+    chat_id: &str,
+    cli_profile: &str,
+    session_id: &str,
+) -> Option<SessionBlobSummary> {
+    let blob = store
+        .load_session_messages(platform, chat_id, cli_profile, session_id)
+        .await
+        .ok()??;
+    let byte_size = blob.len();
+    let msgs: Vec<crate::native_rust::history::Message> = serde_json::from_slice(&blob).ok()?;
+    let message_count = msgs.len();
+
+    let first_user_preview = msgs.iter().find_map(|m| {
+        if !matches!(m.role, crate::native_rust::history::Role::User) {
+            return None;
+        }
+        m.content.iter().find_map(|b| match b {
+            crate::native_rust::history::ContentBlock::Text { text } => {
+                Some(truncate_text(text.trim(), 60))
+            }
+            _ => None,
+        })
+    });
+
+    let tail_start = message_count.saturating_sub(3);
+    let tail_previews = msgs[tail_start..]
+        .iter()
+        .map(|m| {
+            let role = match m.role {
+                crate::native_rust::history::Role::User => "user",
+                crate::native_rust::history::Role::Assistant => "assistant",
+            };
+            // Render the first content block. Each message always has at
+            // least one block (loop_runner pushes a zero-length text block
+            // for edge cases), so .next() is safe to rely on for preview.
+            let preview = m
+                .content
+                .first()
+                .map(|b| match b {
+                    crate::native_rust::history::ContentBlock::Text { text } => {
+                        truncate_text(text.trim(), 60)
+                    }
+                    crate::native_rust::history::ContentBlock::ToolUse { name, input, .. } => {
+                        let arg_preview = input
+                            .as_object()
+                            .and_then(|o| o.values().next())
+                            .and_then(|v| v.as_str())
+                            .map(|s| truncate_text(s, 40))
+                            .unwrap_or_default();
+                        format!("🔧 {name} {arg_preview}")
+                    }
+                    crate::native_rust::history::ContentBlock::ToolResult {
+                        content,
+                        is_error,
+                        ..
+                    } => {
+                        let mark = if *is_error { "❌" } else { "✓" };
+                        format!("{mark} {}", truncate_text(content.trim(), 60))
+                    }
+                    crate::native_rust::history::ContentBlock::Thinking { .. } => {
+                        "💭 (thinking)".to_string()
+                    }
+                })
+                .unwrap_or_else(|| "(empty)".to_string());
+            format!("{role}: {preview}")
+        })
+        .collect();
+
+    Some(SessionBlobSummary {
+        message_count,
+        byte_size,
+        first_user_preview,
+        tail_previews,
+    })
+}
+
+/// Render bytes as KB/MB for user display.
+fn format_bytes(n: usize) -> String {
+    if n < 1024 {
+        format!("{n}B")
+    } else if n < 1024 * 1024 {
+        format!("{:.1}KB", n as f64 / 1024.0)
+    } else {
+        format!("{:.1}MB", n as f64 / (1024.0 * 1024.0))
+    }
+}
+
 fn truncate_text(text: &str, max_chars: usize) -> String {
     if text.chars().count() > max_chars {
         format!("{}…", text.chars().take(max_chars).collect::<String>())
@@ -1909,18 +2176,20 @@ fn format_duration(ms: u64) -> String {
 }
 
 fn model_shortcuts() -> Vec<(&'static str, &'static str, &'static str)> {
+    // Claude-only shortcuts. Gateway's default runtime (`claude-direct`)
+    // calls Bedrock Converse, which only accepts `us.anthropic.*` model
+    // IDs; listing non-Claude options here would let users pick ones that
+    // silently fail on the next turn. If we add multi-provider support
+    // later, thread the current profile name through and show a filtered
+    // list per profile.
     vec![
         (
             "haiku",
-            "us.anthropic.claude-haiku-4-5-20251001-v1:0",
+            "us.anthropic.claude-haiku-4-5-20251001",
             "快/便宜",
         ),
         ("sonnet", "us.anthropic.claude-sonnet-4-6", "均衡"),
-        ("opus", "us.anthropic.claude-opus-4-6-v1", "最强"),
-        ("minimax", "MiniMax-M2.7", "MiniMax"),
-        ("deepseek", "deepseek-v4-pro", "DeepSeek"),
-        ("qwen", "qwen3.6-plus", "通义千问"),
-        ("glm", "glm-5.1", "智谱 GLM"),
+        ("opus", "us.anthropic.claude-opus-4-7", "最强"),
     ]
 }
 
@@ -1981,14 +2250,16 @@ mod tests {
     fn model_shortcut_resolves() {
         assert_eq!(
             resolve_model_shortcut("haiku"),
-            "us.anthropic.claude-haiku-4-5-20251001-v1:0"
+            "us.anthropic.claude-haiku-4-5-20251001"
         );
         assert_eq!(
             resolve_model_shortcut("opus"),
-            "us.anthropic.claude-opus-4-6-v1"
+            "us.anthropic.claude-opus-4-7"
         );
-        assert_eq!(resolve_model_shortcut("minimax"), "MiniMax-M2.7");
-        assert_eq!(resolve_model_shortcut("deepseek"), "deepseek-v4-pro");
+        assert_eq!(
+            resolve_model_shortcut("sonnet"),
+            "us.anthropic.claude-sonnet-4-6"
+        );
     }
 
     #[test]
@@ -2003,11 +2274,11 @@ mod tests {
     fn model_shortcut_case_insensitive() {
         assert_eq!(
             resolve_model_shortcut("Haiku"),
-            "us.anthropic.claude-haiku-4-5-20251001-v1:0"
+            "us.anthropic.claude-haiku-4-5-20251001"
         );
         assert_eq!(
             resolve_model_shortcut("OPUS"),
-            "us.anthropic.claude-opus-4-6-v1"
+            "us.anthropic.claude-opus-4-7"
         );
     }
 
@@ -2015,11 +2286,11 @@ mod tests {
     fn model_shortcut_numeric_index() {
         assert_eq!(
             resolve_model_shortcut("1"),
-            "us.anthropic.claude-haiku-4-5-20251001-v1:0"
+            "us.anthropic.claude-haiku-4-5-20251001"
         );
         assert_eq!(
             resolve_model_shortcut("3"),
-            "us.anthropic.claude-opus-4-6-v1"
+            "us.anthropic.claude-opus-4-7"
         );
         // Out of range → passthrough
         assert_eq!(resolve_model_shortcut("0"), "0");
@@ -2960,6 +3231,266 @@ mod tests {
             "cancelled token entry should be removed from active_tasks"
         );
     }
+
+    // ── /undo tests ─────────────────────────────────────────────────────
+
+    async fn make_sqlite_store() -> std::sync::Arc<dyn crate::store::GatewayStore> {
+        use crate::store::sqlite::SqliteGatewayStore;
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        let store = SqliteGatewayStore::new(pool);
+        store.ensure_schema().await.unwrap();
+        std::sync::Arc::new(store)
+    }
+
+    fn build_ctx_with_sqlite<'a>(
+        config: &'a GatewayConfig,
+        cli: &'a crate::cli_bridge::CliProfile,
+        astra: &'a astra::Client,
+        store: &'a dyn crate::store::GatewayStore,
+    ) -> CommandContext<'a> {
+        CommandContext {
+            astra,
+            config,
+            store: Some(store),
+            platform: "test",
+            chat_id: "chat_undo",
+            user_id: "user_1",
+            resolved_cli: cli,
+            durable_store: None,
+            trace_repo: None,
+            project_dirs: &config.project_dirs,
+            cli_availability: &[],
+            auth_status: None,
+            active_tasks: None,
+            gateway_start: chrono::Utc::now(),
+        }
+    }
+
+    /// Seed a session + its message history in one go. Returns the sid.
+    async fn seed_session_with_messages(
+        store: &dyn crate::store::GatewayStore,
+        chat_id: &str,
+        cli_name: &str,
+        msgs: &[crate::native_rust::history::Message],
+    ) -> String {
+        let sid = format!("sid-{}", uuid::Uuid::new_v4());
+        store
+            .set_current_session("test", chat_id, "user_1", &sid, cli_name)
+            .await
+            .unwrap();
+        let blob = serde_json::to_vec(msgs).unwrap();
+        store
+            .save_session_messages("test", chat_id, cli_name, &sid, &blob)
+            .await
+            .unwrap();
+        sid
+    }
+
+    fn user_text_msg(text: &str) -> crate::native_rust::history::Message {
+        use crate::native_rust::history::{ContentBlock, Message, Role};
+        Message {
+            role: Role::User,
+            content: vec![ContentBlock::Text { text: text.into() }],
+        }
+    }
+
+    fn assistant_text_msg(text: &str) -> crate::native_rust::history::Message {
+        use crate::native_rust::history::{ContentBlock, Message, Role};
+        Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::Text { text: text.into() }],
+        }
+    }
+
+    fn assistant_tool_use_msg() -> crate::native_rust::history::Message {
+        use crate::native_rust::history::{ContentBlock, Message, Role};
+        Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::ToolUse {
+                id: "t1".into(),
+                name: "bash".into(),
+                input: serde_json::json!({"command": "echo"}),
+            }],
+        }
+    }
+
+    fn user_tool_result_msg() -> crate::native_rust::history::Message {
+        use crate::native_rust::history::{ContentBlock, Message, Role};
+        Message {
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: "t1".into(),
+                content: "ok".into(),
+                is_error: false,
+            }],
+        }
+    }
+
+    #[tokio::test]
+    async fn undo_removes_last_turn() {
+        let store = make_sqlite_store().await;
+        let config = test_config();
+        let cli = crate::cli_bridge::CliProfile::default();
+        let astra = astra::Client::new("http://localhost:8080", None).unwrap();
+        let cli_name = cli.name();
+
+        // Seed: 2 turns. Turn 1: user A → assistant A'. Turn 2: user B → assistant B'.
+        let msgs = vec![
+            user_text_msg("question A"),
+            assistant_text_msg("answer A"),
+            user_text_msg("question B"),
+            assistant_text_msg("answer B"),
+        ];
+        let sid = seed_session_with_messages(&*store, "chat_undo", cli_name, &msgs).await;
+
+        let ctx = build_ctx_with_sqlite(&config, &cli, &astra, &*store);
+        let result = handle_command(&ctx, "/undo").await.unwrap();
+        assert!(
+            result.contains("已撤销 1 轮"),
+            "expected undo confirm: {result}"
+        );
+
+        // After undo: only turn 1 remains.
+        let blob = store
+            .load_session_messages("test", "chat_undo", cli_name, &sid)
+            .await
+            .unwrap()
+            .unwrap();
+        let remaining: Vec<crate::native_rust::history::Message> =
+            serde_json::from_slice(&blob).unwrap();
+        assert_eq!(remaining.len(), 2);
+        assert!(
+            result.contains("question A"),
+            "header preview should be the new last user msg: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn undo_n_removes_multiple_turns() {
+        let store = make_sqlite_store().await;
+        let config = test_config();
+        let cli = crate::cli_bridge::CliProfile::default();
+        let astra = astra::Client::new("http://localhost:8080", None).unwrap();
+        let cli_name = cli.name();
+
+        let msgs = vec![
+            user_text_msg("q1"),
+            assistant_text_msg("a1"),
+            user_text_msg("q2"),
+            assistant_text_msg("a2"),
+            user_text_msg("q3"),
+            assistant_text_msg("a3"),
+        ];
+        let sid = seed_session_with_messages(&*store, "chat_undo", cli_name, &msgs).await;
+
+        let ctx = build_ctx_with_sqlite(&config, &cli, &astra, &*store);
+        let result = handle_command(&ctx, "/undo 2").await.unwrap();
+        assert!(result.contains("已撤销 2 轮"), "{result}");
+
+        let blob = store
+            .load_session_messages("test", "chat_undo", cli_name, &sid)
+            .await
+            .unwrap()
+            .unwrap();
+        let remaining: Vec<crate::native_rust::history::Message> =
+            serde_json::from_slice(&blob).unwrap();
+        assert_eq!(remaining.len(), 2);
+        assert!(result.contains("q1"), "head should be q1: {result}");
+    }
+
+    #[tokio::test]
+    async fn undo_tool_use_round_trip_removes_entire_turn() {
+        // Turn shape: user question → assistant tool_use → user tool_result
+        // → assistant text. Undoing this turn must take all 4 messages off;
+        // otherwise we leave orphaned tool_use blocks that Bedrock will
+        // reject on the next request (the bug we fixed earlier).
+        let store = make_sqlite_store().await;
+        let config = test_config();
+        let cli = crate::cli_bridge::CliProfile::default();
+        let astra = astra::Client::new("http://localhost:8080", None).unwrap();
+        let cli_name = cli.name();
+
+        let msgs = vec![
+            user_text_msg("first"),
+            assistant_text_msg("first reply"),
+            user_text_msg("run echo"),
+            assistant_tool_use_msg(),
+            user_tool_result_msg(),
+            assistant_text_msg("done"),
+        ];
+        let sid = seed_session_with_messages(&*store, "chat_undo", cli_name, &msgs).await;
+
+        let ctx = build_ctx_with_sqlite(&config, &cli, &astra, &*store);
+        handle_command(&ctx, "/undo").await.unwrap();
+
+        let blob = store
+            .load_session_messages("test", "chat_undo", cli_name, &sid)
+            .await
+            .unwrap()
+            .unwrap();
+        let remaining: Vec<crate::native_rust::history::Message> =
+            serde_json::from_slice(&blob).unwrap();
+        // The tool_result user msg should NOT be treated as a turn start,
+        // so /undo cuts back to the "run echo" user msg and removes it
+        // along with all subsequent assistant+tool_use+tool_result+reply.
+        assert_eq!(remaining.len(), 2, "expected 2 msgs left, got {:?}", remaining);
+        use crate::native_rust::history::{ContentBlock, Role};
+        assert!(matches!(remaining[0].role, Role::User));
+        assert!(matches!(
+            remaining[0].content[0],
+            ContentBlock::Text { ref text } if text == "first"
+        ));
+    }
+
+    #[tokio::test]
+    async fn undo_too_many_turns_returns_info() {
+        let store = make_sqlite_store().await;
+        let config = test_config();
+        let cli = crate::cli_bridge::CliProfile::default();
+        let astra = astra::Client::new("http://localhost:8080", None).unwrap();
+        let cli_name = cli.name();
+
+        let msgs = vec![user_text_msg("only turn"), assistant_text_msg("reply")];
+        seed_session_with_messages(&*store, "chat_undo", cli_name, &msgs).await;
+
+        let ctx = build_ctx_with_sqlite(&config, &cli, &astra, &*store);
+        let result = handle_command(&ctx, "/undo 5").await.unwrap();
+        assert!(
+            result.contains("只有 1 轮"),
+            "expected ‘too many’ message: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn undo_no_session_is_soft() {
+        let store = make_sqlite_store().await;
+        let config = test_config();
+        let cli = crate::cli_bridge::CliProfile::default();
+        let astra = astra::Client::new("http://localhost:8080", None).unwrap();
+
+        let ctx = build_ctx_with_sqlite(&config, &cli, &astra, &*store);
+        let result = handle_command(&ctx, "/undo").await.unwrap();
+        assert!(
+            result.contains("没有可撤销"),
+            "expected soft empty msg: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn undo_rejects_bad_arg() {
+        let store = make_sqlite_store().await;
+        let config = test_config();
+        let cli = crate::cli_bridge::CliProfile::default();
+        let astra = astra::Client::new("http://localhost:8080", None).unwrap();
+
+        let ctx = build_ctx_with_sqlite(&config, &cli, &astra, &*store);
+        let result = handle_command(&ctx, "/undo abc").await.unwrap();
+        assert!(result.contains("用法:"), "{result}");
+        let result = handle_command(&ctx, "/undo 0").await.unwrap();
+        assert!(result.contains("用法:"), "{result}");
+    }
+
+    // ── /kill + /stop tests ─────────────────────────────────────────────
 
     #[tokio::test]
     async fn stop_is_alias_for_bare_kill() {

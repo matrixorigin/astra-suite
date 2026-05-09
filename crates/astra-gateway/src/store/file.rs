@@ -167,6 +167,21 @@ impl FileGatewayStore {
         )
         .await
     }
+
+    /// Build the path for a NativeRust session message blob.
+    /// Slashes / colons / backslashes in chat_id (group composite keys like
+    /// `wrm-X:wom-Y`) are escaped so the filename stays single-component.
+    fn session_messages_path(
+        &self,
+        platform: &str,
+        chat_id: &str,
+        cli_profile: &str,
+        session_id: &str,
+    ) -> PathBuf {
+        let safe_chat = chat_id.replace(['/', '\\', ':'], "_");
+        let file_name = format!("{platform}_{safe_chat}_{cli_profile}_{session_id}.json");
+        self.base_dir.join("session_messages").join(file_name)
+    }
 }
 
 #[async_trait::async_trait]
@@ -393,6 +408,35 @@ impl GatewayStore for FileGatewayStore {
         }
         drop(sessions);
         self.flush_sessions().await
+    }
+
+    // ─── Session Messages (NativeRust) ────────────────────────────────
+
+    async fn load_session_messages(
+        &self,
+        platform: &str,
+        chat_id: &str,
+        cli_profile: &str,
+        session_id: &str,
+    ) -> Result<Option<Vec<u8>>, StoreError> {
+        let path = self.session_messages_path(platform, chat_id, cli_profile, session_id);
+        match tokio::fs::read(&path).await {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(StoreError::Io(e)),
+        }
+    }
+
+    async fn save_session_messages(
+        &self,
+        platform: &str,
+        chat_id: &str,
+        cli_profile: &str,
+        session_id: &str,
+        messages_json: &[u8],
+    ) -> Result<(), StoreError> {
+        let path = self.session_messages_path(platform, chat_id, cli_profile, session_id);
+        atomic_write(&path, messages_json).await
     }
 
     // ─── Pending Messages ─────────────────────────────────────────────

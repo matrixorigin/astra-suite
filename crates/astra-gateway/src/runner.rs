@@ -347,6 +347,12 @@ pub struct GatewayRunner {
     /// before this are zombies — their cancel tokens and CLI children
     /// died with the previous gateway lifecycle.
     gateway_start: chrono::DateTime<chrono::Utc>,
+    /// Lazily-initialized Bedrock client for `CliProfile::NativeRust`.
+    /// Built on first request with `AWS_BEARER_TOKEN_BEDROCK` + optional
+    /// region override; subsequent requests reuse it. `region` is snapshotted
+    /// into the cell key so two profiles pinned to different regions each
+    /// trigger their own init (rare; usually one region per gateway).
+    native_rust_clients: dashmap::DashMap<String, Arc<crate::native_rust::client::BedrockClient>>,
 }
 
 /// No-op adapter used in spawned CLI tasks (typing/heartbeats not available in background).
@@ -497,7 +503,26 @@ impl GatewayRunner {
             active_tasks: Arc::new(dashmap::DashMap::new()),
             send_health: SendCircuitBreaker::default(),
             gateway_start: chrono::Utc::now(),
+            native_rust_clients: dashmap::DashMap::new(),
         })
+    }
+
+    /// Get or lazily build a `BedrockClient` for the given region key.
+    /// Uses `region.unwrap_or("default")` as the cache key.
+    async fn get_or_init_native_client(
+        &self,
+        region: Option<&str>,
+    ) -> Arc<crate::native_rust::client::BedrockClient> {
+        let key = region.unwrap_or("default").to_string();
+        if let Some(cached) = self.native_rust_clients.get(&key) {
+            return cached.clone();
+        }
+        let config = crate::native_rust::client::BedrockClient::init_sdk_config(region).await;
+        let client = Arc::new(crate::native_rust::client::BedrockClient::from_sdk_config(
+            &config,
+        ));
+        self.native_rust_clients.insert(key, client.clone());
+        client
     }
 
     /// Whether any storage backend is active.
@@ -1094,6 +1119,24 @@ impl GatewayRunner {
         self.active_tasks
             .insert(kill_registry_key.clone(), cancel_token.clone());
 
+        // Prepare NativeRust dispatch ahead of the spawn so the Bedrock
+        // client init (which is async) happens on the runner task, not on
+        // the spawned one.
+        let native_rust_dispatch = if let CliProfile::NativeRust { region, .. } = &cli_profile {
+            let region_owned = region.clone();
+            // Determinstic sid: if the store already has one, reuse; else
+            // mint a fresh uuid and persist it after the loop succeeds.
+            let effective_sid = sid.clone().unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+            let client = self.get_or_init_native_client(region_owned.as_deref()).await;
+            let store_arc = self
+                .store
+                .clone()
+                .ok_or_else(|| "claude-direct profile requires a configured store".to_string());
+            Some((client, store_arc, effective_sid))
+        } else {
+            None
+        };
+
         let cli_handle = tokio::spawn({
             let profile = cli_profile.clone();
             let message_text = message_text.clone();
@@ -1103,21 +1146,50 @@ impl GatewayRunner {
             let kill_token = cancel_token.clone();
             let trace_id_str = trace.as_ref().map(|t| t.trace_id.to_string());
             let request_id_str = trace.as_ref().map(|t| t.request_id.to_string());
+            let platform_owned = msg.platform.to_string();
+            let chat_id_owned = effective_chat_id.clone();
+            let cli_name_owned = cli_name.clone();
             async move {
-                cli_bridge::run_cli_with_cancel(
-                    &profile,
-                    &message_text,
-                    sid.as_deref(),
-                    ws.as_deref(),
-                    Some(progress_tx),
-                    Some(&system_prompt),
-                    trace_id_str.as_deref(),
-                    request_id_str.as_deref(),
-                    Some(cli_timeout),
-                    token.as_deref(),
-                    Some(kill_token),
-                )
-                .await
+                if let Some((client, store_res, sid_effective)) = native_rust_dispatch {
+                    let store = match store_res {
+                        Ok(s) => s,
+                        Err(e) => return Err(e),
+                    };
+                    let cfg = crate::native_rust::NativeRustConfig::from_profile(&profile);
+                    let session_key = crate::native_rust::SessionKey {
+                        platform: platform_owned,
+                        chat_id: chat_id_owned,
+                        cli_profile: cli_name_owned,
+                    };
+                    crate::native_rust::run_native_rust(
+                        &cfg,
+                        client.as_ref(),
+                        store,
+                        session_key,
+                        &sid_effective,
+                        &message_text,
+                        ws.as_deref(),
+                        Some(progress_tx),
+                        Some(&system_prompt),
+                        Some(kill_token),
+                    )
+                    .await
+                } else {
+                    cli_bridge::run_cli_with_cancel(
+                        &profile,
+                        &message_text,
+                        sid.as_deref(),
+                        ws.as_deref(),
+                        Some(progress_tx),
+                        Some(&system_prompt),
+                        trace_id_str.as_deref(),
+                        request_id_str.as_deref(),
+                        Some(cli_timeout),
+                        token.as_deref(),
+                        Some(kill_token),
+                    )
+                    .await
+                }
             }
         });
 

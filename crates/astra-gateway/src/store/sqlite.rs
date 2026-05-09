@@ -187,6 +187,28 @@ impl GatewayStore for SqliteGatewayStore {
         .execute(&self.pool)
         .await?;
 
+        // Message history for NativeRust agent runtime. Subprocess CLI
+        // profiles do not write here — history lives in their own jsonl.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS gw_session_messages (
+                platform      TEXT NOT NULL,
+                chat_id       TEXT NOT NULL,
+                cli_profile   TEXT NOT NULL,
+                session_id    TEXT NOT NULL,
+                messages_json BLOB NOT NULL,
+                updated_at    TEXT DEFAULT (strftime('%Y-%m-%d %H:%M:%f', 'now')),
+                PRIMARY KEY (platform, chat_id, cli_profile, session_id)
+            )",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_session_msgs_session
+             ON gw_session_messages(session_id)",
+        )
+        .execute(&self.pool)
+        .await?;
+
         crate::trace_model::ensure_sqlite_schema(&self.pool).await?;
 
         tracing::info!("SQLite gateway schema ensured");
@@ -489,6 +511,54 @@ impl GatewayStore for SqliteGatewayStore {
         .bind(platform)
         .bind(chat_id)
         .bind(cli_profile)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    // ── Session messages (NativeRust) ───────────────────────────────────
+
+    async fn load_session_messages(
+        &self,
+        platform: &str,
+        chat_id: &str,
+        cli_profile: &str,
+        session_id: &str,
+    ) -> Result<Option<Vec<u8>>, StoreError> {
+        let row: Option<(Vec<u8>,)> = sqlx::query_as(
+            "SELECT messages_json FROM gw_session_messages
+             WHERE platform = ? AND chat_id = ? AND cli_profile = ? AND session_id = ?",
+        )
+        .bind(platform)
+        .bind(chat_id)
+        .bind(cli_profile)
+        .bind(session_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|r| r.0))
+    }
+
+    async fn save_session_messages(
+        &self,
+        platform: &str,
+        chat_id: &str,
+        cli_profile: &str,
+        session_id: &str,
+        messages_json: &[u8],
+    ) -> Result<(), StoreError> {
+        sqlx::query(
+            "INSERT INTO gw_session_messages
+                 (platform, chat_id, cli_profile, session_id, messages_json, updated_at)
+             VALUES (?, ?, ?, ?, ?, strftime('%Y-%m-%d %H:%M:%f', 'now'))
+             ON CONFLICT(platform, chat_id, cli_profile, session_id) DO UPDATE SET
+                 messages_json = excluded.messages_json,
+                 updated_at = strftime('%Y-%m-%d %H:%M:%f', 'now')",
+        )
+        .bind(platform)
+        .bind(chat_id)
+        .bind(cli_profile)
+        .bind(session_id)
+        .bind(messages_json)
         .execute(&self.pool)
         .await?;
         Ok(())

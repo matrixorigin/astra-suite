@@ -438,6 +438,12 @@ fn cmd_status(config: &Path) {
 
 #[tokio::main]
 async fn main() {
+    // Install rustls CryptoProvider before any HTTPS-using crate (sqlx,
+    // aws-sdk, reqwest) triggers its lazy init. Without this, processes
+    // linking multiple rustls consumers panic on first TLS handshake with
+    // "Could not automatically determine the process-level CryptoProvider".
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
     // Load .env file if present (before logging init so RUST_LOG works)
     let _ = dotenvy::dotenv();
 

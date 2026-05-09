@@ -110,7 +110,13 @@ impl GatewayContext {
     }
 }
 
-/// Load skill markdown files from a directory. Returns (name, content) pairs sorted by name.
+/// Load skill markdown files from a directory. Accepts two layouts:
+///
+/// 1. Flat: `dir/*.md`    (legacy, each file is one skill)
+/// 2. Nested: `dir/<name>/SKILL.md`    (Claude Code layout at
+///    `~/.claude/skills/<name>/SKILL.md`)
+///
+/// Returns (name, content) pairs.
 pub fn load_skills_from_dir(dir: &str) -> Vec<(String, String)> {
     let expanded = if dir.starts_with('~') {
         let home = std::env::var("HOME").unwrap_or_default();
@@ -126,6 +132,22 @@ pub fn load_skills_from_dir(dir: &str) -> Vec<(String, String)> {
     if let Ok(entries) = std::fs::read_dir(path) {
         for entry in entries.flatten() {
             let p = entry.path();
+            // Nested layout: dir/<name>/SKILL.md
+            if p.is_dir() {
+                let skill_md = p.join("SKILL.md");
+                if skill_md.is_file()
+                    && let Ok(content) = std::fs::read_to_string(&skill_md)
+                {
+                    let name = p
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("unknown")
+                        .to_string();
+                    skills.push((name, content));
+                }
+                continue;
+            }
+            // Flat layout: dir/<name>.md
             if p.extension().and_then(|e| e.to_str()) == Some("md")
                 && let Ok(content) = std::fs::read_to_string(&p)
             {

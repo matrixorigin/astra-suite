@@ -7,6 +7,7 @@ pub mod durable_task_store;
 pub mod gateway_context;
 pub mod health;
 pub mod markdown;
+pub mod native_rust;
 pub mod platforms;
 pub mod runner;
 pub mod scheduler;
