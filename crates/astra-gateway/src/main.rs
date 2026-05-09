@@ -104,10 +104,7 @@ fn current_target() -> Result<&'static str, String> {
 fn curl_with_fallback(args_direct: &[&str], target_url: &str, proxy: &str) -> Result<(), String> {
     let mut direct = std::process::Command::new("curl");
     direct.args(args_direct).arg(target_url);
-    let ok = direct
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
+    let ok = direct.status().map(|s| s.success()).unwrap_or(false);
     if ok {
         return Ok(());
     }
@@ -142,13 +139,20 @@ fn resolve_latest_tag(proxy: &str) -> Result<String, String> {
     let try_one = |target: &str| -> Option<String> {
         let out = std::process::Command::new("curl")
             .args([
-                "-sIL", "--max-time", "10", "-o", "/dev/null", "-w", "%{url_effective}",
+                "-sIL",
+                "--max-time",
+                "10",
+                "-o",
+                "/dev/null",
+                "-w",
+                "%{url_effective}",
             ])
             .arg(target)
             .output()
             .ok()?;
         let body = String::from_utf8(out.stdout).ok()?;
-        body.rfind("/tag/").map(|i| body[i + 5..].trim().to_string())
+        body.rfind("/tag/")
+            .map(|i| body[i + 5..].trim().to_string())
     };
     if let Some(v) = try_one(&url) {
         return Ok(v);
@@ -236,8 +240,7 @@ fn run_self_update(version: Option<String>, mirror: Option<String>) -> Result<()
             .map_err(|e| format!("stat new binary: {e}"))?
             .permissions();
         perms.set_mode(0o755);
-        std::fs::set_permissions(&new_bin, perms)
-            .map_err(|e| format!("chmod new binary: {e}"))?;
+        std::fs::set_permissions(&new_bin, perms).map_err(|e| format!("chmod new binary: {e}"))?;
     }
 
     self_replace::self_replace(&new_bin).map_err(|e| {
@@ -341,9 +344,7 @@ fn cmd_start(config: &Path) -> Result<(), String> {
         .append(true)
         .open(log_path())
         .map_err(|e| format!("open log {}: {e}", log_path().display()))?;
-    let log2 = log
-        .try_clone()
-        .map_err(|e| format!("clone log fd: {e}"))?;
+    let log2 = log.try_clone().map_err(|e| format!("clone log fd: {e}"))?;
 
     let mut cmd = std::process::Command::new(&exe);
     cmd.arg("--config")
@@ -504,7 +505,10 @@ async fn main() {
             use std::os::unix::fs::PermissionsExt;
             let _ = std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o600));
         }
-        println!("Created {} (WeCom + Claude/Bedrock + SQLite)", dest.display());
+        println!(
+            "Created {} (WeCom + Claude/Bedrock + SQLite)",
+            dest.display()
+        );
         println!();
         println!("Next steps:");
         println!("  1. Edit {} and fill in:", dest.display());
@@ -673,7 +677,9 @@ async fn main() {
     // Ctrl+C / SIGTERM (so `astra-gateway stop` triggers graceful shutdown)
     let shutdown_tx_clone = shutdown_tx.clone();
     tokio::spawn(async move {
-        let mut term = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+        let mut term = match tokio::signal::unix::signal(
+            tokio::signal::unix::SignalKind::terminate(),
+        ) {
             Ok(s) => s,
             Err(e) => {
                 tracing::warn!(error = %e, "failed to install SIGTERM handler; relying on Ctrl+C only");
