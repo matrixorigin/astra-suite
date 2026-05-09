@@ -24,24 +24,49 @@ scheduled tasks, durable long-running jobs, and full observability.
 ## Quick start
 
 ```bash
-# 1. Build
-cargo build --release -p astra-gateway
+# 1. Install (or build from source: cargo build --release -p astra-gateway)
+curl -sSL https://raw.githubusercontent.com/matrixorigin/astra-suite/main/scripts/install.sh | sh
 
-# 2. Create a config from the template
-cp crates/astra-gateway/gateway.example.yaml gateway.yaml
-# Edit gateway.yaml — pick a CLI backend and at least one platform.
+# 2. Generate the starter config at ~/.astra-gateway/config.yaml (chmod 600)
+astra-gateway init
+# Edit the file: fill AWS_BEARER_TOKEN_BEDROCK + wecom.bot_id + wecom.secret.
 
-# 3. (WeChat only) Scan QR to log in
-./target/release/astra-gateway --config gateway.yaml login-weixin
+# 3. (WeChat personal account only) Scan QR to log in
+astra-gateway login-weixin
 
-# 4. Run
-./target/release/astra-gateway --config gateway.yaml
+# 4. Run as a background daemon
+astra-gateway start
+astra-gateway status
+astra-gateway stop
 ```
 
-Zero external deps: the default storage backend is **SQLite**
-(`~/.astra-gateway/gateway.db`), created automatically on first run.
-Full feature set out of the box — durable tasks, trace, outbox, cron, all
-work on SQLite.
+Default paths (all under `~/.astra-gateway/`):
+
+| File           | Purpose                              |
+|----------------|--------------------------------------|
+| `config.yaml`  | Gateway config (override with `--config`) |
+| `gateway.db`   | SQLite store (default backend)       |
+| `gateway.log`  | Daemon stdout/stderr                 |
+| `gateway.pid`  | Daemon pid (auto-cleaned on stop)    |
+
+Zero external deps: SQLite is created on first run; durable tasks, trace,
+outbox, and cron all work on it.
+
+## Subcommands
+
+| Command                   | Description |
+|---------------------------|-------------|
+| `astra-gateway init`      | Write `~/.astra-gateway/config.yaml` (WeCom + Claude/Bedrock + SQLite, 0600) |
+| `astra-gateway login-weixin` | QR-code login for WeChat personal accounts |
+| `astra-gateway start`     | Daemonize and run in background (idempotent) |
+| `astra-gateway status`    | Show whether the daemon is running, plus paths |
+| `astra-gateway stop`      | Graceful SIGTERM, escalates to SIGKILL after 15s |
+| `astra-gateway update`    | Self-replace with the latest release (atomic, with `ghfast.top` fallback) |
+| `astra-gateway`           | Run in foreground (Ctrl+C to stop) — handy for debugging |
+
+`update` accepts `--version <tag>` and `--mirror <url>`. Both `update` and
+the installer honor `ASTRA_GHPROXY` for the GitHub mirror (default
+`https://ghfast.top`).
 
 ## Backends
 
@@ -94,43 +119,34 @@ workspace on your behalf.
 
 ## Configuration
 
-Full config reference lives in
-[`gateway.example.yaml`](gateway.example.yaml). Minimal example:
+The `init` template ([`gateway-wecom-claude.yaml`](gateway-wecom-claude.yaml))
+is the recommended starting point — minimal WeCom + Claude/Bedrock + SQLite.
+For the full reference (all platforms, advanced cron, custom CLIs) see
+[`gateway.example.yaml`](gateway.example.yaml).
 
 ```yaml
 cli:
   type: claude
   bin: claude
-  model: claude-sonnet-4-6
-  stream_json: true
-
-cli_profiles:                              # /cli switch targets
-  copilot:
-    type: copilot
-    bin: copilot
-    model: gpt-5.2
-    stream_json: true
-    allow_all_tools: true
-  copilot-script:
-    type: copilot
-    bin: copilot
-    launcher:
-      type: script
-      path: ~/.astra-gateway/copilot-launcher
-    stream_json: true
-    allow_all_tools: true
+  model: sonnet
+  env:                                    # injected into the spawned CLI
+    CLAUDE_CODE_USE_BEDROCK: "1"
+    AWS_REGION: "us-east-1"
+    AWS_BEARER_TOKEN_BEDROCK: ""          # ← FILL ME
 
 platforms:
-  weixin:
+  wecom:
     enabled: true
-    token: ""          # from `astra-gateway login-weixin`
-    account_id: ""
-
-max_concurrent_runs: 4
+    bot_id: ""                            # ← FILL ME
+    secret: ""                            # ← FILL ME
 ```
 
-Environment variables (see [.env.example](.env.example)) override YAML values
-— useful for secrets and deployment-specific overrides.
+`cli.env` (and `cli.env_file`) work for every CLI backend, so secrets and
+runtime flags live in YAML — no shell `export` needed. Treat the file as
+sensitive (`init` chmods it to 0600).
+
+Environment variables (see [.env.example](.env.example)) still override
+YAML — useful for deployment-specific tweaks.
 
 Reasoning blocks are opt-in per user. `/reasoning on` or
 `/cli <name> thinking-chain` forwards only reasoning/thinking events that the
