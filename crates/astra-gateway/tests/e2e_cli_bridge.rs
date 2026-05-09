@@ -140,6 +140,8 @@ fn claude_profile() -> CliProfile {
         model: None, // use default model
         stream_json: false,
         extra_args: vec![],
+        env: Default::default(),
+        env_file: None,
     }
 }
 

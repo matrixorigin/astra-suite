@@ -73,6 +73,8 @@ fn offline_claude_hello_parse() {
         model: None,
         stream_json: false,
         extra_args: vec![],
+        env: Default::default(),
+        env_file: None,
     };
     let result = profile.parse_output(&json, 0);
 
@@ -98,6 +100,8 @@ fn offline_claude_session_id_format() {
         model: None,
         stream_json: false,
         extra_args: vec![],
+        env: Default::default(),
+        env_file: None,
     };
     let result = profile.parse_output(&json, 0);
     let sid = result.session_id.unwrap();
@@ -143,6 +147,8 @@ fn offline_both_clis_return_session_id() {
             model: None,
             stream_json: false,
             extra_args: vec![],
+            env: Default::default(),
+            env_file: None,
         }
         .parse_output(&json, 0)
     };
@@ -166,6 +172,8 @@ fn offline_both_clis_return_text() {
             model: None,
             stream_json: false,
             extra_args: vec![],
+            env: Default::default(),
+            env_file: None,
         }
         .parse_output(&json, 0)
     };

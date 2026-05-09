@@ -174,13 +174,21 @@ pub enum CliProfile {
         bin: String,
         model: Option<String>,
         /// Use `--output-format stream-json` for real-time token/tool events on stdout.
-        /// When false (default) uses `--output-format json` (single JSON blob at end).
-        #[serde(default)]
+        /// Defaults to true; set to false to fall back to a single end-of-run JSON blob.
+        #[serde(default = "default_true")]
         stream_json: bool,
         /// Extra args appended to the claude invocation before the prompt flag.
         /// Example: ["--settings", "/path/to/hooks.json"]
         #[serde(default)]
         extra_args: Vec<String>,
+        /// Environment variables injected into the spawned `claude` process.
+        /// Useful for Bedrock / Anthropic-compat backends without leaking
+        /// secrets into the parent shell. Values from `env` override `env_file`.
+        #[serde(default)]
+        env: std::collections::BTreeMap<String, String>,
+        /// Optional dotenv-style KEY=VALUE file. Loaded before `env` overrides.
+        #[serde(default)]
+        env_file: Option<String>,
     },
     #[serde(rename = "copilot")]
     Copilot {
@@ -422,6 +430,8 @@ impl CliProfile {
                 model,
                 stream_json,
                 extra_args,
+                env: _,
+                env_file: _,
             } => {
                 let mut cmd = Command::new(bin);
                 // Extra args (e.g. --settings for hook injection).
@@ -465,6 +475,7 @@ impl CliProfile {
                 if let Some(dir) = working_dir {
                     cmd.current_dir(dir);
                 }
+                self.apply_inline_env(&mut cmd);
                 cmd
             }
             Self::Copilot {
@@ -648,8 +659,16 @@ impl CliProfile {
                 bin,
                 stream_json,
                 extra_args,
+                env,
+                env_file,
                 ..
-            } => format!("claude:{bin}:stream={stream_json}:extra={extra_args:?}"),
+            } => {
+                let env_keys: Vec<&String> = env.keys().collect();
+                format!(
+                    "claude:{bin}:stream={stream_json}:extra={extra_args:?}:\
+                     env_file={env_file:?}:env_keys={env_keys:?}"
+                )
+            }
             Self::Copilot {
                 bin,
                 env,
@@ -707,23 +726,30 @@ impl CliProfile {
     }
 
     fn apply_inline_env(&self, cmd: &mut Command) {
-        if let Self::Copilot { env, .. } = self {
-            for (key, value) in env {
-                cmd.env(key, value);
+        match self {
+            Self::Copilot { env, .. } | Self::Claude { env, .. } => {
+                for (key, value) in env {
+                    cmd.env(key, value);
+                }
             }
+            _ => {}
         }
     }
 
     fn apply_runtime_environment(&self, cmd: &mut Command) -> Result<(), String> {
-        if let Self::Copilot { env_file, env, .. } = self {
-            if let Some(path) = env_file.as_deref().filter(|p| !p.trim().is_empty()) {
-                for (key, value) in load_env_file(path)? {
-                    cmd.env(key, value);
-                }
+        let (env_file, env) = match self {
+            Self::Copilot { env_file, env, .. } | Self::Claude { env_file, env, .. } => {
+                (env_file, env)
             }
-            for (key, value) in env {
+            _ => return Ok(()),
+        };
+        if let Some(path) = env_file.as_deref().filter(|p| !p.trim().is_empty()) {
+            for (key, value) in load_env_file(path)? {
                 cmd.env(key, value);
             }
+        }
+        for (key, value) in env {
+            cmd.env(key, value);
         }
         Ok(())
     }
@@ -2259,6 +2285,8 @@ Your Copilot CLI policy setting may be preventing access."#;
             model: Some("claude-sonnet-4-6".into()),
             stream_json: false,
             extra_args: vec![],
+            env: Default::default(),
+            env_file: None,
         };
         let cmd = p.build_command("fix bug", None, None);
         let args: Vec<_> = cmd.as_std().get_args().collect();
@@ -2274,6 +2302,8 @@ Your Copilot CLI policy setting may be preventing access."#;
             model: None,
             stream_json: false,
             extra_args: vec![],
+            env: Default::default(),
+            env_file: None,
         };
         let cmd = p.build_command_with_context("hi", None, None, Some("gateway context"));
         let args: Vec<_> = cmd.as_std().get_args().collect();

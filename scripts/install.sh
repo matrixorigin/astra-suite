@@ -5,6 +5,9 @@
 #   curl -sSL ... | sh -s -- -v v0.1.0
 #   curl -sSL ... | sh -s -- -y              # skip confirmation
 #   curl -sSL ... | sh -s -- -d ~/.local/bin  # custom directory
+#
+# Network: tries GitHub directly (10s timeout); on failure falls back to a
+# mirror. Override with ASTRA_GHPROXY=https://your-mirror (default ghfast.top).
 
 set -eu
 
@@ -23,6 +26,34 @@ REPO="matrixorigin/astra-suite"
 VERSION=""
 INSTALL_DIR=""
 FORCE=false
+GHPROXY="${ASTRA_GHPROXY:-https://ghfast.top}"
+
+# Try direct GitHub URL first (10s timeout); on failure, fall back to a
+# GitHub mirror (default https://ghfast.top, override via ASTRA_GHPROXY).
+# Args: <url> <output-path>
+download() {
+  _url="$1"; _out="$2"
+  if curl -fL# --max-time 10 -o "$_out" "$_url" 2>/dev/null; then
+    return 0
+  fi
+  warn "Direct download failed, retrying via mirror: $GHPROXY"
+  curl -fL# -o "$_out" "${GHPROXY}/${_url}"
+}
+
+# Resolve "latest" via the redirect of /releases/latest (avoids api.github.com).
+# Falls back through the mirror on timeout.
+resolve_latest() {
+  _repo_url="https://github.com/$REPO/releases/latest"
+  _redir=$(curl -sIL --max-time 10 -o /dev/null -w '%{url_effective}' "$_repo_url" 2>/dev/null || true)
+  case "$_redir" in
+    *"/releases/tag/"*) ;;
+    *)
+      warn "Direct version lookup failed, retrying via mirror: $GHPROXY"
+      _redir=$(curl -sIL -o /dev/null -w '%{url_effective}' "${GHPROXY}/${_repo_url}" 2>/dev/null || true)
+      ;;
+  esac
+  printf '%s' "${_redir##*/tag/}"
+}
 
 # ── Parse args ──────────────────────────────────────────────────────
 
@@ -62,7 +93,7 @@ detect_target() {
 # ── Resolve version ─────────────────────────────────────────────────
 
 if [ -z "$VERSION" ]; then
-  VERSION=$(curl -sSf "https://api.github.com/repos/$REPO/releases/latest" | grep '"tag_name"' | sed 's/.*"tag_name": *"//;s/".*//')
+  VERSION=$(resolve_latest)
   if [ -z "$VERSION" ]; then
     error "Failed to fetch latest version"
     exit 1
@@ -102,7 +133,7 @@ fi
 TMPDIR=$(mktemp -d)
 trap 'rm -rf "$TMPDIR"' EXIT
 
-curl -sSfL "$URL" -o "$TMPDIR/$ARCHIVE" || { error "Download failed"; exit 1; }
+download "$URL" "$TMPDIR/$ARCHIVE" || { error "Download failed"; exit 1; }
 tar xzf "$TMPDIR/$ARCHIVE" -C "$TMPDIR"
 
 if [ -w "$INSTALL_DIR" ]; then
@@ -116,9 +147,58 @@ chmod +x "$INSTALL_DIR/astra-gateway"
 
 ok "astra-gateway $VERSION installed to $INSTALL_DIR/astra-gateway"
 
-# Check PATH
+# ── PATH setup ──────────────────────────────────────────────────────
+
 case ":$PATH:" in
-  *":$INSTALL_DIR:"*) ;;
-  *) warn "$INSTALL_DIR is not in your PATH. Add it with:"
-     warn "  export PATH=\"$INSTALL_DIR:\$PATH\"" ;;
+  *":$INSTALL_DIR:"*) exit 0 ;;
 esac
+
+warn "$INSTALL_DIR is not in your PATH."
+
+if [ "$FORCE" = "true" ]; then
+  answer=y
+elif [ -t 0 ]; then
+  printf "Append it to your shell rc file? [y/N] "
+  read -r answer || answer=n
+else
+  answer=auto-no
+fi
+
+case "$answer" in
+  y|Y|yes|YES) ;;
+  auto-no)
+    warn "Non-interactive shell detected; skipping rc update."
+    warn "Re-run with -y to auto-append, or add manually:"
+    warn "  echo 'export PATH=\"$INSTALL_DIR:\$PATH\"' >> ~/.bashrc   # or ~/.zshrc"
+    warn "  export PATH=\"$INSTALL_DIR:\$PATH\"                      # current session"
+    exit 0
+    ;;
+  *)
+    warn "Skipped. Add it manually with:"
+    warn "  echo 'export PATH=\"$INSTALL_DIR:\$PATH\"' >> ~/.bashrc   # or ~/.zshrc"
+    warn "  export PATH=\"$INSTALL_DIR:\$PATH\"                      # current session"
+    exit 0
+    ;;
+esac
+
+LINE="export PATH=\"$INSTALL_DIR:\$PATH\""
+case "${SHELL##*/}" in
+  zsh)  RC="$HOME/.zshrc" ;;
+  bash) [ -f "$HOME/.bashrc" ] && RC="$HOME/.bashrc" || RC="$HOME/.bash_profile" ;;
+  fish)
+    mkdir -p "$HOME/.config/fish"
+    RC="$HOME/.config/fish/config.fish"
+    LINE="set -gx PATH $INSTALL_DIR \$PATH"
+    ;;
+  *)    RC="$HOME/.profile" ;;
+esac
+
+touch "$RC"
+if grep -Fqs "$INSTALL_DIR" "$RC"; then
+  ok "$INSTALL_DIR already referenced in $RC"
+else
+  printf '\n# Added by astra-gateway installer\n%s\n' "$LINE" >> "$RC"
+  ok "Appended PATH entry to $RC"
+fi
+
+ok "Restart your shell, or run: source $RC"

@@ -35,15 +35,19 @@ Claude Code · Codex · Astra · Custom CLI
 curl -sSL https://raw.githubusercontent.com/matrixorigin/astra-suite/main/scripts/install.sh | sh
 ```
 
-Or download binaries directly from [GitHub Releases](https://github.com/matrixorigin/astra-suite/releases).
+Or grab binaries directly from [GitHub Releases](https://github.com/matrixorigin/astra-suite/releases).
 
 **Quick start:**
 
 ```bash
-astra-gateway init          # generate gateway.yaml (Claude + SQLite)
-astra-gateway login-weixin  # scan QR for WeChat
-astra-gateway               # start
+astra-gateway init     # writes ~/.astra-gateway/config.yaml (WeCom + Claude/Bedrock + SQLite)
+# edit the 3 FILL-ME fields: AWS_BEARER_TOKEN_BEDROCK, wecom.bot_id, wecom.secret
+astra-gateway start    # run as background daemon
+astra-gateway status   # check it's up
+astra-gateway stop     # graceful shutdown
 ```
+
+Upgrade in place with `astra-gateway update`.
 
 See [`crates/astra-gateway/README.md`](crates/astra-gateway/README.md) for full documentation.
 
