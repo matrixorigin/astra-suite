@@ -33,7 +33,8 @@ GHPROXY="${ASTRA_GHPROXY:-https://ghfast.top}"
 # Args: <url> <output-path>
 download() {
   _url="$1"; _out="$2"
-  if curl -fL# --max-time 10 -o "$_out" "$_url" 2>/dev/null; then
+  info "Downloading $_url"
+  if curl -fL# --max-time 10 -o "$_out" "$_url"; then
     return 0
   fi
   warn "Direct download failed, retrying via mirror: $GHPROXY"
@@ -93,11 +94,13 @@ detect_target() {
 # ── Resolve version ─────────────────────────────────────────────────
 
 if [ -z "$VERSION" ]; then
+  info "Resolving latest version..."
   VERSION=$(resolve_latest)
   if [ -z "$VERSION" ]; then
     error "Failed to fetch latest version"
     exit 1
   fi
+  ok "Latest version: $VERSION"
 fi
 
 # ── Resolve install dir ─────────────────────────────────────────────
@@ -134,6 +137,7 @@ TMPDIR=$(mktemp -d)
 trap 'rm -rf "$TMPDIR"' EXIT
 
 download "$URL" "$TMPDIR/$ARCHIVE" || { error "Download failed"; exit 1; }
+info "Extracting..."
 tar xzf "$TMPDIR/$ARCHIVE" -C "$TMPDIR"
 
 if [ -w "$INSTALL_DIR" ]; then
