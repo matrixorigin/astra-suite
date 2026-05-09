@@ -298,6 +298,8 @@ mod tests {
             model: None,
             stream_json: false,
             extra_args: vec![],
+            env: Default::default(),
+            env_file: None,
         };
         let ctx = GatewayContext::new("u1", "Test", "weixin", &cli, true);
         let prompt = ctx.to_system_prompt();

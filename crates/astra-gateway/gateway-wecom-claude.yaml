@@ -1,0 +1,29 @@
+# ──────────────────────────────────────────────────────────────────────
+# Astra Gateway — minimal template
+#   Inbound : WeCom AI Bot (企业微信)
+#   Backend : Claude Code CLI (Bedrock)
+#   Storage : local SQLite at ~/.astra-gateway/gateway.db (zero deps)
+#
+# Quick start:
+#   1. astra-gateway init           # writes this file to ~/.astra-gateway/config.yaml
+#   2. Fill the FILL-ME fields below (WeCom creds + Bedrock token).
+#   3. astra-gateway start          # runs as a background daemon
+#
+# This file is the single source of truth — no shell `export` needed.
+# Treat it as a secret (chmod 600).
+# ──────────────────────────────────────────────────────────────────────
+
+cli:
+  type: claude
+  bin: claude          # must be on PATH; or absolute path e.g. /home/you/.npm-global/bin/claude
+  model: sonnet        # override per-session in chat with /model
+  env:
+    CLAUDE_CODE_USE_BEDROCK: "1"
+    AWS_REGION: "us-east-1"
+    AWS_BEARER_TOKEN_BEDROCK: ""    # ← FILL ME (Bedrock bearer token)
+
+platforms:
+  wecom:
+    enabled: true
+    bot_id: ""         # ← FILL ME (企业微信管理后台 → AI 机器人 → Bot ID)
+    secret: ""         # ← FILL ME (同上 → Secret)
