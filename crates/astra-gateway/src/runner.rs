@@ -1347,11 +1347,15 @@ impl GatewayRunner {
                         sent_initial_ack = true;
                         let ack = format!("[{request_tag}] 🤔 {cli_name} 思考中…");
                         if let Some(ref tx) = self.outbound_tx {
-                            let _ = tx.try_send(OutboundMessage::plain(
-                                msg.platform.to_string(),
-                                chat_id.clone(),
-                                ack,
-                            ));
+                            let _ = tx.try_send(OutboundMessage {
+                                platform: msg.platform.to_string(),
+                                chat_id: chat_id.clone(),
+                                text: ack,
+                                reply_token: reply_token.clone(),
+                                outbox: None,
+                                stream_id: None,
+                                stream_finish: true,
+                            });
                         }
                     }
                     next_timer.as_mut().reset(tokio::time::Instant::now() + HEARTBEAT_INTERVAL);
