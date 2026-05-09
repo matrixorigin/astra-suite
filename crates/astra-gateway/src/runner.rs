@@ -1246,9 +1246,22 @@ impl GatewayRunner {
                                 }
                             }
                         }
-                        Some(CliProgress::ToolStarted { ref name }) => {
+                        Some(CliProgress::ToolStarted { ref name, ref params }) => {
                             _tool_count += 1;
                             _last_tool = name.clone();
+                            // Append tool use indicator to stream and flush immediately
+                            if stream_id.is_some() {
+                                if !accumulated.is_empty() && !accumulated.ends_with('\n') {
+                                    accumulated.push('\n');
+                                }
+                                let tool_line = if let Some(p) = params {
+                                    format!("🔧 {}: {}\n", name, p)
+                                } else {
+                                    format!("🔧 {}\n", name)
+                                };
+                                accumulated.push_str(&tool_line);
+                                send_stream(&accumulated, &self.outbound_tx, msg.platform, &chat_id, reply_token.clone(), stream_id.clone(), false);
+                            }
                         }
                         Some(CliProgress::ToolDone { name, .. }) => {
                             _last_tool = name;
