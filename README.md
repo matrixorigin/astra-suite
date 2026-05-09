@@ -35,11 +35,7 @@ Claude Code · Codex · Astra · Custom CLI
 curl -sSL https://raw.githubusercontent.com/matrixorigin/astra-suite/main/scripts/install.sh | sh
 ```
 
-The installer downloads the prebuilt binary, installs it to `~/.local/bin`,
-and (with confirmation) appends that path to your shell rc file. Behind the
-GFW it falls back to `https://ghfast.top` automatically — override with
-`ASTRA_GHPROXY=<your-mirror>`. Or grab binaries directly from
-[GitHub Releases](https://github.com/matrixorigin/astra-suite/releases).
+Or grab binaries directly from [GitHub Releases](https://github.com/matrixorigin/astra-suite/releases).
 
 **Quick start:**
 

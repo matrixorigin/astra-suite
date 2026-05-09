@@ -40,18 +40,6 @@ astra-gateway status
 astra-gateway stop
 ```
 
-Default paths (all under `~/.astra-gateway/`):
-
-| File           | Purpose                              |
-|----------------|--------------------------------------|
-| `config.yaml`  | Gateway config (override with `--config`) |
-| `gateway.db`   | SQLite store (default backend)       |
-| `gateway.log`  | Daemon stdout/stderr                 |
-| `gateway.pid`  | Daemon pid (auto-cleaned on stop)    |
-
-Zero external deps: SQLite is created on first run; durable tasks, trace,
-outbox, and cron all work on it.
-
 ## Subcommands
 
 | Command                   | Description |
@@ -64,9 +52,7 @@ outbox, and cron all work on it.
 | `astra-gateway update`    | Self-replace with the latest release (atomic, with `ghfast.top` fallback) |
 | `astra-gateway`           | Run in foreground (Ctrl+C to stop) — handy for debugging |
 
-`update` accepts `--version <tag>` and `--mirror <url>`. Both `update` and
-the installer honor `ASTRA_GHPROXY` for the GitHub mirror (default
-`https://ghfast.top`).
+`update` accepts `--version <tag>` and `--mirror <url>`.
 
 ## Backends
 
