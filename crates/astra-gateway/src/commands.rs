@@ -636,6 +636,7 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
              `/running` — 查看正在执行的任务 (带编号)\n\
              `/cancel [N|text]` — 取消排队请求 (序号/文本/ID)\n\
              `/kill [N|text]` — 终止运行中请求 (序号/文本/ID)\n\
+             `/stop` — 停止当前生成 (= 无参 `/kill`)\n\
              `/retry` — 查看发送失败的消息\n\
              `/retry dismiss` — 清除所有失败消息\n\
              `/manage [指令]` — AI 辅助任务管理\n\
@@ -1012,7 +1013,7 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
             }
         }
 
-        "/kill" => {
+        "/kill" | "/stop" => {
             let repo = require_trace_repo!(ctx);
             let conversation =
                 ConversationKey::new(ctx.platform, ctx.chat_id, ctx.resolved_cli.name());
@@ -2957,6 +2958,71 @@ mod tests {
         assert!(
             active_tasks.get(t1.as_str()).is_none(),
             "cancelled token entry should be removed from active_tasks"
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_is_alias_for_bare_kill() {
+        // /stop must pick the most recent running request and cancel its
+        // in-memory token, exactly like bare /kill. Users type /stop because
+        // it reads more naturally; the implementation routes through the
+        // same arm, so this test locks the alias wiring in place.
+        //
+        // Note: seed_running_request + mark_running only appends an event;
+        // it does NOT push request.status to Running. Bare /kill/stop filter
+        // on RequestStatus::Running, so we must push the status explicitly.
+        use crate::trace_model::InMemoryTraceRepository;
+        let repo = InMemoryTraceRepository::default();
+        let config = test_config();
+        let cli = crate::cli_bridge::CliProfile::default();
+        let astra = astra::Client::new("http://localhost:8080", None).unwrap();
+        let active_tasks: dashmap::DashMap<String, tokio_util::sync::CancellationToken> =
+            dashmap::DashMap::new();
+
+        let t1 = seed_running_request(&repo, cli.name(), "chat_kill_all", "live").await;
+        // Promote Accepted → Running so the /stop auto-pick filter finds it.
+        let active = repo
+            .list_active_requests(&ConversationKey::new("test", "chat_kill_all", cli.name()), 10)
+            .await
+            .unwrap();
+        let req_id = active.into_iter().find(|r| r.trace_id == t1).unwrap().request_id;
+        repo.update_request_status(&req_id, RequestStatus::Running, None)
+            .await
+            .unwrap();
+
+        let token = tokio_util::sync::CancellationToken::new();
+        active_tasks.insert(t1.as_str().to_string(), token.clone());
+
+        let ctx = build_ctx_with_repo(&config, &cli, &astra, &repo, Some(&active_tasks)).await;
+        let result = handle_command(&ctx, "/stop").await.unwrap();
+
+        assert!(
+            result.contains("终止") || result.contains("killed"),
+            "/stop should report kill confirmation like /kill: {result}"
+        );
+        assert!(
+            token.is_cancelled(),
+            "/stop must cancel the running task's token"
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_all_sweeps_like_kill_all() {
+        // /stop all should also delegate to the bulk sweep path.
+        use crate::trace_model::InMemoryTraceRepository;
+        let repo = InMemoryTraceRepository::default();
+        let config = test_config();
+        let cli = crate::cli_bridge::CliProfile::default();
+        let astra = astra::Client::new("http://localhost:8080", None).unwrap();
+
+        seed_running_request(&repo, cli.name(), "chat_kill_all", "a").await;
+        seed_running_request(&repo, cli.name(), "chat_kill_all", "b").await;
+
+        let ctx = build_ctx_with_repo(&config, &cli, &astra, &repo, None).await;
+        let result = handle_command(&ctx, "/stop all").await.unwrap();
+        assert!(
+            result.contains("2"),
+            "/stop all should report 2 cleared: {result}"
         );
     }
 

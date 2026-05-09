@@ -888,4 +888,17 @@ mod tests {
         // Preserves @ in emails/code (not at word boundary)
         assert_eq!(strip_at_mentions("test@example.com"), "test@example.com");
     }
+
+    #[test]
+    fn strip_at_mentions_preserves_slash_command() {
+        // Group chat: users type "@BotName /stop". After stripping the mention
+        // the remaining text must be "/stop" so handle_command's "starts_with('/')"
+        // check routes it to the slash dispatcher instead of sending to Claude.
+        assert_eq!(strip_at_mentions("@问 /stop"), "/stop");
+        assert_eq!(strip_at_mentions("@问 /kill all"), "/kill all");
+        // Chinese bot name, full-width space — still stripped at first ASCII space.
+        assert_eq!(strip_at_mentions("@问本 /help"), "/help");
+        // Multiple mentions before a slash command.
+        assert_eq!(strip_at_mentions("@A @B /stop"), "/stop");
+    }
 }
