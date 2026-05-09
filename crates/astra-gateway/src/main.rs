@@ -491,11 +491,11 @@ async fn main() {
             );
             std::process::exit(1);
         }
-        if let Some(parent) = dest.parent() {
-            if let Err(e) = std::fs::create_dir_all(parent) {
-                eprintln!("failed to create {}: {e}", parent.display());
-                std::process::exit(1);
-            }
+        if let Some(parent) = dest.parent()
+            && let Err(e) = std::fs::create_dir_all(parent)
+        {
+            eprintln!("failed to create {}: {e}", parent.display());
+            std::process::exit(1);
         }
         let template = include_str!("../gateway-wecom-claude.yaml");
         std::fs::write(&dest, template).expect("failed to write config");
