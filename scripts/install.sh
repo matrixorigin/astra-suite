@@ -124,12 +124,37 @@ info "Installing astra-gateway $VERSION ($TARGET)"
 info "From: $URL"
 info "To:   $INSTALL_DIR/astra-gateway"
 
+# Prompt the user, even when the script is piped via `curl | sh`.
+# Reads from /dev/tty when stdin is not a tty; if no tty is available,
+# echoes the provided default and returns it (so non-interactive runs
+# don't hang or silently abort).
+# Args: <prompt> <default>   → result on stdout
+ask() {
+  _prompt="$1"; _default="$2"
+  if [ -t 0 ]; then
+    printf '%s' "$_prompt" >&2
+    read -r _ans || _ans=$_default
+    printf '%s' "$_ans"
+    return
+  fi
+  # stdin isn't a tty (e.g. piped via `curl | sh`). Try /dev/tty in a
+  # subshell so a redirect failure can't kill the parent script.
+  printf '%s' "$_prompt" >&2
+  _ans=$(exec 2>/dev/null; read -r x </dev/tty && printf '%s' "$x") || _ans=""
+  if [ -n "$_ans" ]; then
+    printf '%s' "$_ans"
+  else
+    # Either no /dev/tty or user just pressed Enter → use default.
+    printf '[default: %s]\n' "$_default" >&2
+    printf '%s' "$_default"
+  fi
+}
+
 if [ "$FORCE" != "true" ]; then
-  printf "Continue? [y/N] "
-  read -r answer
+  answer=$(ask "Continue? [Y/n] " y)
   case "$answer" in
-    y|Y|yes|YES) ;;
-    *) info "Aborted."; exit 0 ;;
+    n|N|no|NO) info "Aborted."; exit 0 ;;
+    *) ;;
   esac
 fi
 
@@ -161,28 +186,18 @@ warn "$INSTALL_DIR is not in your PATH."
 
 if [ "$FORCE" = "true" ]; then
   answer=y
-elif [ -t 0 ]; then
-  printf "Append it to your shell rc file? [y/N] "
-  read -r answer || answer=n
 else
-  answer=auto-no
+  answer=$(ask "Append it to your shell rc file? [Y/n] " y)
 fi
 
 case "$answer" in
-  y|Y|yes|YES) ;;
-  auto-no)
-    warn "Non-interactive shell detected; skipping rc update."
-    warn "Re-run with -y to auto-append, or add manually:"
-    warn "  echo 'export PATH=\"$INSTALL_DIR:\$PATH\"' >> ~/.bashrc   # or ~/.zshrc"
-    warn "  export PATH=\"$INSTALL_DIR:\$PATH\"                      # current session"
-    exit 0
-    ;;
-  *)
+  n|N|no|NO)
     warn "Skipped. Add it manually with:"
     warn "  echo 'export PATH=\"$INSTALL_DIR:\$PATH\"' >> ~/.bashrc   # or ~/.zshrc"
     warn "  export PATH=\"$INSTALL_DIR:\$PATH\"                      # current session"
     exit 0
     ;;
+  *) ;;
 esac
 
 LINE="export PATH=\"$INSTALL_DIR:\$PATH\""
