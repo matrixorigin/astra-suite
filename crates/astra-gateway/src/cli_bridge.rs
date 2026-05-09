@@ -61,6 +61,8 @@ pub enum CliProgress {
     /// Tool execution started.
     ToolStarted {
         name: String,
+        /// Brief description of tool params (extracted from assistant message).
+        params: Option<String>,
     },
     /// Tool execution completed.
     ToolDone {
@@ -983,13 +985,42 @@ fn parse_claude_stream_json_stdout(stdout: &str, exit_code: i32) -> CliResult {
 ///   - `system` (init): tools, model, session info
 ///   - `assistant`: message with content blocks (text, tool_use, thinking)
 ///   - `result`: final answer with usage stats — carries session_id, result text, and token usage
+fn truncate_unicode(s: &str, max_chars: usize) -> String {
+    match s.char_indices().nth(max_chars) {
+        None => s.to_string(),
+        Some((idx, _)) => format!("{}…", &s[..idx]),
+    }
+}
+
 fn parse_claude_stream_json_line(line: &str) -> Option<CliProgress> {
     let v = serde_json::from_str::<serde_json::Value>(line).ok()?;
     match v["type"].as_str()? {
         // Assistant message — used for tool_use/tool_result detection.
-        // All assistant content blocks are already handled via stream_event deltas.
-        // Tool tracking for final stats is done in parse_claude_stream_json_stdout.
-        "assistant" => None,
+        // Extract tool_use params from the complete assistant message.
+        // Text/thinking/tool tracking already handled via stream_event deltas.
+        "assistant" => {
+            let content = v["message"]["content"].as_array()?;
+            for block in content {
+                if block["type"].as_str() == Some("tool_use") {
+                    let name = block["name"].as_str().unwrap_or("tool").to_string();
+                    let input = &block["input"];
+                    let description = input["description"].as_str().unwrap_or("");
+                    let arg = input["command"]
+                        .as_str()
+                        .or_else(|| input["file_path"].as_str())
+                        .or_else(|| input["query"].as_str())
+                        .unwrap_or("");
+                    let params = match (description, arg) {
+                        ("", "") => None,
+                        (desc, "") => Some(desc.to_string()),
+                        ("", arg) => Some(truncate_unicode(arg, 40)),
+                        (desc, arg) => Some(format!("{} ({})", desc, truncate_unicode(arg, 30))),
+                    };
+                    return Some(CliProgress::ToolStarted { name, params });
+                }
+            }
+            None
+        }
         // Real-time streaming events from --include-partial-messages.
         // content_block_delta carries incremental text tokens as they're generated.
         "stream_event" => {
@@ -1020,14 +1051,7 @@ fn parse_claude_stream_json_line(line: &str) -> Option<CliProgress> {
                         _ => None,
                     }
                 }
-                Some("content_block_start") => {
-                    let block = &event["content_block"];
-                    if block["type"].as_str() == Some("tool_use") {
-                        let name = block["name"].as_str().unwrap_or("tool").to_string();
-                        return Some(CliProgress::ToolStarted { name });
-                    }
-                    None
-                }
+                Some("content_block_start") => None,
                 _ => None,
             }
         }
@@ -1224,7 +1248,7 @@ fn parse_copilot_jsonl_line(line: &str) -> Option<CliProgress> {
             .map(|text| CliProgress::Status(text.to_string())),
         "tool.execution_start" => {
             let name = v["data"]["toolName"].as_str().unwrap_or("tool").to_string();
-            Some(CliProgress::ToolStarted { name })
+            Some(CliProgress::ToolStarted { name, params: None })
         }
         "tool.execution_complete" => {
             let name = v["data"]["toolName"].as_str().unwrap_or("tool").to_string();
@@ -1361,16 +1385,23 @@ fn parse_codex_stream_json_line(line: &str) -> Option<CliProgress> {
                 }
                 Some("command_execution") => {
                     let cmd = item["command"].as_str().unwrap_or("shell").to_string();
-                    return Some(CliProgress::ToolStarted { name: cmd });
+                    return Some(CliProgress::ToolStarted {
+                        name: cmd,
+                        params: None,
+                    });
                 }
                 Some("file_change") => {
                     return Some(CliProgress::ToolStarted {
                         name: "file_change".to_string(),
+                        params: None,
                     });
                 }
                 Some("mcp_tool_call") => {
                     let tool = item["tool"].as_str().unwrap_or("mcp_tool").to_string();
-                    return Some(CliProgress::ToolStarted { name: tool });
+                    return Some(CliProgress::ToolStarted {
+                        name: tool,
+                        params: None,
+                    });
                 }
                 _ => {}
             }
@@ -1509,7 +1540,7 @@ fn parse_stderr_line(line: &str) -> CliProgress {
             }
             Some("tool_started") => {
                 let name = v["name"].as_str().unwrap_or_default().to_string();
-                return CliProgress::ToolStarted { name };
+                return CliProgress::ToolStarted { name, params: None };
             }
             Some("tool_completed") => {
                 let name = v["name"].as_str().unwrap_or_default().to_string();
@@ -2811,7 +2842,7 @@ printf '%s\n' '{"type":"assistant.message_delta","data":{"deltaContent":"from sc
     fn parse_tool_started_event() {
         let line = r#"{"type":"tool_started","name":"bash","description":"ls"}"#;
         assert!(
-            matches!(parse_stderr_line(line), CliProgress::ToolStarted { name } if name == "bash")
+            matches!(parse_stderr_line(line), CliProgress::ToolStarted { name, .. } if name == "bash")
         );
     }
 
@@ -2857,7 +2888,7 @@ printf '%s\n' '{"type":"assistant.message_delta","data":{"deltaContent":"from sc
     fn parse_unicode_tool_name() {
         let line = r#"{"type":"tool_started","name":"读取文件","description":"src/main.rs"}"#;
         assert!(
-            matches!(parse_stderr_line(line), CliProgress::ToolStarted { name } if name == "读取文件")
+            matches!(parse_stderr_line(line), CliProgress::ToolStarted { name, .. } if name == "读取文件")
         );
     }
 
@@ -2997,7 +3028,7 @@ printf '%s\n' '{"type":"assistant.message_delta","data":{"deltaContent":"from sc
             r#"{"type":"item.started","item":{"type":"command_execution","command":"cargo test"}}"#;
         assert!(matches!(
             parse_codex_stream_json_line(line),
-            Some(CliProgress::ToolStarted { name }) if name == "cargo test"
+            Some(CliProgress::ToolStarted { name, params: None }) if name == "cargo test"
         ));
     }
 
@@ -3015,7 +3046,7 @@ printf '%s\n' '{"type":"assistant.message_delta","data":{"deltaContent":"from sc
         let line = r#"{"type":"item.started","item":{"type":"file_change","path":"src/lib.rs"}}"#;
         assert!(matches!(
             parse_codex_stream_json_line(line),
-            Some(CliProgress::ToolStarted { name }) if name == "file_change"
+            Some(CliProgress::ToolStarted { name, params: None }) if name == "file_change"
         ));
     }
 
@@ -3024,7 +3055,7 @@ printf '%s\n' '{"type":"assistant.message_delta","data":{"deltaContent":"from sc
         let line = r#"{"type":"item.started","item":{"type":"mcp_tool_call","tool":"web_search"}}"#;
         assert!(matches!(
             parse_codex_stream_json_line(line),
-            Some(CliProgress::ToolStarted { name }) if name == "web_search"
+            Some(CliProgress::ToolStarted { name, params: None }) if name == "web_search"
         ));
     }
 
@@ -3351,15 +3382,13 @@ extra_args:
         assert!(matches!(&events[7], Some(CliProgress::Token(t)) if t == "check."));
         // text content_block_stop → None
         assert!(events[8].is_none());
-        // tool_use content_block_start → ToolStarted
-        assert!(matches!(&events[9], Some(CliProgress::ToolStarted { name }) if name == "Bash"));
+        // tool_use content_block_start → None (params not available yet)
+        assert!(events[9].is_none());
         // tool_use content_block_stop → None
         assert!(events[10].is_none());
-        // assistant complete message → None (no duplicates!)
+        // assistant complete message → ToolStarted with params (extracted from input)
         assert!(
-            events[11].is_none(),
-            "assistant message must not emit duplicate events, got: {:?}",
-            events[11]
+            matches!(&events[11], Some(CliProgress::ToolStarted { name, .. }) if name == "Bash")
         );
         // message_delta → None
         assert!(events[12].is_none());
