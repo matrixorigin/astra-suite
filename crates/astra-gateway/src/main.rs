@@ -181,8 +181,26 @@ fn run_self_update(version: Option<String>, mirror: Option<String>) -> Result<()
     let archive = format!("{BIN_NAME}-{target}.tar.gz");
     let gh_url = format!("https://github.com/{REPO}/releases/download/{tag}/{archive}");
 
-    let tmp = std::env::temp_dir().join(format!("astra-gateway-update-{}", std::process::id()));
+    // Random suffix avoids collisions between concurrent updates; Drop guard
+    // ensures cleanup even if download / extract / self-replace fails.
+    let suffix: u64 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or_else(|_| std::process::id() as u64);
+    let tmp = std::env::temp_dir().join(format!(
+        "astra-gateway-update-{}-{}",
+        std::process::id(),
+        suffix
+    ));
     std::fs::create_dir_all(&tmp).map_err(|e| format!("tempdir: {e}"))?;
+    struct CleanupGuard(PathBuf);
+    impl Drop for CleanupGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let _guard = CleanupGuard(tmp.clone());
+
     let archive_path = tmp.join(&archive);
     let archive_path_str = archive_path.to_string_lossy().into_owned();
 
@@ -232,7 +250,6 @@ fn run_self_update(version: Option<String>, mirror: Option<String>) -> Result<()
              try `sudo astra-gateway update` if installed system-wide"
         )
     })?;
-    let _ = std::fs::remove_dir_all(&tmp);
 
     println!("✓ astra-gateway updated to {tag}");
     Ok(())
@@ -295,7 +312,13 @@ fn current_running_pid() -> Option<i32> {
     let pid_str = std::fs::read_to_string(pid_path()).ok()?;
     let pid: i32 = pid_str.trim().parse().ok()?;
     // kill(pid, 0) probes for existence without sending a signal.
-    let alive = unsafe { libc::kill(pid, 0) } == 0;
+    // errno == EPERM means the process exists but we lack permission to
+    // signal it — still "alive" from our perspective.
+    let alive = if unsafe { libc::kill(pid, 0) } == 0 {
+        true
+    } else {
+        std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    };
     if alive { Some(pid) } else { None }
 }
 
@@ -395,11 +418,11 @@ fn cmd_stop() -> Result<(), String> {
     Ok(())
 }
 
-fn cmd_status() {
+fn cmd_status(config: &Path) {
     match current_running_pid() {
         Some(pid) => {
             println!("● astra-gateway: running (pid: {pid})");
-            println!("  config: {}", default_config_path().display());
+            println!("  config: {}", config.display());
             println!("  log:    {}", log_path().display());
             println!("  pid:    {}", pid_path().display());
         }
@@ -437,7 +460,7 @@ async fn main() {
     }
 
     if let Some(Command::Status) = cli.command {
-        cmd_status();
+        cmd_status(&cli.effective_config());
         return;
     }
 
@@ -459,7 +482,7 @@ async fn main() {
     }
 
     if let Some(Command::Init { force }) = cli.command {
-        let dest = default_config_path();
+        let dest = cli.effective_config();
         if dest.exists() && !force {
             eprintln!(
                 "{} already exists — pass --force to overwrite, or edit it manually.",
