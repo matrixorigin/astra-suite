@@ -16,7 +16,7 @@
 cli:
   type: claude
   bin: claude          # must be on PATH; or absolute path e.g. /home/you/.npm-global/bin/claude
-  model: sonnet        # override per-session in chat with /model
+  model: opus          # override per-session in chat with /model
   env:
     CLAUDE_CODE_USE_BEDROCK: "1"
     AWS_REGION: "us-east-1"

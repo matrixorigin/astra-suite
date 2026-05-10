@@ -1067,7 +1067,7 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
                         })
                         .unwrap_or(false);
                     let suffix = if process_killed {
-                        " (进程已杀死)"
+                        ""
                     } else {
                         " (等待自然退出)"
                     };
