@@ -3,7 +3,7 @@
 # Usage:
 #   curl -sSL https://raw.githubusercontent.com/matrixorigin/astra-suite/main/scripts/install.sh | sh
 #   curl -sSL ... | sh -s -- -v v0.1.0
-#   curl -sSL ... | sh -s -- -y              # skip confirmation
+#   curl -sSL ... | sh -s -- -y              # auto-append PATH (no prompt)
 #   curl -sSL ... | sh -s -- -d ~/.local/bin  # custom directory
 #
 # Network: tries GitHub directly (10s timeout); on failure falls back to a
@@ -124,14 +124,31 @@ info "Installing astra-gateway $VERSION ($TARGET)"
 info "From: $URL"
 info "To:   $INSTALL_DIR/astra-gateway"
 
-if [ "$FORCE" != "true" ]; then
-  printf "Continue? [y/N] "
-  read -r answer
-  case "$answer" in
-    y|Y|yes|YES) ;;
-    *) info "Aborted."; exit 0 ;;
+# Prompt the user, even when the script is piped via `curl | sh`.
+# Reads from stdin if it's a tty, otherwise from /dev/tty.
+# Returns 0 with the answer on stdout when input was obtained.
+# Returns 1 (and writes nothing) when no tty is available so the
+# caller can fall back to a non-interactive default.
+# Args: <prompt>   → result on stdout
+ask() {
+  _prompt="$1"
+  if [ -t 0 ]; then
+    printf '%s' "$_prompt" >&2
+    IFS= read -r _ans || _ans=""
+    printf '%s' "$_ans"
+    return 0
+  fi
+  # stdin isn't a tty (e.g. piped via `curl | sh`). Try /dev/tty in a
+  # subshell so a redirect failure can't kill the parent script.
+  # Tag the captured input so we can distinguish "user pressed Enter"
+  # (empty answer) from "no tty available" (subshell aborted early).
+  printf '%s' "$_prompt" >&2
+  _result=$(exec 2>/dev/null; IFS= read -r x </dev/tty && printf 'TTY:%s' "$x") || _result=""
+  case "$_result" in
+    TTY:*) printf '%s' "${_result#TTY:}"; return 0 ;;
+    *)     printf '\n' >&2; return 1 ;;
   esac
-fi
+}
 
 TMPDIR=$(mktemp -d)
 trap 'rm -rf "$TMPDIR"' EXIT
@@ -161,22 +178,12 @@ warn "$INSTALL_DIR is not in your PATH."
 
 if [ "$FORCE" = "true" ]; then
   answer=y
-elif [ -t 0 ]; then
-  printf "Append it to your shell rc file? [y/N] "
-  read -r answer || answer=n
-else
-  answer=auto-no
+elif ! answer=$(ask "Append it to your shell rc file? [y/N] "); then
+  answer=n
 fi
 
 case "$answer" in
   y|Y|yes|YES) ;;
-  auto-no)
-    warn "Non-interactive shell detected; skipping rc update."
-    warn "Re-run with -y to auto-append, or add manually:"
-    warn "  echo 'export PATH=\"$INSTALL_DIR:\$PATH\"' >> ~/.bashrc   # or ~/.zshrc"
-    warn "  export PATH=\"$INSTALL_DIR:\$PATH\"                      # current session"
-    exit 0
-    ;;
   *)
     warn "Skipped. Add it manually with:"
     warn "  echo 'export PATH=\"$INSTALL_DIR:\$PATH\"' >> ~/.bashrc   # or ~/.zshrc"

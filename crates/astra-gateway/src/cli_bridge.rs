@@ -736,7 +736,7 @@ impl CliProfile {
         }
     }
 
-    fn apply_runtime_environment(&self, cmd: &mut Command) -> Result<(), String> {
+    pub(crate) fn apply_runtime_environment(&self, cmd: &mut Command) -> Result<(), String> {
         let (env_file, env) = match self {
             Self::Copilot { env_file, env, .. } | Self::Claude { env_file, env, .. } => {
                 (env_file, env)
@@ -1472,7 +1472,7 @@ fn parse_codex_stream_json_line(line: &str) -> Option<CliProgress> {
     }
 }
 
-fn parse_stdout_jsonl_line(line: &str, cli_name: &str) -> Option<CliProgress> {
+pub(crate) fn parse_stdout_jsonl_line(line: &str, cli_name: &str) -> Option<CliProgress> {
     let line = strip_leading_osc(line.trim()).trim();
     match cli_name {
         "codex" => parse_codex_stream_json_line(line),

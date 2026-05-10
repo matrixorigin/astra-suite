@@ -347,6 +347,8 @@ pub struct GatewayRunner {
     /// before this are zombies — their cancel tokens and CLI children
     /// died with the previous gateway lifecycle.
     gateway_start: chrono::DateTime<chrono::Utc>,
+    /// Pool of long-lived Claude CLI processes (persistent mode).
+    cli_pool: Arc<tokio::sync::Mutex<crate::cli_pool::CliProcessPool>>,
 }
 
 /// No-op adapter used in spawned CLI tasks (typing/heartbeats not available in background).
@@ -497,6 +499,9 @@ impl GatewayRunner {
             active_tasks: Arc::new(dashmap::DashMap::new()),
             send_health: SendCircuitBreaker::default(),
             gateway_start: chrono::Utc::now(),
+            cli_pool: Arc::new(tokio::sync::Mutex::new(
+                crate::cli_pool::CliProcessPool::new(),
+            )),
         })
     }
 
@@ -760,6 +765,16 @@ impl GatewayRunner {
             gateway_start: self.gateway_start,
         };
         if let Some(response) = commands::handle_command(&cmd_ctx, &msg.text).await {
+            // Commands that invalidate the long-lived process (model/session/workspace change)
+            let invalidates_pool = msg.text.starts_with("/new")
+                || msg.text.starts_with("/reset")
+                || msg.text.starts_with("/model ")
+                || msg.text.starts_with("/cli ")
+                || msg.text.starts_with("/workspace ")
+                || msg.text.starts_with("/ws ");
+            if invalidates_pool {
+                self.cli_pool.lock().await.kill(&effective_chat_id);
+            }
             return Ok(Some(response));
         }
 
@@ -1084,8 +1099,6 @@ impl GatewayRunner {
         let (progress_tx, mut progress_rx) = tokio::sync::mpsc::channel::<CliProgress>(64);
 
         // Register cancellation token for this task so /kill can abort it.
-        // Uses trace_id if available, otherwise a synthetic key based on
-        // the request tag — ensures all tasks are killable.
         let cancel_token = CancellationToken::new();
         let kill_registry_key = trace
             .as_ref()
@@ -1094,7 +1107,114 @@ impl GatewayRunner {
         self.active_tasks
             .insert(kill_registry_key.clone(), cancel_token.clone());
 
-        let cli_handle = tokio::spawn({
+        let use_pool = crate::cli_pool::CliProcessPool::supports_persistent(&cli_profile);
+
+        let cli_handle = if use_pool {
+            // Long-lived process path: send message via pool, forward progress events
+            let pool = self.cli_pool.clone();
+            let pool_key = effective_chat_id.clone();
+            let profile = cli_profile.clone();
+            let msg_text = message_text.clone();
+            let sp = system_prompt.clone();
+            let ws = workspace.clone();
+            let token = access_token.clone();
+            let kill_token = cancel_token.clone();
+
+            tokio::spawn(async move {
+                let mut pool_guard = pool.lock().await;
+                let mut pool_progress_rx = pool_guard
+                    .begin_turn(
+                        &pool_key,
+                        &msg_text,
+                        &profile,
+                        ws.as_deref(),
+                        Some(&sp),
+                        token.as_deref(),
+                    )
+                    .await?;
+                drop(pool_guard); // release lock before reading progress
+
+                // Forward events from pool's progress_rx to the runner's progress_tx
+                // until the turn ends (channel closes), cancel, or timeout.
+                let deadline = tokio::time::sleep(cli_timeout);
+                tokio::pin!(deadline);
+                loop {
+                    tokio::select! {
+                        ev = pool_progress_rx.recv() => {
+                            match ev {
+                                Some(event) => {
+                                    let _ = progress_tx.send(event).await;
+                                }
+                                None => break, // turn complete
+                            }
+                        }
+                        _ = kill_token.cancelled() => {
+                            let pool = pool.lock().await;
+                            let _ = pool.interrupt(&pool_key).await;
+                            drop(pool);
+                            // Give Claude up to 3s to emit result event after interrupt
+                            let drain_deadline = tokio::time::sleep(Duration::from_secs(3));
+                            tokio::pin!(drain_deadline);
+                            loop {
+                                tokio::select! {
+                                    ev = pool_progress_rx.recv() => {
+                                        match ev {
+                                            Some(event) => { let _ = progress_tx.send(event).await; }
+                                            None => break,
+                                        }
+                                    }
+                                    _ = &mut drain_deadline => break,
+                                }
+                            }
+                            break;
+                        }
+                        _ = &mut deadline => {
+                            tracing::warn!(key = %pool_key, "pool turn timed out, killing process");
+                            pool.lock().await.kill(&pool_key);
+                            break;
+                        }
+                    }
+                }
+
+                // Extract stats from the result event stored by stdout reader
+                let pool_guard = pool.lock().await;
+                let session_id = pool_guard.session_id(&pool_key).await;
+                let result_json = pool_guard.take_last_result(&pool_key).await;
+                drop(pool_guard);
+
+                let (text, tokens_prompt, tokens_completion, tool_calls_count) =
+                    if let Some(ref v) = result_json {
+                        (
+                            v["result"].as_str().map(String::from),
+                            v["usage"]["input_tokens"].as_u64(),
+                            v["usage"]["output_tokens"].as_u64(),
+                            v["num_turns"]
+                                .as_u64()
+                                .and_then(|t| if t > 1 { Some(t as u32) } else { None }),
+                        )
+                    } else {
+                        (None, None, None, None)
+                    };
+
+                Ok(cli_bridge::CliResult {
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    exit_code: 0,
+                    success: true,
+                    error_kind: None,
+                    trace_id: None,
+                    request_id: None,
+                    run_id: None,
+                    session_id,
+                    text,
+                    tool_calls_count,
+                    tools_used: Vec::new(),
+                    tokens_prompt,
+                    tokens_completion,
+                })
+            })
+        } else {
+            // Legacy per-request spawn path
             let profile = cli_profile.clone();
             let message_text = message_text.clone();
             let system_prompt = system_prompt.clone();
@@ -1103,7 +1223,7 @@ impl GatewayRunner {
             let kill_token = cancel_token.clone();
             let trace_id_str = trace.as_ref().map(|t| t.trace_id.to_string());
             let request_id_str = trace.as_ref().map(|t| t.request_id.to_string());
-            async move {
+            tokio::spawn(async move {
                 cli_bridge::run_cli_with_cancel(
                     &profile,
                     &message_text,
@@ -1118,8 +1238,8 @@ impl GatewayRunner {
                     Some(kill_token),
                 )
                 .await
-            }
-        });
+            })
+        };
 
         let start = Instant::now();
         let mut _tool_count: u32 = 0;
@@ -1249,15 +1369,16 @@ impl GatewayRunner {
                         Some(CliProgress::ToolStarted { ref name, ref params }) => {
                             _tool_count += 1;
                             _last_tool = name.clone();
+                            tracing::debug!(tool = %name, params = ?params, "ToolStarted received");
                             // Append tool use indicator to stream and flush immediately
                             if stream_id.is_some() {
                                 if !accumulated.is_empty() && !accumulated.ends_with('\n') {
-                                    accumulated.push('\n');
+                                    accumulated.push_str("\n\n");
                                 }
                                 let tool_line = if let Some(p) = params {
-                                    format!("🔧 {}: {}\n", name, p)
+                                    format!("🔧 {}: {}\n\n", name, p)
                                 } else {
-                                    format!("🔧 {}\n", name)
+                                    format!("🔧 {}\n\n", name)
                                 };
                                 accumulated.push_str(&tool_line);
                                 send_stream(&accumulated, &self.outbound_tx, msg.platform, &chat_id, reply_token.clone(), stream_id.clone(), false);

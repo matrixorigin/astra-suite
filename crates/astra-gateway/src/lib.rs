@@ -1,5 +1,6 @@
 pub mod access_control;
 pub mod cli_bridge;
+pub(crate) mod cli_pool;
 pub mod commands;
 pub mod config;
 pub mod dedup;
