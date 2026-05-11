@@ -378,7 +378,6 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
         }
 
         "/model" => {
-            let cli_name = ctx.resolved_cli.name();
             let current_model = ctx.resolved_cli.model_name();
             // Config default: the `cli.model` field in gateway.yaml. When the
             // user has no per-user override, resolve_cli_profile returns this
@@ -391,9 +390,8 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
                     .map(|m| display_model_name(m, &entries))
                     .unwrap_or_else(|| "默认".to_string());
                 let mut lines = vec![
-                    format!("🤖 当前模型: `{current_display}` (CLI: `{cli_name}`)"),
+                    format!("🤖 当前: **{current_display}**"),
                     String::new(),
-                    "**可选模型:**".into(),
                 ];
                 for (i, entry) in entries.iter().enumerate() {
                     let mark = if entry.matches_current(current_model) {
@@ -401,35 +399,33 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
                     } else {
                         ""
                     };
-                    // "默认" row is annotated with what yaml.cli.model currently
-                    // points to; other rows show only the label.
-                    let suffix = if entry.full_id.is_none() {
+                    // "默认" row: show what yaml.cli.model points to today.
+                    // Other rows: show the short per-model description.
+                    let desc = if entry.full_id.is_none() {
                         match config_default_model {
                             Some(m) => {
                                 let pretty = display_model_name(m, &entries);
                                 if pretty == m {
-                                    format!(" — 跟随 gateway.yaml (`{m}`)")
+                                    format!("yaml → {m}")
                                 } else {
-                                    format!(" — 跟随 gateway.yaml ({pretty})")
+                                    format!("yaml → {pretty}")
                                 }
                             }
-                            None => " — 跟随 CLI 默认".to_string(),
+                            None => "yaml 未配".to_string(),
                         }
                     } else {
-                        String::new()
+                        entry.desc.to_string()
                     };
                     lines.push(format!(
-                        "  `{idx}`. {label}{mark}{suffix}",
+                        "{idx}. **{label}**{mark} · {desc}",
                         idx = i + 1,
                         label = entry.label,
                     ));
                 }
                 lines.push(String::new());
-                lines.push(
-                    "用编号/名称/完整 id 切换: `/model 2` · `/model opus` · \
-                     `/model Opus 4.7` · `/model us.anthropic.claude-opus-4-7`"
-                        .into(),
-                );
+                lines.push("切换: `/model <编号|名称|完整id>`".into());
+                lines.push("例: `/model 2`  `/model opus`  `/model Opus 4.7`".into());
+                lines.push("    `/model us.anthropic.claude-opus-4-7`".into());
                 return Some(lines.join("\n"));
             }
 
@@ -1992,27 +1988,27 @@ fn model_entries() -> Vec<ModelEntry> {
     vec![
         ModelEntry {
             label: "默认",
-            desc: "跟随配置默认模型",
+            desc: "跟随配置",
             full_id: None,
         },
         ModelEntry {
             label: "Sonnet",
-            desc: "Sonnet 4.6 · 日常任务",
+            desc: "日常任务",
             full_id: Some("us.anthropic.claude-sonnet-4-6"),
         },
         ModelEntry {
             label: "Haiku",
-            desc: "Haiku 4.5 · 快/便宜",
+            desc: "快 / 省",
             full_id: Some("us.anthropic.claude-haiku-4-5-20251001-v1:0"),
         },
         ModelEntry {
             label: "Opus 4.7",
-            desc: "Opus 4.7 · 最强，复杂任务首选",
+            desc: "最强 / 复杂任务",
             full_id: Some("us.anthropic.claude-opus-4-7"),
         },
         ModelEntry {
             label: "Opus 4.6",
-            desc: "Opus 4.6",
+            desc: "上一代 Opus",
             full_id: Some("us.anthropic.claude-opus-4-6-v1"),
         },
     ]
@@ -2412,11 +2408,11 @@ mod tests {
     });
     cmd_test!(cmd_model_no_arg_shows_current, "/model", |r| {
         let s = r.unwrap();
-        assert!(s.contains("当前模型"));
-        assert!(s.contains("可选模型"));
+        assert!(s.contains("当前"));
         assert!(s.contains("Haiku"));
         assert!(s.contains("Opus"));
         assert!(s.contains("默认"));
+        assert!(s.contains("切换"));
     });
 
     #[test]
