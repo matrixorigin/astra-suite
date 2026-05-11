@@ -401,33 +401,34 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
                     } else {
                         ""
                     };
-                    // For the "默认" row, annotate with whatever cli.model in
-                    // gateway.yaml resolves to, so users know what "default"
-                    // actually means today.
-                    let desc = if entry.full_id.is_none() {
+                    // "默认" row is annotated with what yaml.cli.model currently
+                    // points to; other rows show only the label.
+                    let suffix = if entry.full_id.is_none() {
                         match config_default_model {
                             Some(m) => {
                                 let pretty = display_model_name(m, &entries);
                                 if pretty == m {
-                                    format!("跟随 gateway.yaml 默认 (`{m}`)")
+                                    format!(" — 跟随 gateway.yaml (`{m}`)")
                                 } else {
-                                    format!("跟随 gateway.yaml 默认 ({pretty})")
+                                    format!(" — 跟随 gateway.yaml ({pretty})")
                                 }
                             }
-                            None => "跟随 CLI 默认 (gateway.yaml 未配置 cli.model)".to_string(),
+                            None => " — 跟随 CLI 默认".to_string(),
                         }
                     } else {
-                        entry.desc.to_string()
+                        String::new()
                     };
                     lines.push(format!(
-                        "  `{idx}`. {label}{mark} — {desc}",
+                        "  `{idx}`. {label}{mark}{suffix}",
                         idx = i + 1,
                         label = entry.label,
                     ));
                 }
                 lines.push(String::new());
                 lines.push(
-                    "用编号或名称: `/model 2` · `/model opus` · `/model opus 4.7`".into(),
+                    "用编号/名称/完整 id 切换: `/model 2` · `/model opus` · \
+                     `/model Opus 4.7` · `/model us.anthropic.claude-opus-4-7`"
+                        .into(),
                 );
                 return Some(lines.join("\n"));
             }
