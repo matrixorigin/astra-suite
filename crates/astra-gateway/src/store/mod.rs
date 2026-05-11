@@ -451,34 +451,32 @@ fn next_step_minutes(
     dow_field: &str,
     offset: chrono::FixedOffset,
 ) -> String {
+    // If hour_field is specific and we're not in that hour, jump to it
+    if hour_field != "*"
+        && let Ok(target_hour) = hour_field.parse::<u32>()
+        && now_local.hour() != target_hour
+    {
+        let today_target = now_local
+            .date()
+            .and_hms_opt(target_hour, 0, 0)
+            .unwrap_or(now_local);
+        if today_target > now_local {
+            return to_utc_str(today_target, offset);
+        } else {
+            let tomorrow_target = today_target + chrono::Duration::days(1);
+            return to_utc_str(tomorrow_target, offset);
+        }
+    }
+
     // Find next minute that is a multiple of step
     let current_minute = now_local.minute();
     let next_minute = ((current_minute / step) + 1) * step;
 
     let candidate_local = if next_minute < 60 {
-        // Same hour
-        let candidate = now_local
+        now_local
             .date()
             .and_hms_opt(now_local.hour(), next_minute, 0)
-            .unwrap_or(now_local + chrono::Duration::minutes(step as i64));
-
-        // If hour_field is specific, check we're in the right hour
-        if hour_field != "*"
-            && let Ok(target_hour) = hour_field.parse::<u32>()
-            && now_local.hour() != target_hour
-        {
-            let today_target = now_local
-                .date()
-                .and_hms_opt(target_hour, 0, 0)
-                .unwrap_or(now_local);
-            if today_target > now_local {
-                return to_utc_str(today_target, offset);
-            } else {
-                let tomorrow_target = today_target + chrono::Duration::days(1);
-                return to_utc_str(tomorrow_target, offset);
-            }
-        }
-        candidate
+            .unwrap_or(now_local + chrono::Duration::minutes(step as i64))
     } else {
         // Next hour, minute 0
         let next_hour = now_local + chrono::Duration::hours(1);
