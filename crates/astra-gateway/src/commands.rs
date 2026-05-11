@@ -358,11 +358,14 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
                     .list_cron_jobs(ctx.platform, ctx.chat_id)
                     .await
                     .unwrap_or_default();
-                let full_id = jobs
-                    .iter()
-                    .find(|j| j.job_id.starts_with(id))
-                    .map(|j| j.job_id.clone());
-                let target_id = full_id.as_deref().unwrap_or(id);
+                let matches: Vec<_> = jobs.iter().filter(|j| j.job_id.starts_with(id)).collect();
+                if matches.len() > 1 {
+                    return Some(format!(
+                        "⚠️ 前缀 `{id}` 匹配到 {} 个任务，请提供更多字符",
+                        matches.len()
+                    ));
+                }
+                let target_id = matches.first().map(|j| j.job_id.as_str()).unwrap_or(id);
                 match store.delete_cron_job(target_id).await {
                     Ok(true) => Some("✅ 任务已删除".into()),
                     Ok(false) => Some("❌ 找不到该任务".into()),
