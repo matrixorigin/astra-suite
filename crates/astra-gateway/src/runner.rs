@@ -10,8 +10,8 @@ use crate::gateway_context::GatewayContext;
 use crate::platforms::{InboundMessage, PlatformAdapter};
 use crate::store::{self, GatewayStore};
 use crate::trace_model::{
-    ConversationKey, GatewayRequest, OutboxId, RequestId, RequestStatus, RunStatus, TraceId,
-    TraceRepository, TraceWriter,
+    ConversationKey, GatewayEventKind, GatewayRequest, OutboxId, RequestId, RequestStatus,
+    RunStatus, TraceId, TraceRepository, TraceWriter,
 };
 use futures_util::future::select_all;
 use std::collections::HashMap;
@@ -21,6 +21,26 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
+
+/// Redact credentials that might appear in tool call params or assistant text.
+/// Scope: HTTP `Authorization` headers and well-known token prefixes
+/// (GitHub PATs, Grafana service account tokens). Applied before any
+/// tool/assistant text lands in `gw_trace_events.payload`.
+fn redact_sensitive(s: &str) -> String {
+    static AUTH_HEADER_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"(?i)(Authorization\s*:\s*(?:token|Bearer)\s+)\S+").unwrap()
+    });
+    static GITHUB_TOKEN_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"\b(gh[pousr]_|github_pat_)[A-Za-z0-9_]{20,}\b").unwrap()
+    });
+    static GRAFANA_TOKEN_RE: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r"\bglsa_[A-Za-z0-9_]{20,}\b").unwrap());
+
+    let step1 = AUTH_HEADER_RE.replace_all(s, "${1}<redacted>");
+    let step2 = GITHUB_TOKEN_RE.replace_all(&step1, "${1}<redacted>");
+    let step3 = GRAFANA_TOKEN_RE.replace_all(&step2, "glsa_<redacted>");
+    step3.into_owned()
+}
 
 const MAX_CHUNK_LEN: usize = 3800;
 const INITIAL_ACK_DELAY: Duration = Duration::from_secs(3);
@@ -1370,6 +1390,21 @@ impl GatewayRunner {
                             _tool_count += 1;
                             _last_tool = name.clone();
                             tracing::debug!(tool = %name, params = ?params, "ToolStarted received");
+                            if let Some(writer) = trace_writer.as_ref() {
+                                let redacted_params = params
+                                    .as_deref()
+                                    .map(redact_sensitive);
+                                let _ = writer
+                                    .append(
+                                        GatewayEventKind::CliProgress,
+                                        serde_json::json!({
+                                            "phase": "tool_started",
+                                            "name": name,
+                                            "params": redacted_params,
+                                        }),
+                                    )
+                                    .await;
+                            }
                             // Append tool use indicator to stream and flush immediately
                             if stream_id.is_some() {
                                 if !accumulated.is_empty() && !accumulated.ends_with('\n') {
@@ -1384,7 +1419,19 @@ impl GatewayRunner {
                                 send_stream(&accumulated, &self.outbound_tx, msg.platform, &chat_id, reply_token.clone(), stream_id.clone(), false);
                             }
                         }
-                        Some(CliProgress::ToolDone { name, .. }) => {
+                        Some(CliProgress::ToolDone { name, duration_ms }) => {
+                            if let Some(writer) = trace_writer.as_ref() {
+                                let _ = writer
+                                    .append(
+                                        GatewayEventKind::CliProgress,
+                                        serde_json::json!({
+                                            "phase": "tool_done",
+                                            "name": name,
+                                            "duration_ms": duration_ms,
+                                        }),
+                                    )
+                                    .await;
+                            }
                             _last_tool = name;
                         }
                         Some(CliProgress::ToolCall(line)) => {
@@ -1456,6 +1503,22 @@ impl GatewayRunner {
                             }
                             if !accumulated.is_empty() {
                                 progressive_text_len = accumulated.len();
+                            }
+                            if let Some(writer) = trace_writer.as_ref()
+                                && !accumulated.is_empty()
+                            {
+                                let redacted = redact_sensitive(&accumulated);
+                                let _ = writer
+                                    .append(
+                                        GatewayEventKind::CliProgress,
+                                        serde_json::json!({
+                                            "phase": "assistant_reply",
+                                            "text": redacted,
+                                            "text_len": accumulated.len(),
+                                            "tool_count": _tool_count,
+                                        }),
+                                    )
+                                    .await;
                             }
                             // Send full accumulated content with finish=true to close the stream
                             send_stream(&accumulated, &self.outbound_tx, msg.platform, &chat_id, reply_token.clone(), stream_id.clone(), true);
@@ -6273,5 +6336,60 @@ mod stream_tests {
         // Verify final content contains both text blocks
         assert!(accumulated.starts_with("让我查看一下代码。"));
         assert!(accumulated.len() > "让我查看一下代码。".len());
+    }
+}
+
+#[cfg(test)]
+mod redact_tests {
+    use super::redact_sensitive;
+
+    #[test]
+    fn redacts_github_authorization_token_header() {
+        let input = r#"curl -H "Authorization: token ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA1234" https://api.github.com/repos/x/y/pulls"#;
+        let out = redact_sensitive(input);
+        assert!(!out.contains("ghp_AAAA"), "leaked raw PAT: {out}");
+        assert!(out.contains("Authorization: token <redacted>"), "{out}");
+    }
+
+    #[test]
+    fn redacts_bearer_token_header_case_insensitive() {
+        let out = redact_sensitive("-H 'authorization: BEARER abcdef.ghi.jkl'");
+        assert!(out.contains("<redacted>"));
+        assert!(!out.contains("abcdef.ghi"));
+    }
+
+    #[test]
+    fn redacts_bare_github_pat_prefixes() {
+        for prefix in ["ghp_", "gho_", "ghu_", "ghs_", "ghr_", "github_pat_"] {
+            let raw = format!("{prefix}AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA1234");
+            let line = format!("export GITHUB_PAT={raw}");
+            let out = redact_sensitive(&line);
+            assert!(
+                !out.contains(&raw),
+                "prefix {prefix} left token intact: {out}"
+            );
+            assert!(out.contains(&format!("{prefix}<redacted>")), "{out}");
+        }
+    }
+
+    #[test]
+    fn redacts_grafana_service_account_token() {
+        let out = redact_sensitive("Authorization: Bearer glsa_abcdefghij0123456789ABCDEFGHIJ_xyz");
+        // The auth-header regex strips everything after "Bearer "; that swallows the
+        // whole token including the glsa_ prefix, so the output no longer contains
+        // the raw secret (the grafana regex is a second line of defense for non-header uses).
+        assert!(out.contains("Authorization: Bearer <redacted>"));
+        assert!(!out.contains("glsa_abcdefghij"));
+
+        // Non-header context: grafana regex fires.
+        let bare = redact_sensitive("token=glsa_abcdefghij0123456789ABCDEFGHIJ_xyz");
+        assert!(bare.contains("glsa_<redacted>"));
+        assert!(!bare.contains("abcdefghij01"));
+    }
+
+    #[test]
+    fn leaves_safe_text_unchanged() {
+        let safe = "GET /repos/matrixorigin/matrixone/pulls?state=open";
+        assert_eq!(redact_sensitive(safe), safe);
     }
 }
