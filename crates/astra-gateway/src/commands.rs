@@ -2070,16 +2070,59 @@ pub(crate) fn resolve_model_input(input: &str) -> ResolvedModel {
                 Some(id) => ResolvedModel::Id(id.to_string()),
             };
         }
-        // Accept the raw full id too (so `/model us.anthropic.claude-opus-4-7`
-        // works) — but only for ids we know; unknown ids are rejected.
-        if let Some(id) = entry.full_id
-            && trimmed.eq_ignore_ascii_case(id)
-        {
+    }
+
+    // Broader Bedrock id whitelist: any Claude model id the installed CLI
+    // bundle knows about. Menu UI stays short (5 entries), but power users
+    // who type a full `us.anthropic.…` id or a CLI short name like
+    // `claude-opus-4-5-20251101` get accepted rather than rejected.
+    for id in known_bedrock_ids() {
+        if trimmed.eq_ignore_ascii_case(id) {
             return ResolvedModel::Id(id.to_string());
         }
     }
 
     ResolvedModel::Unrecognized
+}
+
+/// All Claude model identifiers the bundled Claude CLI (2.1.138) will accept.
+/// Kept in sync manually — update when upgrading the CLI or when a new model
+/// ships on Bedrock `us-east-1`. Both full `us.anthropic.…` ids and CLI
+/// short names (`claude-opus-4-7`) are accepted; the CLI normalises short
+/// names to the full id before signing the request.
+fn known_bedrock_ids() -> &'static [&'static str] {
+    &[
+        // Full Bedrock inference profile ids (what Bedrock actually signs).
+        "us.anthropic.claude-opus-4-7",
+        "us.anthropic.claude-opus-4-6-v1",
+        "us.anthropic.claude-opus-4-5-20251101-v1:0",
+        "us.anthropic.claude-opus-4-1-20250805-v1:0",
+        "us.anthropic.claude-opus-4-20250514-v1:0",
+        "us.anthropic.claude-sonnet-4-6",
+        "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+        "us.anthropic.claude-sonnet-4-20250514-v1:0",
+        "us.anthropic.claude-haiku-4-5-20251001-v1:0",
+        // CLI short names (no provider prefix). Claude CLI normalises these
+        // to the corresponding us.anthropic.… id before signing.
+        "claude-opus-4-7",
+        "claude-opus-4-6",
+        "claude-opus-4-5",
+        "claude-opus-4-5-20251101",
+        "claude-opus-4-1",
+        "claude-opus-4-1-20250805",
+        "claude-opus-4",
+        "claude-opus-4-0",
+        "claude-opus-4-20250514",
+        "claude-sonnet-4-6",
+        "claude-sonnet-4-5",
+        "claude-sonnet-4-5-20250929",
+        "claude-sonnet-4",
+        "claude-sonnet-4-0",
+        "claude-sonnet-4-20250514",
+        "claude-haiku-4-5",
+        "claude-haiku-4-5-20251001",
+        "claude-haiku-4",
+    ]
 }
 
 fn strip_whitespace(s: &str) -> String {
@@ -2447,6 +2490,21 @@ mod tests {
         assert_eq!(
             id(resolve_model_input("OPUS4.7")),
             "us.anthropic.claude-opus-4-7"
+        );
+        // Extended whitelist: CLI short name accepted (passed through to CLI
+        // which will normalise internally).
+        assert_eq!(
+            id(resolve_model_input("claude-opus-4-7")),
+            "claude-opus-4-7"
+        );
+        assert_eq!(
+            id(resolve_model_input("claude-sonnet-4-5-20250929")),
+            "claude-sonnet-4-5-20250929"
+        );
+        // Extended whitelist: older Bedrock ids not in the menu still accepted
+        assert_eq!(
+            id(resolve_model_input("us.anthropic.claude-opus-4-5-20251101-v1:0")),
+            "us.anthropic.claude-opus-4-5-20251101-v1:0"
         );
         // Anything else rejected (no passthrough)
         assert!(matches!(
