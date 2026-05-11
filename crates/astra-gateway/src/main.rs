@@ -707,16 +707,17 @@ async fn main() {
     runner.run(adapters, cron_rx, shutdown_rx).await;
 }
 
+// Only fixed-offset timezones are supported (no DST handling).
+// For DST-affected zones, use explicit numeric offset (e.g. "+8", "-5").
 fn parse_timezone_offset(tz: &str) -> i32 {
     match tz {
         "Asia/Shanghai" | "Asia/Chongqing" | "CST" => 8,
         "Asia/Tokyo" | "JST" => 9,
-        "America/New_York" | "EST" => -5,
-        "America/Los_Angeles" | "PST" => -8,
-        "Europe/London" | "GMT" => 0,
-        "Europe/Berlin" | "CET" => 1,
-        "UTC" => 0,
+        "Europe/London" | "GMT" | "UTC" => 0,
         s if s.starts_with('+') || s.starts_with('-') => s.parse().unwrap_or(0),
-        _ => 0,
+        _ => {
+            tracing::warn!(timezone = %tz, "unsupported timezone (may have DST); falling back to UTC. Use numeric offset like \"+8\" instead.");
+            0
+        }
     }
 }
