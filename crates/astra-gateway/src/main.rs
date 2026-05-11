@@ -65,7 +65,7 @@ fn data_dir() -> PathBuf {
 }
 
 fn default_config_path() -> PathBuf {
-    data_dir().join("config.yaml")
+    default_run_dir().join("config.yaml")
 }
 
 fn default_run_dir() -> PathBuf {
@@ -83,7 +83,7 @@ fn lock_path() -> PathBuf {
 }
 
 fn log_path() -> PathBuf {
-    data_dir().join("gateway.log")
+    default_run_dir().join("gateway.log")
 }
 
 const REPO: &str = "matrixorigin/astra-suite";
@@ -337,8 +337,8 @@ fn cmd_start(config: &Path) -> Result<(), String> {
     }
 
     let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
-    std::fs::create_dir_all(data_dir())
-        .map_err(|e| format!("create {}: {e}", data_dir().display()))?;
+    std::fs::create_dir_all(default_run_dir())
+        .map_err(|e| format!("create {}: {e}", default_run_dir().display()))?;
     let log = OpenOptions::new()
         .create(true)
         .append(true)
