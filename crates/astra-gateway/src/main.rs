@@ -623,6 +623,19 @@ async fn main() {
         };
     }
 
+    // Apply timezone offset for cron scheduling
+    if let Some(ref tz) = config.timezone {
+        let offset = match parse_timezone_offset(tz) {
+            Some(o) => o,
+            None => {
+                tracing::error!(timezone = %tz, "unsupported timezone; use a known zone (Asia/Shanghai, Asia/Tokyo, UTC) or numeric offset (\"+8\", \"-5\")");
+                std::process::exit(1);
+            }
+        };
+        astra_gateway::store::set_cron_timezone_offset(offset);
+        tracing::info!(timezone = %tz, offset_hours = offset, "cron timezone configured");
+    }
+
     let mut runner = match astra_gateway::runner::GatewayRunner::new(config.clone()).await {
         Ok(r) => r,
         Err(e) => {
@@ -698,4 +711,16 @@ async fn main() {
 
     let runner = std::sync::Arc::new(runner);
     runner.run(adapters, cron_rx, shutdown_rx).await;
+}
+
+// Only fixed-offset timezones are supported (no DST handling).
+// For DST-affected zones, use explicit numeric offset (e.g. "+8", "-5").
+fn parse_timezone_offset(tz: &str) -> Option<i32> {
+    match tz {
+        "Asia/Shanghai" | "Asia/Chongqing" => Some(8),
+        "Asia/Tokyo" | "JST" => Some(9),
+        "Europe/London" | "GMT" | "UTC" => Some(0),
+        s if s.starts_with('+') || s.starts_with('-') => Some(s.parse().unwrap_or(0)),
+        _ => None,
+    }
 }

@@ -11,7 +11,18 @@ pub mod mysql;
 pub mod sqlite;
 
 use async_trait::async_trait;
-use chrono::Datelike;
+use chrono::{Datelike, Timelike};
+use std::sync::atomic::{AtomicI32, Ordering};
+
+static CRON_TZ_OFFSET_HOURS: AtomicI32 = AtomicI32::new(0);
+
+pub fn set_cron_timezone_offset(hours: i32) {
+    CRON_TZ_OFFSET_HOURS.store(hours, Ordering::Relaxed);
+}
+
+pub fn cron_timezone_offset() -> i32 {
+    CRON_TZ_OFFSET_HOURS.load(Ordering::Relaxed)
+}
 
 // ─── Error type ────────────────────────────────────────────────────────────
 
@@ -357,42 +368,159 @@ fn validate_cron_part(part: &str, min: u32, max: u32) -> bool {
 }
 
 /// Compute the next run time from a cron expression as a datetime string
-/// (`YYYY-MM-DD HH:MM:SS`).
+/// (`YYYY-MM-DD HH:MM:SS` in UTC).
 ///
-/// Supports: `M H * * *` (daily), `M H * * DOW` (weekday filter).
+/// Supports:
+/// - `M H * * *` (daily at fixed time)
+/// - `M H * * DOW` (weekday filter)
+/// - `*/N * * * *` (every N minutes)
+/// - `*/N H * * *` (every N minutes within hour H)
+///
+/// `tz_offset_hours`: offset from UTC (e.g. 8 for Asia/Shanghai).
 /// Falls back to +24 h if parsing fails.
 pub fn next_cron_run_str(expr: &str) -> String {
-    let now = chrono::Utc::now();
-    let parts: Vec<&str> = expr.split_whitespace().collect();
+    next_cron_run_str_with_tz(expr, cron_timezone_offset())
+}
 
+pub fn next_cron_run_str_with_tz(expr: &str, tz_offset_hours: i32) -> String {
+    let now_utc = chrono::Utc::now().naive_utc();
+    let offset = chrono::FixedOffset::east_opt(tz_offset_hours * 3600)
+        .unwrap_or_else(|| chrono::FixedOffset::east_opt(0).unwrap());
+    let now_local = now_utc + chrono::Duration::seconds(tz_offset_hours as i64 * 3600);
+
+    let parts: Vec<&str> = expr.split_whitespace().collect();
     if parts.len() != 5 {
-        let fallback = now + chrono::Duration::hours(24);
+        let fallback = now_utc + chrono::Duration::hours(24);
         return fallback.format("%Y-%m-%d %H:%M:%S").to_string();
     }
 
-    let minute: u32 = parts[0].parse().unwrap_or(0);
-    let hour: u32 = parts[1].parse().unwrap_or(9);
+    let minute_field = parts[0];
+    let hour_field = parts[1];
 
-    let tomorrow = now + chrono::Duration::days(1);
-    let mut candidate = tomorrow
-        .date_naive()
+    // Handle */N minute patterns (sub-hourly)
+    if let Some(step_str) = minute_field.strip_prefix("*/")
+        && let Ok(step) = step_str.parse::<u32>()
+        && step > 0
+        && step < 60
+    {
+        return next_step_minutes(now_local, step, hour_field, parts[4], offset);
+    }
+
+    // Fixed minute + hour
+    let minute: u32 = minute_field.parse().unwrap_or(0);
+    let hour: u32 = hour_field.parse().unwrap_or(9);
+
+    // Try today first (in local time), then search forward
+    let today_local = now_local
+        .date()
         .and_hms_opt(hour, minute, 0)
-        .unwrap_or(tomorrow.naive_utc());
+        .unwrap_or(now_local);
 
+    let candidate_local = if today_local > now_local {
+        today_local
+    } else {
+        today_local + chrono::Duration::days(1)
+    };
+
+    let mut candidate_local = candidate_local;
+
+    // Apply DOW filter
     if parts[4] != "*" {
         let target_days = parse_dow(parts[4]);
         if !target_days.is_empty() {
             for _ in 0..8 {
-                let weekday = candidate.weekday().num_days_from_monday();
+                let weekday = candidate_local.weekday().num_days_from_monday();
                 if target_days.contains(&weekday) {
                     break;
                 }
-                candidate += chrono::Duration::days(1);
+                candidate_local += chrono::Duration::days(1);
             }
         }
     }
 
-    candidate.format("%Y-%m-%d %H:%M:%S").to_string()
+    // Convert back to UTC for storage
+    let candidate_utc =
+        candidate_local - chrono::Duration::seconds(offset.local_minus_utc() as i64);
+    candidate_utc.format("%Y-%m-%d %H:%M:%S").to_string()
+}
+
+fn next_step_minutes(
+    now_local: chrono::NaiveDateTime,
+    step: u32,
+    hour_field: &str,
+    dow_field: &str,
+    offset: chrono::FixedOffset,
+) -> String {
+    // If hour_field is specific and we're not in that hour, jump to it
+    if hour_field != "*"
+        && let Ok(target_hour) = hour_field.parse::<u32>()
+        && now_local.hour() != target_hour
+    {
+        let today_target = now_local
+            .date()
+            .and_hms_opt(target_hour, 0, 0)
+            .unwrap_or(now_local);
+        if today_target > now_local {
+            return to_utc_str(today_target, offset);
+        } else {
+            let tomorrow_target = today_target + chrono::Duration::days(1);
+            return to_utc_str(tomorrow_target, offset);
+        }
+    }
+
+    // Find next minute that is a multiple of step
+    let current_minute = now_local.minute();
+    let next_minute = ((current_minute / step) + 1) * step;
+
+    let candidate_local = if next_minute < 60 {
+        now_local
+            .date()
+            .and_hms_opt(now_local.hour(), next_minute, 0)
+            .unwrap_or(now_local + chrono::Duration::minutes(step as i64))
+    } else {
+        // Next hour, minute 0
+        let next_hour = now_local + chrono::Duration::hours(1);
+        next_hour
+            .date()
+            .and_hms_opt(next_hour.hour(), 0, 0)
+            .unwrap_or(now_local + chrono::Duration::minutes(step as i64))
+    };
+
+    // Apply DOW filter
+    if dow_field != "*" {
+        let target_days = parse_dow(dow_field);
+        if !target_days.is_empty() {
+            let weekday = candidate_local.weekday().num_days_from_monday();
+            if !target_days.contains(&weekday) {
+                // Skip to next valid day at minute 0 of the target hour
+                let hour: u32 = if hour_field == "*" {
+                    0
+                } else {
+                    hour_field.parse().unwrap_or(0)
+                };
+                let mut day = candidate_local
+                    .date()
+                    .succ_opt()
+                    .unwrap_or(candidate_local.date());
+                for _ in 0..8 {
+                    let wd = day.weekday().num_days_from_monday();
+                    if target_days.contains(&wd) {
+                        break;
+                    }
+                    day = day.succ_opt().unwrap_or(day);
+                }
+                let target = day.and_hms_opt(hour, 0, 0).unwrap_or(candidate_local);
+                return to_utc_str(target, offset);
+            }
+        }
+    }
+
+    to_utc_str(candidate_local, offset)
+}
+
+fn to_utc_str(local: chrono::NaiveDateTime, offset: chrono::FixedOffset) -> String {
+    let utc = local - chrono::Duration::seconds(offset.local_minus_utc() as i64);
+    utc.format("%Y-%m-%d %H:%M:%S").to_string()
 }
 
 /// Parse cron DOW field and convert to chrono's Monday-based numbering.
@@ -665,6 +793,109 @@ mod tests {
         assert_eq!(cron_dow_to_chrono(0), 6); // Sun
         assert_eq!(cron_dow_to_chrono(1), 0); // Mon
         assert_eq!(cron_dow_to_chrono(6), 5); // Sat
+    }
+
+    // ── Timezone-aware scheduling ─────────────────────────────────────
+
+    #[test]
+    fn next_cron_with_tz_shanghai() {
+        // "0 10 * * *" with tz=+8 should produce UTC 02:00
+        let next = next_cron_run_str_with_tz("0 10 * * *", 8);
+        assert!(next.contains("02:00:00"), "expected UTC 02:00, got {next}");
+    }
+
+    #[test]
+    fn next_cron_with_tz_zero() {
+        // "0 10 * * *" with tz=0 should produce UTC 10:00
+        let next = next_cron_run_str_with_tz("0 10 * * *", 0);
+        assert!(next.contains("10:00:00"), "expected UTC 10:00, got {next}");
+    }
+
+    #[test]
+    fn next_cron_with_tz_negative() {
+        // "0 10 * * *" with tz=-5 (EST) should produce UTC 15:00
+        let next = next_cron_run_str_with_tz("0 10 * * *", -5);
+        assert!(next.contains("15:00:00"), "expected UTC 15:00, got {next}");
+    }
+
+    #[test]
+    fn next_cron_with_tz_is_in_future() {
+        let next = next_cron_run_str_with_tz("0 10 * * *", 8);
+        let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        assert!(next > now, "next_run {next} should be after now {now}");
+    }
+
+    #[test]
+    fn next_cron_step_every_5_min() {
+        let next = next_cron_run_str_with_tz("*/5 * * * *", 0);
+        let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        assert!(next > now, "next_run {next} should be after now {now}");
+        // Should be within 5 minutes from now
+        let next_dt = chrono::NaiveDateTime::parse_from_str(&next, "%Y-%m-%d %H:%M:%S").unwrap();
+        let now_dt = chrono::Utc::now().naive_utc();
+        let diff = next_dt - now_dt;
+        assert!(
+            diff.num_minutes() <= 5,
+            "*/5 should fire within 5 min, got {} min",
+            diff.num_minutes()
+        );
+    }
+
+    #[test]
+    fn next_cron_step_every_15_min() {
+        let next = next_cron_run_str_with_tz("*/15 * * * *", 0);
+        let next_dt = chrono::NaiveDateTime::parse_from_str(&next, "%Y-%m-%d %H:%M:%S").unwrap();
+        let now_dt = chrono::Utc::now().naive_utc();
+        let diff = next_dt - now_dt;
+        assert!(
+            diff.num_minutes() <= 15,
+            "*/15 should fire within 15 min, got {} min",
+            diff.num_minutes()
+        );
+    }
+
+    #[test]
+    fn next_cron_step_with_hour_constraint() {
+        // */10 in hour 23 — should schedule for hour 23
+        let next = next_cron_run_str_with_tz("*/10 23 * * *", 0);
+        assert!(next.contains("23:"), "expected hour 23, got {next}");
+    }
+
+    #[test]
+    #[allow(clippy::manual_is_multiple_of)]
+    fn next_cron_step_minute_is_aligned() {
+        let next = next_cron_run_str_with_tz("*/15 * * * *", 0);
+        let next_dt = chrono::NaiveDateTime::parse_from_str(&next, "%Y-%m-%d %H:%M:%S").unwrap();
+        let minute = next_dt.minute();
+        assert!(
+            minute % 15 == 0,
+            "minute should be multiple of 15, got {minute}"
+        );
+    }
+
+    #[test]
+    fn next_cron_dow_with_tz() {
+        // Monday-Friday at 09:00 Shanghai time = 01:00 UTC
+        let next = next_cron_run_str_with_tz("0 9 * * 1-5", 8);
+        assert!(next.contains("01:00:00"), "expected UTC 01:00, got {next}");
+        // Verify it's a weekday
+        let next_dt = chrono::NaiveDateTime::parse_from_str(&next, "%Y-%m-%d %H:%M:%S").unwrap();
+        let dow = next_dt.weekday().num_days_from_monday();
+        assert!(dow < 5, "expected weekday (0-4), got {dow}");
+    }
+
+    #[test]
+    fn next_cron_consider_today() {
+        // Use a time far in the future (23:59) to ensure "today" is picked
+        let next = next_cron_run_str_with_tz("59 23 * * *", 0);
+        let now = chrono::Utc::now().naive_utc();
+        let next_dt = chrono::NaiveDateTime::parse_from_str(&next, "%Y-%m-%d %H:%M:%S").unwrap();
+        // Should be today or tomorrow, not day-after-tomorrow
+        let diff_days = (next_dt - now).num_days();
+        assert!(
+            diff_days <= 1,
+            "should be today or tomorrow, got {diff_days} days ahead"
+        );
     }
 
     // ── model_preference_key ────────────────────────────────────────────
