@@ -30,3 +30,11 @@ gateway.yaml
 *.sqlite-journal
 /data/
 vendor/rust-code-agent-sdks
+
+# Claude Code runtime artifacts
+.claude/scheduled_tasks.json
+.claude/scheduled_tasks.lock
+
+# Local docs / plans
+docs/
+test-plan-*.md

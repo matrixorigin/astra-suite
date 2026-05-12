@@ -53,6 +53,7 @@ tracing-subscriber = { version = "0.3", default-features = false, features = [
     "time",
 ] }
 uuid = { version = "1", features = ["v4", "v7"] }
+rmcp = { version = "1.6", features = ["server", "transport-io"] }
 
 [profile.release]
 lto = "thin"

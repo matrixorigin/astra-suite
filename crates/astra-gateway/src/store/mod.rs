@@ -137,6 +137,15 @@ pub struct UsageSummary {
     pub tool_calls: u64,
 }
 
+/// A saved skill record.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SkillRecord {
+    pub name: String,
+    pub content: String,
+    pub description: String,
+    pub created_at: String,
+}
+
 // ─── GatewayStore trait ────────────────────────────────────────────────────
 
 /// Unified persistence interface for gateway state.
@@ -314,6 +323,36 @@ pub trait GatewayStore: Send + Sync + 'static {
         platform: &str,
         user_id: &str,
     ) -> Result<UsageSummary, StoreError>;
+
+    // ── Skills ─────────────────────────────────────────────────────────
+    async fn list_skills(
+        &self,
+        platform: &str,
+        chat_id: &str,
+    ) -> Result<Vec<SkillRecord>, StoreError>;
+
+    async fn get_skill(
+        &self,
+        platform: &str,
+        chat_id: &str,
+        name: &str,
+    ) -> Result<Option<SkillRecord>, StoreError>;
+
+    async fn upsert_skill(
+        &self,
+        platform: &str,
+        chat_id: &str,
+        name: &str,
+        content: &str,
+        description: &str,
+    ) -> Result<(), StoreError>;
+
+    async fn delete_skill(
+        &self,
+        platform: &str,
+        chat_id: &str,
+        name: &str,
+    ) -> Result<bool, StoreError>;
 }
 
 // ─── Shared helpers ────────────────────────────────────────────────────────

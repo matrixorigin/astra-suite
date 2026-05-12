@@ -1077,7 +1077,25 @@ impl GatewayRunner {
             }
             ctx
         };
-        let system_prompt = gw_context.to_system_prompt();
+        let system_prompt = if crate::cli_pool::CliProcessPool::supports_persistent(&cli_profile) {
+            let mut prompt = gw_context.to_slim_system_prompt();
+            if let Some(ref extra) = self.config.system_prompt_extra
+                && !extra.is_empty()
+            {
+                prompt.push_str("\n\n");
+                prompt.push_str(extra);
+            }
+            prompt
+        } else {
+            let mut prompt = gw_context.to_system_prompt();
+            if let Some(ref extra) = self.config.system_prompt_extra
+                && !extra.is_empty()
+            {
+                prompt.push_str("\n\n");
+                prompt.push_str(extra);
+            }
+            prompt
+        };
 
         let reasoning_display = if let Some(ref store) = self.store {
             store
@@ -1144,6 +1162,36 @@ impl GatewayRunner {
 
         let use_pool = crate::cli_pool::CliProcessPool::supports_persistent(&cli_profile);
 
+        let mcp_config_path = if use_pool {
+            let storage_env = match &self.config.storage {
+                crate::store::StorageConfig::Mysql { url }
+                | crate::store::StorageConfig::MatrixOne { url } => {
+                    crate::mcp::config::McpStorageEnv {
+                        database_url: Some(url.clone()),
+                        sqlite_path: None,
+                    }
+                }
+                crate::store::StorageConfig::Sqlite { path } => crate::mcp::config::McpStorageEnv {
+                    database_url: None,
+                    sqlite_path: Some(path.clone()),
+                },
+                _ => crate::mcp::config::McpStorageEnv {
+                    database_url: None,
+                    sqlite_path: None,
+                },
+            };
+            crate::mcp::config::generate_mcp_config(
+                &storage_env,
+                msg.platform,
+                &effective_chat_id,
+                &msg.user_id,
+                &self.config.project_dirs,
+            )
+            .ok()
+        } else {
+            None
+        };
+
         let cli_handle = if use_pool {
             // Long-lived process path: send message via pool, forward progress events
             let pool = self.cli_pool.clone();
@@ -1154,6 +1202,7 @@ impl GatewayRunner {
             let ws = workspace.clone();
             let token = access_token.clone();
             let kill_token = cancel_token.clone();
+            let mcp_cfg = mcp_config_path.clone();
 
             tokio::spawn(async move {
                 let mut pool_guard = pool.lock().await;
@@ -1165,6 +1214,7 @@ impl GatewayRunner {
                         ws.as_deref(),
                         Some(&sp),
                         token.as_deref(),
+                        mcp_cfg.as_deref(),
                     )
                     .await?;
                 drop(pool_guard); // release lock before reading progress
@@ -1554,7 +1604,7 @@ impl GatewayRunner {
                                 outbox: None,
                                 stream_id: None,
                                 stream_finish: true,
-                            });
+                                                });
                         }
                     }
                     next_timer.as_mut().reset(tokio::time::Instant::now() + HEARTBEAT_INTERVAL);

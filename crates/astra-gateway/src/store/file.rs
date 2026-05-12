@@ -13,7 +13,7 @@
 
 use super::{
     CronJobRecord, CronJobSpec, DueJob, GatewayStore, PendingMessage, PlatformCredential,
-    SessionRecord, StoreError, UsageRecord, UsageSummary, next_cron_run_str,
+    SessionRecord, SkillRecord, StoreError, UsageRecord, UsageSummary, next_cron_run_str,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -705,6 +705,84 @@ impl GatewayStore for FileGatewayStore {
         }
         Ok(total)
     }
+
+    // ─── Skills ───────────────────────────────────────────────────────
+    async fn list_skills(
+        &self,
+        platform: &str,
+        chat_id: &str,
+    ) -> Result<Vec<SkillRecord>, StoreError> {
+        let path = self
+            .base_dir
+            .join(format!("skills_{platform}_{chat_id}.json"));
+        let skills: Vec<SkillRecord> = load_json_vec(&path).await?;
+        Ok(skills)
+    }
+
+    async fn get_skill(
+        &self,
+        platform: &str,
+        chat_id: &str,
+        name: &str,
+    ) -> Result<Option<SkillRecord>, StoreError> {
+        let path = self
+            .base_dir
+            .join(format!("skills_{platform}_{chat_id}.json"));
+        let skills: Vec<SkillRecord> = load_json_vec(&path).await?;
+        Ok(skills.into_iter().find(|s| s.name == name))
+    }
+
+    async fn upsert_skill(
+        &self,
+        platform: &str,
+        chat_id: &str,
+        name: &str,
+        content: &str,
+        description: &str,
+    ) -> Result<(), StoreError> {
+        let path = self
+            .base_dir
+            .join(format!("skills_{platform}_{chat_id}.json"));
+        let _guard = self.disk_write_lock.lock().await;
+        let mut skills: Vec<SkillRecord> = load_json_vec(&path).await?;
+        if let Some(existing) = skills.iter_mut().find(|s| s.name == name) {
+            existing.content = content.to_string();
+            existing.description = description.to_string();
+        } else {
+            skills.push(SkillRecord {
+                name: name.to_string(),
+                content: content.to_string(),
+                description: description.to_string(),
+                created_at: now_str(),
+            });
+        }
+        let json = serde_json::to_string_pretty(&skills)
+            .map_err(|e| StoreError::Serialization(e.to_string()))?;
+        atomic_write(&path, json.as_bytes()).await?;
+        Ok(())
+    }
+
+    async fn delete_skill(
+        &self,
+        platform: &str,
+        chat_id: &str,
+        name: &str,
+    ) -> Result<bool, StoreError> {
+        let path = self
+            .base_dir
+            .join(format!("skills_{platform}_{chat_id}.json"));
+        let _guard = self.disk_write_lock.lock().await;
+        let mut skills: Vec<SkillRecord> = load_json_vec(&path).await?;
+        let original_len = skills.len();
+        skills.retain(|s| s.name != name);
+        if skills.len() == original_len {
+            return Ok(false);
+        }
+        let json = serde_json::to_string_pretty(&skills)
+            .map_err(|e| StoreError::Serialization(e.to_string()))?;
+        atomic_write(&path, json.as_bytes()).await?;
+        Ok(true)
+    }
 }
 
 // ─── File I/O helpers ─────────────────────────────────────────────────────
@@ -720,6 +798,19 @@ async fn load_json_map<T: serde::de::DeserializeOwned>(
             serde_json::from_str(&data).map_err(|e| StoreError::Serialization(e.to_string()))
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(HashMap::new()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+async fn load_json_vec<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Vec<T>, StoreError> {
+    match tokio::fs::read_to_string(path).await {
+        Ok(data) => {
+            if data.trim().is_empty() {
+                return Ok(Vec::new());
+            }
+            serde_json::from_str(&data).map_err(|e| StoreError::Serialization(e.to_string()))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
         Err(e) => Err(e.into()),
     }
 }

@@ -108,6 +108,45 @@ impl GatewayContext {
         }
         prompt
     }
+
+    pub fn to_slim_system_prompt(&self) -> String {
+        let mut lines = Vec::new();
+        lines.push(format!(
+            "## Gateway\n\nAstra Gateway on **{}**. User: {} (`{}`), CLI: `{}`",
+            self.platform, self.user_display_name, self.user_id, self.cli_name
+        ));
+        if let Some(ref m) = self.model {
+            lines.push(format!("Model: `{m}`"));
+        }
+        lines.push(String::new());
+        lines.push("You have gateway MCP tools available for:".into());
+        lines.push("- Scheduling tasks and reminders (gateway_cron_*)".into());
+        lines.push("- Managing reusable skills (gateway_skills_*)".into());
+        lines.push("- Durable task tracking (gateway_tasks_*)".into());
+        lines.push("- Workspace management (gateway_workspace_*)".into());
+        lines.push(String::new());
+        lines.push("Use these tools when the user asks to set reminders, schedule tasks, save procedures, check task status, or switch projects.".into());
+        lines.push(String::new());
+        lines.push("### User Commands (handled by gateway, not you)".into());
+        lines.push(String::new());
+        lines.push("/new /status /model /cli /ws /running /kill /cancel /manage /help".into());
+        if self.has_session {
+            lines.push("/session list /session switch <id>".into());
+        }
+        lines.push(String::new());
+        lines.push("### Notes".into());
+        lines.push(String::new());
+        lines
+            .push("- Mobile platform — keep responses concise. Respond in user's language.".into());
+        lines.push(
+            "- You CAN set reminders/schedules via gateway tools. No raw JSON/code unless asked."
+                .into(),
+        );
+        lines.push(
+            r#"- "提醒我X" → remind_after(exec=false); "帮我做X" → remind_after(exec=true)"#.into(),
+        );
+        lines.join("\n")
+    }
 }
 
 /// Load skill markdown files from a directory. Returns (name, content) pairs sorted by name.

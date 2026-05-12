@@ -404,10 +404,7 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
                 let current_display = current_model
                     .map(|m| display_model_name(m, &entries))
                     .unwrap_or_else(|| "默认".to_string());
-                let mut lines = vec![
-                    format!("🤖 当前: **{current_display}**"),
-                    String::new(),
-                ];
+                let mut lines = vec![format!("🤖 当前: **{current_display}**"), String::new()];
                 for (i, entry) in entries.iter().enumerate() {
                     let mark = if entry.matches_current(current_model) {
                         " ✓"
@@ -2184,7 +2181,6 @@ mod tests {
         assert_eq!(format_duration(125_000), "2m 5s");
     }
 
-
     // ── Harness snapshot tests ──────────────────────────────────
 
     fn test_snapshot() -> HarnessSnapshot {
@@ -2367,6 +2363,7 @@ mod tests {
             bot_name: String::new(),
             timezone: None,
             project_dirs: vec![],
+            system_prompt_extra: None,
         }
     }
 
@@ -2473,10 +2470,7 @@ mod tests {
         );
         // Numeric index: 1=默认, 2=Sonnet, 3=Haiku, 4=Opus 4.7, 5=Opus 4.6
         assert!(matches!(resolve_model_input("1"), ResolvedModel::Default));
-        assert_eq!(
-            id(resolve_model_input("4")),
-            "us.anthropic.claude-opus-4-7"
-        );
+        assert_eq!(id(resolve_model_input("4")), "us.anthropic.claude-opus-4-7");
         // Default
         assert!(matches!(
             resolve_model_input("默认"),
@@ -2516,7 +2510,9 @@ mod tests {
         );
         // Extended whitelist: older Bedrock ids not in the menu still accepted
         assert_eq!(
-            id(resolve_model_input("us.anthropic.claude-opus-4-5-20251101-v1:0")),
+            id(resolve_model_input(
+                "us.anthropic.claude-opus-4-5-20251101-v1:0"
+            )),
             "us.anthropic.claude-opus-4-5-20251101-v1:0"
         );
         // Anything else rejected (no passthrough)
