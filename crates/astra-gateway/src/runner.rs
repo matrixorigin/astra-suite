@@ -658,6 +658,20 @@ impl GatewayRunner {
             return Ok(Some(self.config.access.rejection_message().to_string()));
         }
 
+        // Ensure gw_users has a row for this sender so mutation slash
+        // commands (/model, /cli, /workspace, /reasoning) can write per-user
+        // preferences. handle_message_inner does this on the slow path; we
+        // must mirror it here because some users' very first interaction
+        // with the bot is a slash command — they never hit the slow path,
+        // and set_user_preference then fails with "user not found".
+        if let Some(ref store) = self.store
+            && let Err(e) = store
+                .upsert_user(msg.platform, &msg.user_id, &msg.user_id)
+                .await
+        {
+            tracing::warn!(error = %e, "handle_fast: failed to upsert user");
+        }
+
         // Group chat: require @mention if configured
         if msg.chat_type == crate::platforms::ChatType::Group
             && self.config.group_require_mention

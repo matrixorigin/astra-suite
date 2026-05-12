@@ -951,6 +951,54 @@ async fn group_mention_filter() {
 }
 
 #[tokio::test]
+async fn handle_fast_upserts_user_for_first_time_slash_command() {
+    // Regression: a user whose very first interaction with the bot is a
+    // mutation slash command (/model, /cli, /workspace, /reasoning) must
+    // still have their preference persisted. Previously handle_fast skipped
+    // upsert_user, so set_user_preference hit "user not found" and the
+    // command returned "⚠️ 模型设置失败".
+    let gw = TestGateway::new().await;
+    let store = gw.runner.store().unwrap();
+
+    // Precondition: user row doesn't exist yet.
+    assert!(
+        store.is_first_message("mock", "newcomer").await.unwrap(),
+        "test setup: user should be unknown before any message"
+    );
+
+    // Very first message — straight to a mutation slash command.
+    let m = msg("chat-nc", "newcomer", "/model opus");
+    let result = gw.runner.handle_fast(&m).await;
+    assert!(result.is_ok());
+    let response = result.unwrap().expect("slash command must respond");
+    assert!(
+        response.contains("模型已切换"),
+        "first-message /model should succeed, got: {response}"
+    );
+    assert!(
+        !response.contains("失败"),
+        "response must not indicate failure, got: {response}"
+    );
+
+    // Postcondition: user row exists and preference landed.
+    assert!(
+        !store.is_first_message("mock", "newcomer").await.unwrap(),
+        "user row should have been upserted by handle_fast"
+    );
+    let cli_name = gw.runner.cli_profile().name();
+    let key = astra_gateway::store::model_preference_key(cli_name);
+    let stored = store
+        .get_user_preference("mock", "newcomer", &key)
+        .await
+        .unwrap();
+    assert_eq!(
+        stored.as_deref(),
+        Some("us.anthropic.claude-opus-4-7"),
+        "model override should be persisted"
+    );
+}
+
+#[tokio::test]
 async fn per_user_model_override_isolated() {
     let gw = TestGateway::new().await;
 
@@ -977,9 +1025,11 @@ async fn per_user_model_override_isolated() {
         .unwrap();
     assert!(bob_model.is_none(), "bob should have no model override");
 
-    if alice_model.is_some() {
-        assert_ne!(alice_model, bob_model, "model overrides should be per-user");
-    }
+    assert!(
+        alice_model.is_some(),
+        "alice's /model should have persisted (handle_fast must upsert)"
+    );
+    assert_ne!(alice_model, bob_model, "model overrides should be per-user");
 }
 
 #[tokio::test]
