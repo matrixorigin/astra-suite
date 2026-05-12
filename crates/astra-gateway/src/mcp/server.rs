@@ -350,6 +350,7 @@ impl GatewayMcpServer {
 
 pub async fn run_stdio_server(
     database_url: Option<String>,
+    sqlite_path: Option<String>,
     platform: Option<String>,
     chat_id: Option<String>,
     user_id: Option<String>,
@@ -360,11 +361,9 @@ pub async fn run_stdio_server(
     let user_id = user_id.unwrap_or_else(|| "default".into());
 
     let storage_config = if let Some(url) = database_url {
-        if url.starts_with("mysql://") {
-            store::StorageConfig::Mysql { url }
-        } else {
-            store::StorageConfig::Sqlite { path: url }
-        }
+        store::StorageConfig::Mysql { url }
+    } else if let Some(path) = sqlite_path {
+        store::StorageConfig::Sqlite { path }
     } else {
         store::StorageConfig::default()
     };

@@ -142,6 +142,9 @@ impl GatewayContext {
             "- You CAN set reminders/schedules via gateway tools. No raw JSON/code unless asked."
                 .into(),
         );
+        lines.push(
+            r#"- "提醒我X" → remind_after(exec=false); "帮我做X" → remind_after(exec=true)"#.into(),
+        );
         lines.join("\n")
     }
 }

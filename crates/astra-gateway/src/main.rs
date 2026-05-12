@@ -58,9 +58,12 @@ enum Command {
     /// Run as MCP stdio server (spawned by Claude CLI via --mcp-config)
     #[command(name = "mcp-serve")]
     McpServe {
-        /// Database URL for storage access
+        /// Database URL for storage access (MySQL/MatrixOne)
         #[arg(long, env = "GATEWAY_DATABASE_URL")]
         database_url: Option<String>,
+        /// SQLite database file path
+        #[arg(long, env = "GW_MCP_SQLITE_PATH")]
+        sqlite_path: Option<String>,
         /// Platform identifier for scoping queries
         #[arg(long, env = "GW_MCP_PLATFORM")]
         platform: Option<String>,
@@ -471,6 +474,7 @@ async fn main() {
 
     if let Some(Command::McpServe {
         database_url,
+        sqlite_path,
         platform,
         chat_id,
         user_id,
@@ -482,6 +486,7 @@ async fn main() {
             .unwrap_or_default();
         if let Err(e) = astra_gateway::mcp::server::run_stdio_server(
             database_url,
+            sqlite_path,
             platform,
             chat_id,
             user_id,

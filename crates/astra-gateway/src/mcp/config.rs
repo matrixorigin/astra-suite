@@ -1,7 +1,14 @@
 use std::path::PathBuf;
 
+/// Storage info passed to the MCP server subprocess via environment variables.
+/// No credentials are written to the temp config file.
+pub struct McpStorageEnv {
+    pub database_url: Option<String>,
+    pub sqlite_path: Option<String>,
+}
+
 pub fn generate_mcp_config(
-    database_url: Option<&str>,
+    storage_env: &McpStorageEnv,
     platform: &str,
     chat_id: &str,
     user_id: &str,
@@ -9,11 +16,19 @@ pub fn generate_mcp_config(
 ) -> Result<PathBuf, std::io::Error> {
     let gateway_bin = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("astra-gateway"));
 
+    // Env vars are set on the child process by Claude CLI when spawning the MCP server.
+    // DB credentials go here (not in the JSON file) so they never touch disk.
     let mut env = serde_json::Map::new();
-    if let Some(url) = database_url {
+    if let Some(ref url) = storage_env.database_url {
         env.insert(
             "GATEWAY_DATABASE_URL".into(),
-            serde_json::Value::String(url.to_string()),
+            serde_json::Value::String(url.clone()),
+        );
+    }
+    if let Some(ref path) = storage_env.sqlite_path {
+        env.insert(
+            "GW_MCP_SQLITE_PATH".into(),
+            serde_json::Value::String(path.clone()),
         );
     }
     env.insert(

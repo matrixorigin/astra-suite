@@ -214,16 +214,6 @@ pub trait PlatformAdapter: Send + Sync + 'static {
     ) -> Result<(), String> {
         self.send_text(chat_id, text, reply_token).await
     }
-    /// Send a proactive message with @mentions (group chat). Default: ignores mentions.
-    async fn send_text_with_mentions(
-        &self,
-        chat_id: &str,
-        text: &str,
-        mention_user_ids: &[String],
-    ) -> Result<(), String> {
-        let _ = mention_user_ids;
-        self.send_text(chat_id, text, None).await
-    }
     /// Send typing indicator (start). No-op for platforms that don't support it.
     async fn send_typing(&self, _chat_id: &str) -> Result<(), String> {
         Ok(())
