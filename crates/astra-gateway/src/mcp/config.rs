@@ -47,8 +47,7 @@ pub fn generate_mcp_config(
 
     let hash = simple_hash(chat_id);
     let path = std::env::temp_dir().join(format!("gw-mcp-{hash}.json"));
-    let content = serde_json::to_string_pretty(&config)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    let content = serde_json::to_string_pretty(&config).map_err(std::io::Error::other)?;
     std::fs::write(&path, &content)?;
     #[cfg(unix)]
     {

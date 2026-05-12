@@ -57,6 +57,7 @@ impl CliProcessPool {
     /// Begin a turn: ensure process exists, register progress channel, send message.
     /// Returns a receiver that will get CliProgress events for this turn.
     /// The turn ends when a `None` is received (process sent result event or died).
+    #[allow(clippy::too_many_arguments)]
     pub async fn begin_turn(
         &mut self,
         key: &str,
