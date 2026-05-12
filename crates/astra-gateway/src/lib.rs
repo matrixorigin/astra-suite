@@ -7,6 +7,7 @@ pub mod dedup;
 pub mod durable_task_store;
 pub mod gateway_context;
 pub mod health;
+pub mod inject_server;
 pub mod markdown;
 pub mod mcp;
 pub mod platforms;

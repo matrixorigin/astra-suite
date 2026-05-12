@@ -216,6 +216,15 @@ action_policy:
 #
 # Available hook types: PreToolUse, PostToolUse, Stop, SubagentStop
 
+# ─── Inject API ──────────────────────────────────────────────────────────────
+#
+# HTTP endpoint for injecting messages into the gateway programmatically.
+# Useful for inter-service communication (e.g. another bot triggering this one).
+# Listens on 127.0.0.1 only (not exposed externally).
+# Disabled when absent.
+
+# api_port: 9090
+
 # ─── Platforms (at least one must be enabled) ────────────────────────────────
 
 platforms:

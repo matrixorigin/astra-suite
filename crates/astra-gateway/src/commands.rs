@@ -2364,6 +2364,7 @@ mod tests {
             timezone: None,
             project_dirs: vec![],
             system_prompt_extra: None,
+            api_port: None,
         }
     }
 
