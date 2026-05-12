@@ -29,6 +29,7 @@ pub async fn workspace_switch(
     platform: &str,
     user_id: &str,
     path: &str,
+    project_dirs: &[String],
 ) -> String {
     let expanded = if path.starts_with('~') {
         let home = std::env::var("HOME").unwrap_or_default();
@@ -44,6 +45,11 @@ pub async fn workspace_switch(
         .canonicalize()
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or(expanded);
+
+    if !is_allowed_path(&canonical, project_dirs) {
+        return "Error: path is not within any configured project directory".into();
+    }
+
     match store
         .set_user_preference(platform, user_id, "workspace", &canonical)
         .await
@@ -51,4 +57,14 @@ pub async fn workspace_switch(
         Ok(()) => format!("Workspace switched to: `{canonical}`"),
         Err(e) => format!("Error: {e}"),
     }
+}
+
+fn is_allowed_path(canonical: &str, project_dirs: &[String]) -> bool {
+    let home = std::env::var("HOME").unwrap_or_default();
+    if !home.is_empty() && canonical.starts_with(&home) {
+        return true;
+    }
+    project_dirs
+        .iter()
+        .any(|dir| canonical.starts_with(dir) || dir.starts_with(canonical))
 }

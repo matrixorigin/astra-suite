@@ -129,6 +129,7 @@ impl CliProcessPool {
         if let Some(handle) = self.processes.remove(key) {
             handle.cancel.cancel();
         }
+        crate::mcp::config::cleanup_mcp_config(key);
     }
 
     pub async fn session_id(&self, key: &str) -> Option<String> {

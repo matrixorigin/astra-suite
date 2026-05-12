@@ -342,6 +342,7 @@ impl GatewayMcpServer {
             &self.platform,
             &self.user_id,
             &params.path,
+            &self.project_dirs,
         )
         .await;
         Json(TextResult::new(result))
