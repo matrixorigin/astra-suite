@@ -105,18 +105,34 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
             } else {
                 None
             };
-            let cli_model = ctx.resolved_cli.model_name();
-            let (model_display, model_source) = if let Some(m) = cli_model {
-                (m.to_string(), "user override")
-            } else if let Some(m) = ctx.config.astra.default_model.as_deref() {
-                (m.to_string(), "config default")
-            } else {
-                ("(CLI default)".to_string(), "profile default")
+            // Model: show the friendly label ("Opus 4.7") instead of the raw
+            // Bedrock id, and distinguish between user override vs yaml default
+            // by comparing against `config.cli`.
+            let resolved_model = ctx.resolved_cli.model_name();
+            let yaml_default = ctx.config.cli.model_name();
+            let entries = model_entries();
+            let model_line = match resolved_model {
+                Some(id) => {
+                    let pretty = display_model_name(id, &entries);
+                    let source = if Some(id) == yaml_default {
+                        "配置默认"
+                    } else {
+                        "用户切换"
+                    };
+                    // If pretty differs from id, show both so power users can
+                    // still see the full Bedrock id.
+                    if pretty == id {
+                        format!("- 模型: `{pretty}` ({source})")
+                    } else {
+                        format!("- 模型: {pretty} `{id}` ({source})")
+                    }
+                }
+                None => "- 模型: (CLI 默认,yaml 未配置 cli.model)".to_string(),
             };
             let mut lines = vec![
                 "📊 **状态**".to_string(),
                 format!("- CLI: `{cli_name}`"),
-                format!("- 模型: `{model_display}` ({model_source})"),
+                model_line,
                 format!("- 用户: `{}`", ctx.user_id),
                 format!("- 会话: `{}`", session.as_deref().unwrap_or("(无)")),
                 format!(
@@ -377,48 +393,88 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
         }
 
         "/model" => {
-            let cli_name = ctx.resolved_cli.name();
-            let current_model = ctx
-                .resolved_cli
-                .model_name()
-                .or(ctx.config.astra.default_model.as_deref())
-                .unwrap_or("(server default)");
+            let current_model = ctx.resolved_cli.model_name();
+            // Config default: the `cli.model` field in gateway.yaml. When the
+            // user has no per-user override, resolve_cli_profile returns this
+            // untouched, so current_model == config_default_model.
+            let config_default_model = ctx.config.cli.model_name();
+            let entries = model_entries();
 
             if arg.is_empty() {
-                let shortcuts = model_shortcuts();
-                let mut lines = vec![
-                    format!("🤖 当前模型: `{current_model}` (CLI: `{cli_name}`)"),
-                    String::new(),
-                    "**可选模型:**".into(),
-                ];
-                for (i, (shortcut, full_name, desc)) in shortcuts.iter().enumerate() {
+                let current_display = current_model
+                    .map(|m| display_model_name(m, &entries))
+                    .unwrap_or_else(|| "默认".to_string());
+                let mut lines = vec![format!("🤖 当前: **{current_display}**"), String::new()];
+                for (i, entry) in entries.iter().enumerate() {
+                    let mark = if entry.matches_current(current_model) {
+                        " ✓"
+                    } else {
+                        ""
+                    };
+                    // "默认" row: show what yaml.cli.model points to today.
+                    // Other rows: show the short per-model description.
+                    let desc = if entry.full_id.is_none() {
+                        match config_default_model {
+                            Some(m) => {
+                                let pretty = display_model_name(m, &entries);
+                                if pretty == m {
+                                    format!("yaml → {m}")
+                                } else {
+                                    format!("yaml → {pretty}")
+                                }
+                            }
+                            None => "yaml 未配".to_string(),
+                        }
+                    } else {
+                        entry.desc.to_string()
+                    };
                     lines.push(format!(
-                        "  `{idx}`. `/model {shortcut}` → `{full_name}` ({desc})",
-                        idx = i + 1
+                        "{idx}. **{label}**{mark} · {desc}",
+                        idx = i + 1,
+                        label = entry.label,
                     ));
                 }
                 lines.push(String::new());
-                lines.push(
-                    "用编号、名称或完整 model ID: `/model 3` `/model opus` `/model xxx`".into(),
-                );
+                lines.push("切换: `/model <编号|名称|完整id>`".into());
+                lines.push("例: `/model 2`  `/model opus`  `/model Opus 4.7`".into());
+                lines.push("    `/model us.anthropic.claude-opus-4-7`".into());
                 return Some(lines.join("\n"));
             }
 
-            // Resolve shortcut or use as-is
             if let Some(denial) = slash_denial(ctx, ActionCapability::ModelMutation) {
                 return Some(denial);
             }
-            let target = resolve_model_shortcut(arg);
-            if let Some(store) = ctx.store {
-                let model_key = store::model_preference_key(ctx.resolved_cli.name());
-                if let Err(e) = store
-                    .set_user_preference(ctx.platform, ctx.user_id, &model_key, &target)
-                    .await
-                {
-                    return Some(format!("⚠️ 模型设置失败: {e}"));
-                }
+
+            let resolved = resolve_model_input(arg);
+            if matches!(resolved, ResolvedModel::Unrecognized) {
+                return Some(format!(
+                    "⚠️ 未识别模型: `{arg}`，当前模型未改变。\n\
+                     发送 `/model` 查看可选列表后重新切换。"
+                ));
             }
-            Some(format!("🤖 模型已切换: `{target}`\n(下次消息生效)"))
+
+            let Some(store) = ctx.store else {
+                let display = match &resolved {
+                    ResolvedModel::Default => "默认".to_string(),
+                    ResolvedModel::Id(id) => display_model_name(id, &entries),
+                    ResolvedModel::Unrecognized => unreachable!(),
+                };
+                return Some(format!("🤖 模型已切换: `{display}`\n(下次消息生效)"));
+            };
+
+            let model_key = store::model_preference_key(ctx.resolved_cli.name());
+            let (stored_value, display) = match &resolved {
+                ResolvedModel::Default => ("".to_string(), "默认".to_string()),
+                ResolvedModel::Id(id) => (id.clone(), display_model_name(id, &entries)),
+                ResolvedModel::Unrecognized => unreachable!(),
+            };
+            if let Err(e) = store
+                .set_user_preference(ctx.platform, ctx.user_id, &model_key, &stored_value)
+                .await
+            {
+                return Some(format!("⚠️ 模型设置失败: {e}"));
+            }
+            Some(format!("🤖 模型已切换: `{display}`\n(下次消息生效)"))
         }
 
         "/reasoning" => {
@@ -638,7 +694,7 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
              `/session switch <id>` — 切换会话\n\n\
              **模型**\n\
              `/model` — 当前模型 + 快捷列表\n\
-             `/model <name>` — 切换 (haiku/sonnet/opus/minimax/deepseek/qwen/glm)\n\n\
+             `/model <name>` — 切换 (默认/Sonnet/Haiku/Opus/Opus 4.7/Opus 4.6)\n\n\
              **CLI & 工作区**\n\
              `/cli` — 查看当前 CLI + 能力 + 工作目录\n\
              `/cli <name>` — 切换 CLI (astra/claude)\n\
@@ -1922,41 +1978,175 @@ fn format_duration(ms: u64) -> String {
     }
 }
 
-fn model_shortcuts() -> Vec<(&'static str, &'static str, &'static str)> {
+/// An entry in the `/model` selection list.
+struct ModelEntry {
+    label: &'static str,
+    desc: &'static str,
+    /// Full Bedrock inference profile id, or `None` to mean "follow default".
+    full_id: Option<&'static str>,
+}
+
+impl ModelEntry {
+    fn matches_current(&self, current: Option<&str>) -> bool {
+        match (self.full_id, current) {
+            (None, None) => true,
+            (Some(id), Some(cur)) => id == cur,
+            _ => false,
+        }
+    }
+}
+
+fn model_entries() -> Vec<ModelEntry> {
     vec![
-        (
-            "haiku",
-            "us.anthropic.claude-haiku-4-5-20251001-v1:0",
-            "快/便宜",
-        ),
-        ("sonnet", "us.anthropic.claude-sonnet-4-6", "均衡"),
-        ("opus", "us.anthropic.claude-opus-4-6-v1", "最强"),
-        ("minimax", "MiniMax-M2.7", "MiniMax"),
-        ("deepseek", "deepseek-v4-pro", "DeepSeek"),
-        ("qwen", "qwen3.6-plus", "通义千问"),
-        ("glm", "glm-5.1", "智谱 GLM"),
+        ModelEntry {
+            label: "默认",
+            desc: "跟随配置",
+            full_id: None,
+        },
+        ModelEntry {
+            label: "Sonnet",
+            desc: "日常任务",
+            full_id: Some("us.anthropic.claude-sonnet-4-6"),
+        },
+        ModelEntry {
+            label: "Haiku",
+            desc: "快 / 省",
+            full_id: Some("us.anthropic.claude-haiku-4-5-20251001-v1:0"),
+        },
+        ModelEntry {
+            label: "Opus 4.7",
+            desc: "最强 / 复杂任务",
+            full_id: Some("us.anthropic.claude-opus-4-7"),
+        },
+        ModelEntry {
+            label: "Opus 4.6",
+            desc: "上一代 Opus",
+            full_id: Some("us.anthropic.claude-opus-4-6-v1"),
+        },
     ]
 }
 
-fn resolve_model_shortcut(input: &str) -> String {
-    let lower = input.to_ascii_lowercase();
-    let shortcuts = model_shortcuts();
+/// Result of resolving a user-provided `/model` argument.
+pub(crate) enum ResolvedModel {
+    /// Clear the override — runner falls back to yaml default.
+    Default,
+    /// A concrete Bedrock inference profile id.
+    Id(String),
+    /// Input didn't match any known label or full id.
+    Unrecognized,
+}
 
-    // Try numeric index first (1-based)
-    if let Ok(idx) = input.parse::<usize>()
-        && idx >= 1
-        && idx <= shortcuts.len()
-    {
-        return shortcuts[idx - 1].1.to_string();
+/// Match against: numeric index · "默认"/"default" · "opus" shorthand · label
+/// (case-insensitive, whitespace ignored) · full Bedrock id in entries.
+/// Anything else → `Unrecognized`. No passthrough.
+pub(crate) fn resolve_model_input(input: &str) -> ResolvedModel {
+    let entries = model_entries();
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return ResolvedModel::Unrecognized;
     }
 
-    // Try name shortcut
-    for (shortcut, full, _) in &shortcuts {
-        if lower == *shortcut {
-            return full.to_string();
+    // Numeric index (1-based)
+    if let Ok(idx) = trimmed.parse::<usize>()
+        && idx >= 1
+        && idx <= entries.len()
+    {
+        return match entries[idx - 1].full_id {
+            None => ResolvedModel::Default,
+            Some(id) => ResolvedModel::Id(id.to_string()),
+        };
+    }
+
+    // "默认" / "default"
+    if trimmed == "默认" || trimmed.eq_ignore_ascii_case("default") {
+        return ResolvedModel::Default;
+    }
+
+    // "opus" shorthand → latest Opus. Update this constant when a newer Opus
+    // ships (kept explicit rather than in the entries list so label display
+    // doesn't get confused between "Opus" and "Opus 4.7").
+    if trimmed.eq_ignore_ascii_case("opus") {
+        return ResolvedModel::Id("us.anthropic.claude-opus-4-7".to_string());
+    }
+
+    // Label match with whitespace ignored, case-insensitive. "Opus 4.7" /
+    // "opus 4.7" / "opus4.7" / "  Opus  4.7 " all collapse and match.
+    let stripped = strip_whitespace(trimmed);
+    for entry in &entries {
+        if stripped.eq_ignore_ascii_case(&strip_whitespace(entry.label)) {
+            return match entry.full_id {
+                None => ResolvedModel::Default,
+                Some(id) => ResolvedModel::Id(id.to_string()),
+            };
         }
     }
-    input.to_string()
+
+    // Broader Bedrock id whitelist: any Claude model id the installed CLI
+    // bundle knows about. Menu UI stays short (5 entries), but power users
+    // who type a full `us.anthropic.…` id or a CLI short name like
+    // `claude-opus-4-5-20251101` get accepted rather than rejected.
+    for id in known_bedrock_ids() {
+        if trimmed.eq_ignore_ascii_case(id) {
+            return ResolvedModel::Id(id.to_string());
+        }
+    }
+
+    ResolvedModel::Unrecognized
+}
+
+/// All Claude model identifiers the bundled Claude CLI (2.1.138) will accept.
+/// Kept in sync manually — update when upgrading the CLI or when a new model
+/// ships on Bedrock `us-east-1`. Both full `us.anthropic.…` ids and CLI
+/// short names (`claude-opus-4-7`) are accepted; the CLI normalises short
+/// names to the full id before signing the request.
+fn known_bedrock_ids() -> &'static [&'static str] {
+    &[
+        // Full Bedrock inference profile ids (what Bedrock actually signs).
+        "us.anthropic.claude-opus-4-7",
+        "us.anthropic.claude-opus-4-6-v1",
+        "us.anthropic.claude-opus-4-5-20251101-v1:0",
+        "us.anthropic.claude-opus-4-1-20250805-v1:0",
+        "us.anthropic.claude-opus-4-20250514-v1:0",
+        "us.anthropic.claude-sonnet-4-6",
+        "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+        "us.anthropic.claude-sonnet-4-20250514-v1:0",
+        "us.anthropic.claude-haiku-4-5-20251001-v1:0",
+        // CLI short names (no provider prefix). Claude CLI normalises these
+        // to the corresponding us.anthropic.… id before signing.
+        "claude-opus-4-7",
+        "claude-opus-4-6",
+        "claude-opus-4-5",
+        "claude-opus-4-5-20251101",
+        "claude-opus-4-1",
+        "claude-opus-4-1-20250805",
+        "claude-opus-4",
+        "claude-opus-4-0",
+        "claude-opus-4-20250514",
+        "claude-sonnet-4-6",
+        "claude-sonnet-4-5",
+        "claude-sonnet-4-5-20250929",
+        "claude-sonnet-4",
+        "claude-sonnet-4-0",
+        "claude-sonnet-4-20250514",
+        "claude-haiku-4-5",
+        "claude-haiku-4-5-20251001",
+        "claude-haiku-4",
+    ]
+}
+
+fn strip_whitespace(s: &str) -> String {
+    s.chars().filter(|c| !c.is_whitespace()).collect()
+}
+
+/// Render a Bedrock model id using the friendly label from the entries list,
+/// falling back to the raw id if unknown.
+fn display_model_name(id: &str, entries: &[ModelEntry]) -> String {
+    for entry in entries {
+        if entry.full_id == Some(id) {
+            return entry.label.to_string();
+        }
+    }
+    id.to_string()
 }
 
 #[cfg(test)]
@@ -1989,55 +2179,6 @@ mod tests {
         assert_eq!(format_duration(500), "500ms");
         assert_eq!(format_duration(3500), "3.5s");
         assert_eq!(format_duration(125_000), "2m 5s");
-    }
-
-    #[test]
-    fn model_shortcut_resolves() {
-        assert_eq!(
-            resolve_model_shortcut("haiku"),
-            "us.anthropic.claude-haiku-4-5-20251001-v1:0"
-        );
-        assert_eq!(
-            resolve_model_shortcut("opus"),
-            "us.anthropic.claude-opus-4-6-v1"
-        );
-        assert_eq!(resolve_model_shortcut("minimax"), "MiniMax-M2.7");
-        assert_eq!(resolve_model_shortcut("deepseek"), "deepseek-v4-pro");
-    }
-
-    #[test]
-    fn model_shortcut_passthrough() {
-        assert_eq!(
-            resolve_model_shortcut("some-custom-model"),
-            "some-custom-model"
-        );
-    }
-
-    #[test]
-    fn model_shortcut_case_insensitive() {
-        assert_eq!(
-            resolve_model_shortcut("Haiku"),
-            "us.anthropic.claude-haiku-4-5-20251001-v1:0"
-        );
-        assert_eq!(
-            resolve_model_shortcut("OPUS"),
-            "us.anthropic.claude-opus-4-6-v1"
-        );
-    }
-
-    #[test]
-    fn model_shortcut_numeric_index() {
-        assert_eq!(
-            resolve_model_shortcut("1"),
-            "us.anthropic.claude-haiku-4-5-20251001-v1:0"
-        );
-        assert_eq!(
-            resolve_model_shortcut("3"),
-            "us.anthropic.claude-opus-4-6-v1"
-        );
-        // Out of range → passthrough
-        assert_eq!(resolve_model_shortcut("0"), "0");
-        assert_eq!(resolve_model_shortcut("99"), "99");
     }
 
     // ── Harness snapshot tests ──────────────────────────────────
@@ -2222,6 +2363,7 @@ mod tests {
             bot_name: String::new(),
             timezone: None,
             project_dirs: vec![],
+            system_prompt_extra: None,
         }
     }
 
@@ -2279,11 +2421,136 @@ mod tests {
     });
     cmd_test!(cmd_model_no_arg_shows_current, "/model", |r| {
         let s = r.unwrap();
-        assert!(s.contains("当前模型"));
-        assert!(s.contains("可选模型"));
-        assert!(s.contains("haiku"));
-        assert!(s.contains("opus"));
+        assert!(s.contains("当前"));
+        assert!(s.contains("Haiku"));
+        assert!(s.contains("Opus"));
+        assert!(s.contains("默认"));
+        assert!(s.contains("切换"));
     });
+
+    #[test]
+    fn resolve_model_input_variants() {
+        fn id(r: ResolvedModel) -> String {
+            match r {
+                ResolvedModel::Id(s) => s,
+                ResolvedModel::Default => "__DEFAULT__".to_string(),
+                ResolvedModel::Unrecognized => "__UNRECOGNIZED__".to_string(),
+            }
+        }
+
+        // "opus" shorthand → latest Opus
+        assert_eq!(
+            id(resolve_model_input("opus")),
+            "us.anthropic.claude-opus-4-7"
+        );
+        assert_eq!(
+            id(resolve_model_input("Opus")),
+            "us.anthropic.claude-opus-4-7"
+        );
+        // Exact label match (case-insensitive)
+        assert_eq!(
+            id(resolve_model_input("Opus 4.7")),
+            "us.anthropic.claude-opus-4-7"
+        );
+        assert_eq!(
+            id(resolve_model_input("opus 4.7")),
+            "us.anthropic.claude-opus-4-7"
+        );
+        assert_eq!(
+            id(resolve_model_input("Opus 4.6")),
+            "us.anthropic.claude-opus-4-6-v1"
+        );
+        assert_eq!(
+            id(resolve_model_input("sonnet")),
+            "us.anthropic.claude-sonnet-4-6"
+        );
+        assert_eq!(
+            id(resolve_model_input("Haiku")),
+            "us.anthropic.claude-haiku-4-5-20251001-v1:0"
+        );
+        // Numeric index: 1=默认, 2=Sonnet, 3=Haiku, 4=Opus 4.7, 5=Opus 4.6
+        assert!(matches!(resolve_model_input("1"), ResolvedModel::Default));
+        assert_eq!(id(resolve_model_input("4")), "us.anthropic.claude-opus-4-7");
+        // Default
+        assert!(matches!(
+            resolve_model_input("默认"),
+            ResolvedModel::Default
+        ));
+        assert!(matches!(
+            resolve_model_input("default"),
+            ResolvedModel::Default
+        ));
+        // Full id of a known entry accepted
+        assert_eq!(
+            id(resolve_model_input("us.anthropic.claude-opus-4-7")),
+            "us.anthropic.claude-opus-4-7"
+        );
+        // Whitespace collapsed inside labels
+        assert_eq!(
+            id(resolve_model_input("  opus  4.7  ")),
+            "us.anthropic.claude-opus-4-7"
+        );
+        assert_eq!(
+            id(resolve_model_input("opus4.7")),
+            "us.anthropic.claude-opus-4-7"
+        );
+        assert_eq!(
+            id(resolve_model_input("OPUS4.7")),
+            "us.anthropic.claude-opus-4-7"
+        );
+        // Extended whitelist: CLI short name accepted (passed through to CLI
+        // which will normalise internally).
+        assert_eq!(
+            id(resolve_model_input("claude-opus-4-7")),
+            "claude-opus-4-7"
+        );
+        assert_eq!(
+            id(resolve_model_input("claude-sonnet-4-5-20250929")),
+            "claude-sonnet-4-5-20250929"
+        );
+        // Extended whitelist: older Bedrock ids not in the menu still accepted
+        assert_eq!(
+            id(resolve_model_input(
+                "us.anthropic.claude-opus-4-5-20251101-v1:0"
+            )),
+            "us.anthropic.claude-opus-4-5-20251101-v1:0"
+        );
+        // Anything else rejected (no passthrough)
+        assert!(matches!(
+            resolve_model_input("xyz-model"),
+            ResolvedModel::Unrecognized
+        ));
+        assert!(matches!(
+            resolve_model_input("opus 12345"),
+            ResolvedModel::Unrecognized
+        ));
+        assert!(matches!(
+            resolve_model_input("opus 5"),
+            ResolvedModel::Unrecognized
+        ));
+        assert!(matches!(
+            resolve_model_input("random text"),
+            ResolvedModel::Unrecognized
+        ));
+        assert!(matches!(
+            resolve_model_input("us.anthropic.claude-opus-9-9"),
+            ResolvedModel::Unrecognized
+        ));
+    }
+
+    #[test]
+    fn display_model_name_maps_known_ids() {
+        let entries = model_entries();
+        assert_eq!(
+            display_model_name("us.anthropic.claude-opus-4-7", &entries),
+            "Opus 4.7"
+        );
+        assert_eq!(
+            display_model_name("us.anthropic.claude-sonnet-4-6", &entries),
+            "Sonnet"
+        );
+        assert_eq!(display_model_name("unknown-id", &entries), "unknown-id");
+    }
     cmd_test!(
         cmd_model_set_without_db_still_succeeds,
         "/model opus",

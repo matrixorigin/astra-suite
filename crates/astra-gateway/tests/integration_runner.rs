@@ -302,6 +302,7 @@ impl TestGateway {
             bot_name: String::new(),
             timezone: None,
             project_dirs: vec![],
+            system_prompt_extra: None,
         }
     }
 }
@@ -681,6 +682,7 @@ async fn runner_init_invalid_config_errors() {
         bot_name: String::new(),
         timezone: None,
         project_dirs: vec![],
+        system_prompt_extra: None,
     };
 
     let result = GatewayRunner::new(config).await;

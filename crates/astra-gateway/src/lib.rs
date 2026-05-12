@@ -9,6 +9,7 @@ pub mod gateway_context;
 pub mod health;
 pub mod inject_server;
 pub mod markdown;
+pub mod mcp;
 pub mod platforms;
 pub mod runner;
 pub mod scheduler;

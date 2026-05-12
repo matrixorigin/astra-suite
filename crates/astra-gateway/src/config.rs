@@ -53,6 +53,9 @@ pub struct GatewayConfig {
     /// Directories to scan for git projects (e.g. ["~/github", "~/work"]).
     #[serde(default)]
     pub project_dirs: Vec<String>,
+    /// Extra text appended to the system prompt (user-customizable).
+    #[serde(default)]
+    pub system_prompt_extra: Option<String>,
     /// HTTP API port for message injection (e.g. 9090). Disabled when absent.
     #[serde(default)]
     pub api_port: Option<u16>,
