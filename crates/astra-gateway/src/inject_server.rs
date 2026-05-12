@@ -53,7 +53,10 @@ async fn handle_connection(
         if line.trim().is_empty() {
             break;
         }
-        if let Some(val) = line.strip_prefix("Content-Length: ").or_else(|| line.strip_prefix("content-length: ")) {
+        if let Some(val) = line
+            .strip_prefix("Content-Length: ")
+            .or_else(|| line.strip_prefix("content-length: "))
+        {
             content_length = val.trim().parse().unwrap_or(0);
         }
     }
