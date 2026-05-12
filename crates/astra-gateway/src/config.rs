@@ -143,6 +143,11 @@ pub struct WeComConfig {
     pub secret: String,
     #[serde(default = "default_wecom_ws_url")]
     pub websocket_url: String,
+    /// Webhook URL for proactive group messages (cron results, alerts).
+    /// WeCom AI Bot cannot send proactive messages to groups — only respond.
+    /// A separate webhook bot in the same group enables scheduled reports.
+    #[serde(default)]
+    pub webhook_url: Option<String>,
 }
 
 impl std::fmt::Debug for WeComConfig {
