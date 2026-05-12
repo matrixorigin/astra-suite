@@ -1078,9 +1078,23 @@ impl GatewayRunner {
             ctx
         };
         let system_prompt = if crate::cli_pool::CliProcessPool::supports_persistent(&cli_profile) {
-            gw_context.to_slim_system_prompt()
+            let mut prompt = gw_context.to_slim_system_prompt();
+            if let Some(ref extra) = self.config.system_prompt_extra
+                && !extra.is_empty()
+            {
+                prompt.push_str("\n\n");
+                prompt.push_str(extra);
+            }
+            prompt
         } else {
-            gw_context.to_system_prompt()
+            let mut prompt = gw_context.to_system_prompt();
+            if let Some(ref extra) = self.config.system_prompt_extra
+                && !extra.is_empty()
+            {
+                prompt.push_str("\n\n");
+                prompt.push_str(extra);
+            }
+            prompt
         };
 
         let reasoning_display = if let Some(ref store) = self.store {
