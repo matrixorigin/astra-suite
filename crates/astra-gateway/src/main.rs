@@ -672,7 +672,14 @@ async fn main() {
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
     let (cron_tx, cron_rx) = tokio::sync::mpsc::channel(64);
+    let (inject_tx, inject_rx) = tokio::sync::mpsc::channel(64);
     runner.set_outbound_tx(cron_tx.clone());
+
+    // Start inject API server if configured
+    if let Some(port) = config.api_port {
+        let tx = inject_tx.clone();
+        tokio::spawn(astra_gateway::inject_server::run(port, tx));
+    }
 
     // Start cron scheduler (only if store + trace_repo available)
     if let (Some(store), Some(trace_repo)) = (runner.store(), runner.trace_repo()) {
@@ -710,7 +717,7 @@ async fn main() {
     });
 
     let runner = std::sync::Arc::new(runner);
-    runner.run(adapters, cron_rx, shutdown_rx).await;
+    runner.run(adapters, cron_rx, inject_rx, shutdown_rx).await;
 }
 
 // Only fixed-offset timezones are supported (no DST handling).

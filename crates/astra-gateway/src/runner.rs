@@ -1381,7 +1381,9 @@ impl GatewayRunner {
                                     token_buf.clear();
                                     next_flush_at = 5 + (rand::random::<u8>() % 16) as usize;
                                     _chunk_counter += 1;
-                                    progressive_text_len = accumulated.len();
+                                    if stream_id.is_some() {
+                                        progressive_text_len = accumulated.len();
+                                    }
                                     send_stream(&accumulated, &self.outbound_tx, msg.platform, &chat_id, reply_token.clone(), stream_id.clone(), false);
                                 }
                             }
@@ -1501,7 +1503,7 @@ impl GatewayRunner {
                                 accumulated.push_str(&token_buf);
                                 token_buf.clear();
                             }
-                            if !accumulated.is_empty() {
+                            if !accumulated.is_empty() && stream_id.is_some() {
                                 progressive_text_len = accumulated.len();
                             }
                             if let Some(writer) = trace_writer.as_ref()
@@ -2727,6 +2729,7 @@ impl GatewayRunner {
         self: std::sync::Arc<Self>,
         adapters: Vec<Box<dyn PlatformAdapter>>,
         mut cron_rx: tokio::sync::mpsc::Receiver<OutboundMessage>,
+        mut inject_rx: tokio::sync::mpsc::Receiver<InboundMessage>,
         mut shutdown: tokio::sync::broadcast::Receiver<()>,
     ) {
         let mut started: Vec<Box<dyn PlatformAdapter>> = Vec::new();
@@ -2813,6 +2816,22 @@ impl GatewayRunner {
                 outbound = cron_rx.recv() => {
                     if let Some(outbound) = outbound {
                         self.deliver_outbound(&adapters, &adapter_indices, outbound).await;
+                    }
+                }
+                injected = inject_rx.recv() => {
+                    if let Some(msg) = injected {
+                        tracing::info!(platform = "inject", chat_id = %msg.chat_id, user = %msg.user_id, text = %msg.text, "injected message");
+                        match self.handle_fast(&msg).await {
+                            Ok(Some(text)) => {
+                                let _ = send_text_to_platform(&adapters, &adapter_indices, msg.platform, &msg.chat_id, &text, msg.reply_token.as_deref(), None, true).await;
+                            }
+                            Ok(None) => {}
+                            Err(msg) => {
+                                let platform = msg.platform;
+                                send_typing_to_platform(&adapters, &adapter_indices, platform, &msg.chat_id).await;
+                                self.enqueue_cli_request(msg, cli_resp_tx.clone()).await;
+                            }
+                        }
                     }
                 }
                 _ = shutdown.recv() => break,

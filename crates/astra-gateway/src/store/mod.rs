@@ -592,8 +592,11 @@ pub enum StorageConfig {
 }
 
 fn default_sqlite_path() -> String {
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-    format!("{home}/.astra-gateway/gateway.db")
+    let base = std::env::var("GATEWAY_RUN_DIR").unwrap_or_else(|_| {
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+        format!("{home}/.astra-gateway")
+    });
+    format!("{base}/gateway.db")
 }
 
 fn default_file_dir() -> String {

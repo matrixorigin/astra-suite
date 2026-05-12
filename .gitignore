@@ -29,4 +29,5 @@ gateway.yaml
 *.sqlite
 *.sqlite-journal
 /data/
+test-env/
 vendor/rust-code-agent-sdks
