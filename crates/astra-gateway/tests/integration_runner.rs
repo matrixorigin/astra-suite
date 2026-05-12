@@ -303,6 +303,7 @@ impl TestGateway {
             timezone: None,
             project_dirs: vec![],
             system_prompt_extra: None,
+            api_port: None,
         }
     }
 }
@@ -683,6 +684,7 @@ async fn runner_init_invalid_config_errors() {
         timezone: None,
         project_dirs: vec![],
         system_prompt_extra: None,
+            api_port: None,
     };
 
     let result = GatewayRunner::new(config).await;
