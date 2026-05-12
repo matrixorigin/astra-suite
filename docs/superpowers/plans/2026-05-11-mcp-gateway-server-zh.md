@@ -382,3 +382,54 @@ claude -p '列出所有 skills' --mcp-config /tmp/test-gw-mcp.json --dangerously
 7. ✅ 非 Claude CLI 仍获得完整 prompt + `[[GATEWAY:...]]` 文档
 8. ✅ `[[GATEWAY:...]]` 正则提取对非 MCP 后端仍然有效
 9. ✅ `gw_skills` 表启动时创建，CRUD 正常
+10. ✅ MCP 临时文件在进程 kill 时清理
+11. ✅ `workspace_switch` 限制路径范围（`$HOME` 或 `project_dirs`）
+
+---
+
+## Review 后追加修复
+
+### Task 11：Code Review 反馈修复（第一轮 — aptend）
+
+已在 `73a260c` 中完成：
+
+- [x] DB 凭据不写磁盘：改用 env vars 传递，mcp-config JSON 不含敏感信息
+- [x] SQLite 路径转发：新增 `GW_MCP_SQLITE_PATH` env var，自定义 SQLite 路径正确传给 MCP 子进程
+- [x] Slim prompt 补充规则：`"提醒我X" → exec=false; "帮我做X" → exec=true`
+- [x] 移除 `mention_user_ids`（YAGNI，后续 PR 实现）
+
+---
+
+### Task 12：Code Review 反馈修复（第二轮）
+
+**文件：**
+- 修改：`crates/astra-gateway/src/cli_pool.rs`
+- 修改：`crates/astra-gateway/src/mcp/tools_workspace.rs`
+- 修改：`crates/astra-gateway/src/mcp/server.rs`
+- 修改：`.gitignore`
+- 移动：`test-plan-week-2026-05-08.md` → `docs/`
+- 删除：`.claude/scheduled_tasks.json`、`.claude/scheduled_tasks.lock`
+
+- [x] **步骤 1：移除误提交的运行时产物**
+
+`.claude/scheduled_tasks.json` 和 `.lock` 从 git 追踪移除，加入 `.gitignore`。
+
+- [x] **步骤 2：测试计划文件迁移**
+
+`test-plan-week-2026-05-08.md` 从仓库根目录移至 `docs/`。
+
+- [x] **步骤 3：MCP 临时文件清理**
+
+`cli_pool::kill()` 中调用 `cleanup_mcp_config(key)`，确保进程销毁时 `/tmp/gw-mcp-*.json` 不会无限累积。
+
+- [x] **步骤 4：workspace_switch 路径限制**
+
+新增 `is_allowed_path()` 函数，仅允许切换到：
+- `$HOME` 下的目录
+- `project_dirs` 配置中的目录
+
+防止通过 MCP tool 切换到 `/etc`、`/root` 等系统敏感路径。
+
+- [x] **步骤 5：验证编译**
+
+`cargo check -p astra-gateway` 通过。
