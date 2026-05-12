@@ -632,12 +632,14 @@ impl GatewayRunner {
             self.cli_profile.clone()
         };
 
-        // Apply per-user model override scoped to this CLI
+        // Apply per-user model override scoped to this CLI. Empty string is the
+        // "use default" sentinel written by `/model 默认` — treat as no override.
         let model_key = store::model_preference_key(profile.name());
         if let Some(ref store) = self.store
             && let Ok(Some(model_name)) = store
                 .get_user_preference(platform, user_id, &model_key)
                 .await
+            && !model_name.is_empty()
         {
             profile.set_model_override(model_name);
         }
@@ -793,7 +795,20 @@ impl GatewayRunner {
                 || msg.text.starts_with("/workspace ")
                 || msg.text.starts_with("/ws ");
             if invalidates_pool {
-                self.cli_pool.lock().await.kill(&effective_chat_id);
+                // For /model, only kill the pool when the argument actually
+                // resolved to a valid model. Otherwise the user just gets an
+                // error message back and the existing session stays warm.
+                let should_kill = if let Some(arg) = msg.text.strip_prefix("/model ") {
+                    !matches!(
+                        commands::resolve_model_input(arg),
+                        commands::ResolvedModel::Unrecognized
+                    )
+                } else {
+                    true
+                };
+                if should_kill {
+                    self.cli_pool.lock().await.kill(&effective_chat_id);
+                }
             }
             return Ok(Some(response));
         }
