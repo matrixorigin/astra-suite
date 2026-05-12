@@ -33,6 +33,7 @@ struct OutboundMessage {
     reply_token: Option<String>,
     stream_id: Option<String>,
     stream_finish: bool,
+    mention_user_ids: Vec<String>,
 }
 
 pub struct WeComAdapter {
@@ -168,6 +169,31 @@ impl PlatformAdapter for WeComAdapter {
                 reply_token: reply_token.map(String::from),
                 stream_id: stream_id.map(String::from),
                 stream_finish: finish,
+                mention_user_ids: Vec::new(),
+            })
+            .await
+            .map_err(|e| format!("outbound channel send failed: {e}"))
+    }
+
+    async fn send_text_with_mentions(
+        &self,
+        chat_id: &str,
+        text: &str,
+        mention_user_ids: &[String],
+    ) -> Result<(), String> {
+        let text = if text.len() > MAX_TEXT_LENGTH {
+            crate::text::truncate_with_suffix(text, MAX_TEXT_LENGTH, "…\n\n(truncated)")
+        } else {
+            text.to_string()
+        };
+        self.out_tx
+            .send(OutboundMessage {
+                chat_id: chat_id.to_string(),
+                text,
+                reply_token: None,
+                stream_id: None,
+                stream_finish: true,
+                mention_user_ids: mention_user_ids.to_vec(),
             })
             .await
             .map_err(|e| format!("outbound channel send failed: {e}"))
@@ -356,15 +382,19 @@ fn build_send_frame(bot_id: &str, out: &OutboundMessage) -> Value {
         })
     } else if !out.chat_id.is_empty() {
         // Proactive send (DM or group without req_id)
+        let mut body = json!({
+            "bot_id": bot_id,
+            "chatid": &out.chat_id,
+            "msgtype": "markdown",
+            "markdown": {"content": &out.text}
+        });
+        if !out.mention_user_ids.is_empty() {
+            body["mentioned_list"] = json!(out.mention_user_ids);
+        }
         json!({
             "cmd": "aibot_send_msg",
             "headers": {"req_id": format!("send-{}", uuid::Uuid::new_v4())},
-            "body": {
-                "bot_id": bot_id,
-                "chatid": &out.chat_id,
-                "msgtype": "markdown",
-                "markdown": {"content": &out.text}
-            }
+            "body": body
         })
     } else {
         tracing::warn!(
@@ -621,6 +651,7 @@ mod tests {
             reply_token: None,
             stream_id: None,
             stream_finish: true,
+            mention_user_ids: Vec::new(),
         };
         let frame = build_send_frame("bot-1", &out);
         assert_eq!(frame["cmd"], "aibot_send_msg");
@@ -636,6 +667,7 @@ mod tests {
             reply_token: Some("req-original".into()),
             stream_id: Some("stream-1".into()),
             stream_finish: true,
+            mention_user_ids: Vec::new(),
         };
         let frame = build_send_frame("bot-1", &out);
         assert_eq!(frame["cmd"], "aibot_respond_msg");
@@ -713,6 +745,7 @@ mod tests {
                 reply_token: None,
                 stream_id: None,
                 stream_finish: true,
+                mention_user_ids: Vec::new(),
             })
             .await
             .unwrap();

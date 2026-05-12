@@ -79,6 +79,11 @@ impl CronScheduler {
             // Pure text reminder — no agent invocation needed
             if cron_expr == "once" {
                 let text = format!("⏰ 提醒: {message}");
+                let mentions = if !user_id.is_empty() {
+                    vec![user_id.clone()]
+                } else {
+                    vec![]
+                };
                 let outbound = self
                     .enqueue_scheduler_outbox(
                         job_id, platform, chat_id, &user_id, "reminder", &text, None,
@@ -86,7 +91,8 @@ impl CronScheduler {
                     .await
                     .unwrap_or_else(|_| {
                         OutboundMessage::plain(platform.clone(), chat_id.clone(), text)
-                    });
+                    })
+                    .with_mentions(mentions);
                 if let Err(e) = self.outbound_tx.send(outbound).await {
                     tracing::warn!(job_id = %job_id, error = %e, "failed to send one-shot reminder");
                 }
@@ -168,22 +174,30 @@ impl CronScheduler {
 
             let prefix = format!("⏰ **定时任务 `{}`**\n\n", &job_id[..8.min(job_id.len())]);
             let body = format!("{prefix}{response}");
+            let mentions = if !user_id.is_empty() {
+                vec![user_id.clone()]
+            } else {
+                vec![]
+            };
             if let Some(writer) = trace.as_ref() {
                 match writer.enqueue_outbox(platform, chat_id, None, &body).await {
                     Ok(outbox_id) => {
                         if let Err(e) = self
                             .outbound_tx
-                            .send(OutboundMessage::with_outbox(
-                                platform.clone(),
-                                chat_id.clone(),
-                                body,
-                                None,
-                                OutboxDelivery {
-                                    outbox_id,
-                                    trace_id: writer.trace_id().clone(),
-                                    request_id: writer.request_id().clone(),
-                                },
-                            ))
+                            .send(
+                                OutboundMessage::with_outbox(
+                                    platform.clone(),
+                                    chat_id.clone(),
+                                    body,
+                                    None,
+                                    OutboxDelivery {
+                                        outbox_id,
+                                        trace_id: writer.trace_id().clone(),
+                                        request_id: writer.request_id().clone(),
+                                    },
+                                )
+                                .with_mentions(mentions.clone()),
+                            )
                             .await
                         {
                             tracing::warn!(error = %e, "scheduler: outbound send failed");
@@ -193,11 +207,10 @@ impl CronScheduler {
                 }
             } else if let Err(e) = self
                 .outbound_tx
-                .send(OutboundMessage::plain(
-                    platform.clone(),
-                    chat_id.clone(),
-                    body,
-                ))
+                .send(
+                    OutboundMessage::plain(platform.clone(), chat_id.clone(), body)
+                        .with_mentions(mentions),
+                )
                 .await
             {
                 tracing::warn!(error = %e, "scheduler: outbound send failed");

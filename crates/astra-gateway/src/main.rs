@@ -55,6 +55,25 @@ enum Command {
         #[arg(long)]
         mirror: Option<String>,
     },
+    /// Run as MCP stdio server (spawned by Claude CLI via --mcp-config)
+    #[command(name = "mcp-serve")]
+    McpServe {
+        /// Database URL for storage access
+        #[arg(long, env = "GATEWAY_DATABASE_URL")]
+        database_url: Option<String>,
+        /// Platform identifier for scoping queries
+        #[arg(long, env = "GW_MCP_PLATFORM")]
+        platform: Option<String>,
+        /// Chat ID for scoping queries
+        #[arg(long, env = "GW_MCP_CHAT_ID")]
+        chat_id: Option<String>,
+        /// User ID for scoping queries
+        #[arg(long, env = "GW_MCP_USER_ID")]
+        user_id: Option<String>,
+        /// Colon-separated project directories
+        #[arg(long, env = "GW_MCP_PROJECT_DIRS")]
+        project_dirs: Option<String>,
+    },
 }
 
 fn data_dir() -> PathBuf {
@@ -449,6 +468,27 @@ async fn main() {
         .init();
 
     let cli = Cli::parse();
+
+    if let Some(Command::McpServe {
+        database_url,
+        platform,
+        chat_id,
+        user_id,
+        project_dirs,
+    }) = cli.command
+    {
+        let dirs: Vec<String> = project_dirs
+            .map(|s| s.split(':').map(String::from).collect())
+            .unwrap_or_default();
+        if let Err(e) =
+            astra_gateway::mcp::server::run_stdio_server(database_url, platform, chat_id, user_id, dirs)
+                .await
+        {
+            eprintln!("mcp-serve error: {e}");
+            std::process::exit(1);
+        }
+        return;
+    }
 
     if let Some(Command::Update { version, mirror }) = cli.command {
         match run_self_update(version, mirror) {

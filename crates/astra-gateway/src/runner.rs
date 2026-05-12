@@ -271,6 +271,8 @@ pub struct OutboundMessage {
     /// Whether this is the final chunk of a stream.
     pub stream_finish: bool,
     pub outbox: Option<OutboxDelivery>,
+    /// User IDs to @mention in group chat messages.
+    pub mention_user_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -294,6 +296,7 @@ impl OutboundMessage {
             stream_id: None,
             stream_finish: true,
             outbox: None,
+            mention_user_ids: Vec::new(),
         }
     }
 
@@ -313,6 +316,7 @@ impl OutboundMessage {
             stream_id,
             stream_finish: finish,
             outbox: None,
+            mention_user_ids: Vec::new(),
         }
     }
 
@@ -331,7 +335,13 @@ impl OutboundMessage {
             stream_id: None,
             stream_finish: true,
             outbox: Some(outbox),
+            mention_user_ids: Vec::new(),
         }
+    }
+
+    pub fn with_mentions(mut self, user_ids: Vec<String>) -> Self {
+        self.mention_user_ids = user_ids;
+        self
     }
 }
 
@@ -1077,7 +1087,11 @@ impl GatewayRunner {
             }
             ctx
         };
-        let system_prompt = gw_context.to_system_prompt();
+        let system_prompt = if crate::cli_pool::CliProcessPool::supports_persistent(&cli_profile) {
+            gw_context.to_slim_system_prompt()
+        } else {
+            gw_context.to_system_prompt()
+        };
 
         let reasoning_display = if let Some(ref store) = self.store {
             store
@@ -1144,6 +1158,24 @@ impl GatewayRunner {
 
         let use_pool = crate::cli_pool::CliProcessPool::supports_persistent(&cli_profile);
 
+        let mcp_config_path = if use_pool {
+            let db_url = match &self.config.storage {
+                crate::store::StorageConfig::Mysql { url } => Some(url.as_str()),
+                crate::store::StorageConfig::MatrixOne { url } => Some(url.as_str()),
+                _ => None,
+            };
+            crate::mcp::config::generate_mcp_config(
+                db_url,
+                msg.platform,
+                &effective_chat_id,
+                &msg.user_id,
+                &self.config.project_dirs,
+            )
+            .ok()
+        } else {
+            None
+        };
+
         let cli_handle = if use_pool {
             // Long-lived process path: send message via pool, forward progress events
             let pool = self.cli_pool.clone();
@@ -1154,6 +1186,7 @@ impl GatewayRunner {
             let ws = workspace.clone();
             let token = access_token.clone();
             let kill_token = cancel_token.clone();
+            let mcp_cfg = mcp_config_path.clone();
 
             tokio::spawn(async move {
                 let mut pool_guard = pool.lock().await;
@@ -1165,6 +1198,7 @@ impl GatewayRunner {
                         ws.as_deref(),
                         Some(&sp),
                         token.as_deref(),
+                        mcp_cfg.as_deref(),
                     )
                     .await?;
                 drop(pool_guard); // release lock before reading progress
@@ -1554,6 +1588,7 @@ impl GatewayRunner {
                                 outbox: None,
                                 stream_id: None,
                                 stream_finish: true,
+                                mention_user_ids: Vec::new(),
                             });
                         }
                     }
@@ -2070,6 +2105,7 @@ impl GatewayRunner {
                 stream_id: None,
                 stream_finish: true,
                 outbox: None,
+                mention_user_ids: Vec::new(),
             };
         };
         let Some(repo) = self.trace_repo.as_ref() else {
@@ -2081,6 +2117,7 @@ impl GatewayRunner {
                 stream_id: None,
                 stream_finish: true,
                 outbox: None,
+                mention_user_ids: Vec::new(),
             };
         };
         let writer = TraceWriter::from_existing(
@@ -2113,6 +2150,7 @@ impl GatewayRunner {
                     stream_id: None,
                     stream_finish: true,
                     outbox: None,
+                    mention_user_ids: Vec::new(),
                 }
             }
         }
@@ -2677,17 +2715,33 @@ impl GatewayRunner {
         outbound: OutboundMessage,
     ) {
         let health_key = format!("{}:{}", outbound.platform, outbound.chat_id);
-        let result = send_text_to_platform(
-            adapters,
-            adapter_indices,
-            &outbound.platform,
-            &outbound.chat_id,
-            &outbound.text,
-            outbound.reply_token.as_deref(),
-            outbound.stream_id.as_deref(),
-            outbound.stream_finish,
-        )
-        .await;
+        let result = if !outbound.mention_user_ids.is_empty() && outbound.reply_token.is_none() {
+            if let Some(&idx) = adapter_indices.get(outbound.platform.as_str()) {
+                adapters[idx]
+                    .send_text_with_mentions(
+                        &outbound.chat_id,
+                        &outbound.text,
+                        &outbound.mention_user_ids,
+                    )
+                    .await
+                    .map(|_| 0usize)
+                    .map_err(|e| (0usize, e))
+            } else {
+                Err((0usize, format!("no adapter for platform: {}", outbound.platform)))
+            }
+        } else {
+            send_text_to_platform(
+                adapters,
+                adapter_indices,
+                &outbound.platform,
+                &outbound.chat_id,
+                &outbound.text,
+                outbound.reply_token.as_deref(),
+                outbound.stream_id.as_deref(),
+                outbound.stream_finish,
+            )
+            .await
+        };
 
         // Track send health for heartbeat circuit-breaker.
         match &result {
@@ -5318,6 +5372,7 @@ fn cli_response_fields() {
         stream_id: None,
         stream_finish: true,
         outbox: None,
+        mention_user_ids: Vec::new(),
     };
     assert_eq!(r.platform, "weixin");
     assert_eq!(r.chat_id, "c1");
@@ -5418,6 +5473,7 @@ async fn cli_response_channel_roundtrip() {
         stream_id: None,
         stream_finish: true,
         outbox: None,
+        mention_user_ids: Vec::new(),
     })
     .await
     .unwrap();
@@ -5442,6 +5498,7 @@ async fn concurrent_cli_responses_ordered() {
             stream_id: None,
             stream_finish: true,
             outbox: None,
+            mention_user_ids: Vec::new(),
         })
         .await
         .unwrap();
@@ -5455,6 +5512,7 @@ async fn concurrent_cli_responses_ordered() {
             stream_id: None,
             stream_finish: true,
             outbox: None,
+            mention_user_ids: Vec::new(),
         })
         .await
         .unwrap();

@@ -6,7 +6,7 @@
 
 use super::{
     CronJobRecord, CronJobSpec, DueJob, GatewayStore, PendingMessage, PlatformCredential,
-    SessionRecord, StoreError, UsageRecord, UsageSummary, next_cron_run_str,
+    SessionRecord, SkillRecord, StoreError, UsageRecord, UsageSummary, next_cron_run_str,
 };
 use async_trait::async_trait;
 use sqlx::SqlitePool;
@@ -183,6 +183,20 @@ impl GatewayStore for SqliteGatewayStore {
         sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_durable_tasks_owner_updated
              ON gw_durable_tasks(owner_id, updated_at)",
+        )
+        .execute(&self.pool)
+        .await?;
+
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS gw_skills (
+                platform TEXT NOT NULL,
+                chat_id TEXT NOT NULL,
+                name TEXT NOT NULL,
+                content TEXT NOT NULL,
+                description TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%S','now')),
+                PRIMARY KEY (platform, chat_id, name)
+            )",
         )
         .execute(&self.pool)
         .await?;
@@ -840,6 +854,98 @@ impl GatewayStore for SqliteGatewayStore {
                 tool_calls: t as u64,
             })
             .unwrap_or_default())
+    }
+
+    // ── Skills ─────────────────────────────────────────────────────────
+
+    async fn list_skills(
+        &self,
+        platform: &str,
+        chat_id: &str,
+    ) -> Result<Vec<SkillRecord>, StoreError> {
+        let rows: Vec<(String, String, String, String)> = sqlx::query_as(
+            "SELECT name, content, description, created_at
+             FROM gw_skills WHERE platform = ? AND chat_id = ?
+             ORDER BY name",
+        )
+        .bind(platform)
+        .bind(chat_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|(name, content, description, created_at)| SkillRecord {
+                name,
+                content,
+                description,
+                created_at,
+            })
+            .collect())
+    }
+
+    async fn get_skill(
+        &self,
+        platform: &str,
+        chat_id: &str,
+        name: &str,
+    ) -> Result<Option<SkillRecord>, StoreError> {
+        let row: Option<(String, String, String, String)> = sqlx::query_as(
+            "SELECT name, content, description, created_at
+             FROM gw_skills WHERE platform = ? AND chat_id = ? AND name = ?",
+        )
+        .bind(platform)
+        .bind(chat_id)
+        .bind(name)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row.map(|(name, content, description, created_at)| SkillRecord {
+            name,
+            content,
+            description,
+            created_at,
+        }))
+    }
+
+    async fn upsert_skill(
+        &self,
+        platform: &str,
+        chat_id: &str,
+        name: &str,
+        content: &str,
+        description: &str,
+    ) -> Result<(), StoreError> {
+        sqlx::query(
+            "INSERT INTO gw_skills (platform, chat_id, name, content, description)
+             VALUES (?, ?, ?, ?, ?)
+             ON CONFLICT(platform, chat_id, name) DO UPDATE SET content=excluded.content, description=excluded.description",
+        )
+        .bind(platform)
+        .bind(chat_id)
+        .bind(name)
+        .bind(content)
+        .bind(description)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn delete_skill(
+        &self,
+        platform: &str,
+        chat_id: &str,
+        name: &str,
+    ) -> Result<bool, StoreError> {
+        let result = sqlx::query(
+            "DELETE FROM gw_skills WHERE platform = ? AND chat_id = ? AND name = ?",
+        )
+        .bind(platform)
+        .bind(chat_id)
+        .bind(name)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
     }
 }
 

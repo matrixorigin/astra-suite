@@ -2,7 +2,7 @@
 
 use super::{
     CronJobRecord, CronJobSpec, DueJob, GatewayStore, PendingMessage, PlatformCredential,
-    SessionRecord, StoreError, UsageRecord, UsageSummary, next_cron_run_str,
+    SessionRecord, SkillRecord, StoreError, UsageRecord, UsageSummary, next_cron_run_str,
 };
 
 /// MySQL-backed gateway store.
@@ -177,6 +177,21 @@ impl GatewayStore for MysqlGatewayStore {
                 text TEXT NOT NULL,
                 created_at DATETIME(6) DEFAULT NOW(6),
                 INDEX idx_pending (platform, created_at)
+            )",
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| StoreError::Database(e.to_string()))?;
+
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS gw_skills (
+                platform VARCHAR(64) NOT NULL,
+                chat_id VARCHAR(128) NOT NULL,
+                name VARCHAR(128) NOT NULL,
+                content LONGTEXT NOT NULL,
+                description TEXT NOT NULL,
+                created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (platform, chat_id, name)
             )",
         )
         .execute(&self.pool)
@@ -851,5 +866,101 @@ impl GatewayStore for MysqlGatewayStore {
                 tool_calls: t as u64,
             })
             .unwrap_or_default())
+    }
+
+    // ── Skill operations ───────────────────────────────────────────────
+
+    async fn list_skills(
+        &self,
+        platform: &str,
+        chat_id: &str,
+    ) -> Result<Vec<SkillRecord>, StoreError> {
+        let rows: Vec<(String, String, String, String)> = sqlx::query_as(
+            "SELECT name, content, description, CAST(created_at AS CHAR)
+             FROM gw_skills WHERE platform = ? AND chat_id = ?
+             ORDER BY name",
+        )
+        .bind(platform)
+        .bind(chat_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| StoreError::Database(e.to_string()))?;
+
+        Ok(rows
+            .into_iter()
+            .map(|(name, content, description, created_at)| SkillRecord {
+                name,
+                content,
+                description,
+                created_at,
+            })
+            .collect())
+    }
+
+    async fn get_skill(
+        &self,
+        platform: &str,
+        chat_id: &str,
+        name: &str,
+    ) -> Result<Option<SkillRecord>, StoreError> {
+        let row: Option<(String, String, String, String)> = sqlx::query_as(
+            "SELECT name, content, description, CAST(created_at AS CHAR)
+             FROM gw_skills WHERE platform = ? AND chat_id = ? AND name = ?",
+        )
+        .bind(platform)
+        .bind(chat_id)
+        .bind(name)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| StoreError::Database(e.to_string()))?;
+
+        Ok(row.map(|(name, content, description, created_at)| SkillRecord {
+            name,
+            content,
+            description,
+            created_at,
+        }))
+    }
+
+    async fn upsert_skill(
+        &self,
+        platform: &str,
+        chat_id: &str,
+        name: &str,
+        content: &str,
+        description: &str,
+    ) -> Result<(), StoreError> {
+        sqlx::query(
+            "INSERT INTO gw_skills (platform, chat_id, name, content, description)
+             VALUES (?, ?, ?, ?, ?)
+             ON DUPLICATE KEY UPDATE content = VALUES(content), description = VALUES(description)",
+        )
+        .bind(platform)
+        .bind(chat_id)
+        .bind(name)
+        .bind(content)
+        .bind(description)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| StoreError::Database(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn delete_skill(
+        &self,
+        platform: &str,
+        chat_id: &str,
+        name: &str,
+    ) -> Result<bool, StoreError> {
+        let result = sqlx::query(
+            "DELETE FROM gw_skills WHERE platform = ? AND chat_id = ? AND name = ?",
+        )
+        .bind(platform)
+        .bind(chat_id)
+        .bind(name)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| StoreError::Database(e.to_string()))?;
+        Ok(result.rows_affected() > 0)
     }
 }

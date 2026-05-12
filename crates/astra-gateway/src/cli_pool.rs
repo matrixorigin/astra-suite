@@ -65,10 +65,11 @@ impl CliProcessPool {
         working_dir: Option<&Path>,
         system_prompt: Option<&str>,
         access_token: Option<&str>,
+        mcp_config: Option<&Path>,
     ) -> Result<mpsc::Receiver<CliProgress>, String> {
         if !self.processes.contains_key(key) || !self.is_alive(key) {
             self.processes.remove(key);
-            self.spawn(key, profile, working_dir, system_prompt, access_token)
+            self.spawn(key, profile, working_dir, system_prompt, access_token, mcp_config)
                 .await?;
         }
 
@@ -145,8 +146,9 @@ impl CliProcessPool {
         working_dir: Option<&Path>,
         system_prompt: Option<&str>,
         access_token: Option<&str>,
+        mcp_config: Option<&Path>,
     ) -> Result<(), String> {
-        let mut cmd = build_persistent_command(profile, working_dir, system_prompt)
+        let mut cmd = build_persistent_command(profile, working_dir, system_prompt, mcp_config)
             .ok_or("profile does not support persistent mode")?;
 
         if let Some(token) = access_token {
@@ -228,6 +230,7 @@ fn build_persistent_command(
     profile: &CliProfile,
     working_dir: Option<&Path>,
     system_prompt: Option<&str>,
+    mcp_config: Option<&Path>,
 ) -> Option<Command> {
     match profile {
         CliProfile::Claude {
@@ -264,6 +267,9 @@ fn build_persistent_command(
             }
             if let Some(sp) = system_prompt {
                 cmd.arg("--append-system-prompt").arg(sp);
+            }
+            if let Some(mcp) = mcp_config {
+                cmd.arg("--mcp-config").arg(mcp);
             }
             if let Some(dir) = working_dir {
                 cmd.current_dir(dir);
