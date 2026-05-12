@@ -136,8 +136,12 @@ impl GatewayContext {
         lines.push(String::new());
         lines.push("### Notes".into());
         lines.push(String::new());
-        lines.push("- Mobile platform — keep responses concise. Respond in user's language.".into());
-        lines.push("- You CAN set reminders/schedules via gateway tools. No raw JSON/code unless asked.".into());
+        lines
+            .push("- Mobile platform — keep responses concise. Respond in user's language.".into());
+        lines.push(
+            "- You CAN set reminders/schedules via gateway tools. No raw JSON/code unless asked."
+                .into(),
+        );
         lines.join("\n")
     }
 }

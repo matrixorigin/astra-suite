@@ -69,8 +69,15 @@ impl CliProcessPool {
     ) -> Result<mpsc::Receiver<CliProgress>, String> {
         if !self.processes.contains_key(key) || !self.is_alive(key) {
             self.processes.remove(key);
-            self.spawn(key, profile, working_dir, system_prompt, access_token, mcp_config)
-                .await?;
+            self.spawn(
+                key,
+                profile,
+                working_dir,
+                system_prompt,
+                access_token,
+                mcp_config,
+            )
+            .await?;
         }
 
         let handle = self.processes.get(key).unwrap();

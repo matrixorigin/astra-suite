@@ -914,12 +914,14 @@ impl GatewayStore for MysqlGatewayStore {
         .await
         .map_err(|e| StoreError::Database(e.to_string()))?;
 
-        Ok(row.map(|(name, content, description, created_at)| SkillRecord {
-            name,
-            content,
-            description,
-            created_at,
-        }))
+        Ok(
+            row.map(|(name, content, description, created_at)| SkillRecord {
+                name,
+                content,
+                description,
+                created_at,
+            }),
+        )
     }
 
     async fn upsert_skill(
@@ -952,15 +954,14 @@ impl GatewayStore for MysqlGatewayStore {
         chat_id: &str,
         name: &str,
     ) -> Result<bool, StoreError> {
-        let result = sqlx::query(
-            "DELETE FROM gw_skills WHERE platform = ? AND chat_id = ? AND name = ?",
-        )
-        .bind(platform)
-        .bind(chat_id)
-        .bind(name)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| StoreError::Database(e.to_string()))?;
+        let result =
+            sqlx::query("DELETE FROM gw_skills WHERE platform = ? AND chat_id = ? AND name = ?")
+                .bind(platform)
+                .bind(chat_id)
+                .bind(name)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| StoreError::Database(e.to_string()))?;
         Ok(result.rows_affected() > 0)
     }
 }

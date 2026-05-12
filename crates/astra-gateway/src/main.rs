@@ -480,9 +480,14 @@ async fn main() {
         let dirs: Vec<String> = project_dirs
             .map(|s| s.split(':').map(String::from).collect())
             .unwrap_or_default();
-        if let Err(e) =
-            astra_gateway::mcp::server::run_stdio_server(database_url, platform, chat_id, user_id, dirs)
-                .await
+        if let Err(e) = astra_gateway::mcp::server::run_stdio_server(
+            database_url,
+            platform,
+            chat_id,
+            user_id,
+            dirs,
+        )
+        .await
         {
             eprintln!("mcp-serve error: {e}");
             std::process::exit(1);

@@ -900,12 +900,14 @@ impl GatewayStore for SqliteGatewayStore {
         .fetch_optional(&self.pool)
         .await?;
 
-        Ok(row.map(|(name, content, description, created_at)| SkillRecord {
-            name,
-            content,
-            description,
-            created_at,
-        }))
+        Ok(
+            row.map(|(name, content, description, created_at)| SkillRecord {
+                name,
+                content,
+                description,
+                created_at,
+            }),
+        )
     }
 
     async fn upsert_skill(
@@ -937,14 +939,13 @@ impl GatewayStore for SqliteGatewayStore {
         chat_id: &str,
         name: &str,
     ) -> Result<bool, StoreError> {
-        let result = sqlx::query(
-            "DELETE FROM gw_skills WHERE platform = ? AND chat_id = ? AND name = ?",
-        )
-        .bind(platform)
-        .bind(chat_id)
-        .bind(name)
-        .execute(&self.pool)
-        .await?;
+        let result =
+            sqlx::query("DELETE FROM gw_skills WHERE platform = ? AND chat_id = ? AND name = ?")
+                .bind(platform)
+                .bind(chat_id)
+                .bind(name)
+                .execute(&self.pool)
+                .await?;
         Ok(result.rows_affected() > 0)
     }
 }

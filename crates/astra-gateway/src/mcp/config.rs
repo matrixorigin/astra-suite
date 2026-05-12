@@ -7,16 +7,27 @@ pub fn generate_mcp_config(
     user_id: &str,
     project_dirs: &[String],
 ) -> Result<PathBuf, std::io::Error> {
-    let gateway_bin = std::env::current_exe()
-        .unwrap_or_else(|_| PathBuf::from("astra-gateway"));
+    let gateway_bin = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("astra-gateway"));
 
     let mut env = serde_json::Map::new();
     if let Some(url) = database_url {
-        env.insert("GATEWAY_DATABASE_URL".into(), serde_json::Value::String(url.to_string()));
+        env.insert(
+            "GATEWAY_DATABASE_URL".into(),
+            serde_json::Value::String(url.to_string()),
+        );
     }
-    env.insert("GW_MCP_PLATFORM".into(), serde_json::Value::String(platform.to_string()));
-    env.insert("GW_MCP_CHAT_ID".into(), serde_json::Value::String(chat_id.to_string()));
-    env.insert("GW_MCP_USER_ID".into(), serde_json::Value::String(user_id.to_string()));
+    env.insert(
+        "GW_MCP_PLATFORM".into(),
+        serde_json::Value::String(platform.to_string()),
+    );
+    env.insert(
+        "GW_MCP_CHAT_ID".into(),
+        serde_json::Value::String(chat_id.to_string()),
+    );
+    env.insert(
+        "GW_MCP_USER_ID".into(),
+        serde_json::Value::String(user_id.to_string()),
+    );
     if !project_dirs.is_empty() {
         env.insert(
             "GW_MCP_PROJECT_DIRS".into(),

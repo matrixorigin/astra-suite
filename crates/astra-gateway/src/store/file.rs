@@ -802,9 +802,7 @@ async fn load_json_map<T: serde::de::DeserializeOwned>(
     }
 }
 
-async fn load_json_vec<T: serde::de::DeserializeOwned>(
-    path: &Path,
-) -> Result<Vec<T>, StoreError> {
+async fn load_json_vec<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Vec<T>, StoreError> {
     match tokio::fs::read_to_string(path).await {
         Ok(data) => {
             if data.trim().is_empty() {

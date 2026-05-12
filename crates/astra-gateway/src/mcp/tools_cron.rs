@@ -8,7 +8,10 @@ pub async fn cron_list(store: &dyn GatewayStore, platform: &str, chat_id: &str) 
             for j in &jobs {
                 let status = if j.enabled { "✅" } else { "⏸" };
                 let short_id = &j.job_id[..8.min(j.job_id.len())];
-                lines.push(format!("{status} `{short_id}` | `{}` | {}", j.cron_expr, j.description));
+                lines.push(format!(
+                    "{status} `{short_id}` | `{}` | {}",
+                    j.cron_expr, j.description
+                ));
             }
             lines.join("\n")
         }
@@ -28,7 +31,9 @@ pub async fn cron_add(
         return "Error: message cannot be empty".into();
     }
     if !store::is_valid_cron_expr(cron_expr) {
-        return format!("Error: invalid cron expression `{cron_expr}` (need 5 fields: min hour day month weekday)");
+        return format!(
+            "Error: invalid cron expression `{cron_expr}` (need 5 fields: min hour day month weekday)"
+        );
     }
 
     let job_id = uuid::Uuid::new_v4().to_string();
@@ -140,9 +145,15 @@ pub async fn remind_after(
                 format!("{minutes}m")
             };
             if exec {
-                format!("Scheduled exec in {time_str}: {message}\n(ID: `{}`)", &job_id[..8])
+                format!(
+                    "Scheduled exec in {time_str}: {message}\n(ID: `{}`)",
+                    &job_id[..8]
+                )
             } else {
-                format!("Reminder in {time_str}: {message}\n(ID: `{}`)", &job_id[..8])
+                format!(
+                    "Reminder in {time_str}: {message}\n(ID: `{}`)",
+                    &job_id[..8]
+                )
             }
         }
         Err(e) => format!("Error: {e}"),

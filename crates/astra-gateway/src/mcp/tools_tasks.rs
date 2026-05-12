@@ -1,5 +1,5 @@
-use astra_task_store::{DurableTaskStatus, TaskFilter, TaskSpec};
 use crate::durable_task_store::DurableTaskStoreExt;
+use astra_task_store::{DurableTaskStatus, TaskFilter, TaskSpec};
 
 pub async fn tasks_list(
     store: Option<&dyn DurableTaskStoreExt>,
@@ -27,7 +27,12 @@ pub async fn tasks_list(
                     DurableTaskStatus::Failed => "❌",
                     _ => "📋",
                 };
-                lines.push(format!("{icon} `{short_id}` | {} | {} | {}%", t.name, t.status.as_str(), t.progress_pct));
+                lines.push(format!(
+                    "{icon} `{short_id}` | {} | {} | {}%",
+                    t.name,
+                    t.status.as_str(),
+                    t.progress_pct
+                ));
             }
             lines.join("\n")
         }
@@ -55,7 +60,10 @@ pub async fn tasks_create(
         initial_state: None,
     };
     match store.create(&spec).await {
-        Ok(id) => format!("Task created\n- ID: `{}`\n- Name: {name}", &id.0[..8.min(id.0.len())]),
+        Ok(id) => format!(
+            "Task created\n- ID: `{}`\n- Name: {name}",
+            &id.0[..8.min(id.0.len())]
+        ),
         Err(e) => format!("Error: {e}"),
     }
 }

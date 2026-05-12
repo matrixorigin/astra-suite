@@ -2727,7 +2727,10 @@ impl GatewayRunner {
                     .map(|_| 0usize)
                     .map_err(|e| (0usize, e))
             } else {
-                Err((0usize, format!("no adapter for platform: {}", outbound.platform)))
+                Err((
+                    0usize,
+                    format!("no adapter for platform: {}", outbound.platform),
+                ))
             }
         } else {
             send_text_to_platform(

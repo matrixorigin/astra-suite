@@ -1,9 +1,9 @@
 use std::sync::Arc;
 
-use rmcp::{tool, tool_router};
 use rmcp::handler::server::wrapper::{Json, Parameters};
 use rmcp::model::{Implementation, ServerInfo};
 use rmcp::schemars;
+use rmcp::{tool, tool_router};
 use serde::{Deserialize, Serialize};
 
 use crate::store::{self, GatewayStore};
@@ -98,8 +98,10 @@ impl TextResult {
 impl GatewayMcpServer {
     #[allow(dead_code)]
     fn get_info(&self) -> ServerInfo {
-        ServerInfo::default()
-            .with_server_info(Implementation::new("astra-gateway", env!("CARGO_PKG_VERSION")))
+        ServerInfo::default().with_server_info(Implementation::new(
+            "astra-gateway",
+            env!("CARGO_PKG_VERSION"),
+        ))
     }
 
     #[tool(
@@ -168,8 +170,7 @@ impl GatewayMcpServer {
         description = "List all saved skills (reusable procedures) with their names and descriptions"
     )]
     async fn skills_list(&self) -> Json<TextResult> {
-        let result =
-            tools_skills::skills_list(&*self.store, &self.platform, &self.chat_id).await;
+        let result = tools_skills::skills_list(&*self.store, &self.platform, &self.chat_id).await;
         Json(TextResult::new(result))
     }
 
@@ -191,10 +192,7 @@ impl GatewayMcpServer {
         name = "gateway_skills_add",
         description = "Save a reusable skill (procedure/workflow). Only for non-trivial procedures worth reusing."
     )]
-    async fn skills_add(
-        &self,
-        Parameters(params): Parameters<SkillAddParams>,
-    ) -> Json<TextResult> {
+    async fn skills_add(&self, Parameters(params): Parameters<SkillAddParams>) -> Json<TextResult> {
         let result = tools_skills::skills_add(
             &*self.store,
             &self.platform,
@@ -226,12 +224,9 @@ impl GatewayMcpServer {
         description = "List active durable tasks (long-running, checkpointable tasks)"
     )]
     async fn tasks_list(&self) -> Json<TextResult> {
-        let result = tools_tasks::tasks_list(
-            self.durable_store.as_deref(),
-            &self.platform,
-            &self.chat_id,
-        )
-        .await;
+        let result =
+            tools_tasks::tasks_list(self.durable_store.as_deref(), &self.platform, &self.chat_id)
+                .await;
         Json(TextResult::new(result))
     }
 
@@ -258,10 +253,7 @@ impl GatewayMcpServer {
         name = "gateway_tasks_status",
         description = "Get status of a durable task by ID (prefix match supported)"
     )]
-    async fn tasks_status(
-        &self,
-        Parameters(params): Parameters<TaskIdParams>,
-    ) -> Json<TextResult> {
+    async fn tasks_status(&self, Parameters(params): Parameters<TaskIdParams>) -> Json<TextResult> {
         let result = tools_tasks::tasks_status(
             self.durable_store.as_deref(),
             &self.platform,
@@ -294,10 +286,7 @@ impl GatewayMcpServer {
         name = "gateway_tasks_fail",
         description = "Mark a durable task as failed with optional error message"
     )]
-    async fn tasks_fail(
-        &self,
-        Parameters(params): Parameters<TaskFailParams>,
-    ) -> Json<TextResult> {
+    async fn tasks_fail(&self, Parameters(params): Parameters<TaskFailParams>) -> Json<TextResult> {
         let result = tools_tasks::tasks_fail(
             self.durable_store.as_deref(),
             &self.platform,
@@ -309,14 +298,8 @@ impl GatewayMcpServer {
         Json(TextResult::new(result))
     }
 
-    #[tool(
-        name = "gateway_tasks_cancel",
-        description = "Cancel a durable task"
-    )]
-    async fn tasks_cancel(
-        &self,
-        Parameters(params): Parameters<TaskIdParams>,
-    ) -> Json<TextResult> {
+    #[tool(name = "gateway_tasks_cancel", description = "Cancel a durable task")]
+    async fn tasks_cancel(&self, Parameters(params): Parameters<TaskIdParams>) -> Json<TextResult> {
         let result = tools_tasks::tasks_cancel(
             self.durable_store.as_deref(),
             &self.platform,
