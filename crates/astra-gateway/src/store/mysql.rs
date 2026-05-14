@@ -1,8 +1,8 @@
 //! MySQL / MatrixOne implementation of [`GatewayStore`].
 
 use super::{
-    CronJobRecord, CronJobSpec, DueJob, GatewayStore, PendingMessage, PlatformCredential,
-    SessionRecord, SkillRecord, StoreError, UsageRecord, UsageSummary, next_cron_run_str,
+    CronJobRecord, CronJobSpec, DueJob, GatewayStore, PlatformCredential, SessionRecord,
+    SkillRecord, StoreError, UsageRecord, UsageSummary, next_cron_run_str,
 };
 
 /// MySQL-backed gateway store.
@@ -162,21 +162,6 @@ impl GatewayStore for MysqlGatewayStore {
                 updated_at DATETIME(6) DEFAULT NOW(6),
                 INDEX idx_owner_status (owner_id, status),
                 INDEX idx_owner_updated (owner_id, updated_at)
-            )",
-        )
-        .execute(&self.pool)
-        .await
-        .map_err(|e| StoreError::Database(e.to_string()))?;
-
-        sqlx::query(
-            "CREATE TABLE IF NOT EXISTS gw_pending_messages (
-                id BIGINT AUTO_INCREMENT PRIMARY KEY,
-                platform VARCHAR(32) NOT NULL,
-                chat_id VARCHAR(128) NOT NULL,
-                user_id VARCHAR(128) NOT NULL,
-                text TEXT NOT NULL,
-                created_at DATETIME(6) DEFAULT NOW(6),
-                INDEX idx_pending (platform, created_at)
             )",
         )
         .execute(&self.pool)
@@ -511,76 +496,6 @@ impl GatewayStore for MysqlGatewayStore {
         .await
         .map_err(|e| StoreError::Database(e.to_string()))?;
         Ok(())
-    }
-
-    // ── Pending message operations ──────────────────────────────────────
-
-    async fn save_pending_message(
-        &self,
-        platform: &str,
-        chat_id: &str,
-        user_id: &str,
-        text: &str,
-    ) -> Result<i64, StoreError> {
-        let result = sqlx::query(
-            "INSERT INTO gw_pending_messages (platform, chat_id, user_id, text) VALUES (?, ?, ?, ?)",
-        )
-        .bind(platform)
-        .bind(chat_id)
-        .bind(user_id)
-        .bind(text)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| StoreError::Database(e.to_string()))?;
-        Ok(result.last_insert_id() as i64)
-    }
-
-    async fn list_pending_messages(
-        &self,
-        platform: Option<&str>,
-    ) -> Result<Vec<PendingMessage>, StoreError> {
-        let rows: Vec<(i64, String, String, String, String)> = if let Some(platform) = platform {
-            sqlx::query_as(
-                "SELECT id, platform, chat_id, user_id, text
-                 FROM gw_pending_messages
-                 WHERE platform = ?
-                 ORDER BY created_at
-                 LIMIT 50",
-            )
-            .bind(platform)
-            .fetch_all(&self.pool)
-            .await
-        } else {
-            sqlx::query_as(
-                "SELECT id, platform, chat_id, user_id, text
-                 FROM gw_pending_messages
-                 ORDER BY created_at
-                 LIMIT 50",
-            )
-            .fetch_all(&self.pool)
-            .await
-        }
-        .map_err(|e| StoreError::Database(e.to_string()))?;
-
-        Ok(rows
-            .into_iter()
-            .map(|(id, plat, cid, uid, txt)| PendingMessage {
-                id,
-                platform: plat,
-                chat_id: cid,
-                user_id: uid,
-                text: txt,
-            })
-            .collect())
-    }
-
-    async fn delete_pending_message(&self, id: i64) -> Result<u64, StoreError> {
-        let result = sqlx::query("DELETE FROM gw_pending_messages WHERE id = ?")
-            .bind(id)
-            .execute(&self.pool)
-            .await
-            .map_err(|e| StoreError::Database(e.to_string()))?;
-        Ok(result.rows_affected())
     }
 
     // ── Cron job operations ─────────────────────────────────────────────

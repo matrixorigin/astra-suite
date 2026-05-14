@@ -117,78 +117,10 @@ pub async fn ensure_schema(pool: &MySqlPool) -> Result<(), sqlx::Error> {
     .execute(pool)
     .await?;
 
-    sqlx::query(
-        "CREATE TABLE IF NOT EXISTS gw_pending_messages (
-            id BIGINT AUTO_INCREMENT PRIMARY KEY,
-            platform VARCHAR(32) NOT NULL,
-            chat_id VARCHAR(128) NOT NULL,
-            user_id VARCHAR(128) NOT NULL,
-            text TEXT NOT NULL,
-            created_at DATETIME(6) DEFAULT NOW(6),
-            INDEX idx_pending (platform, created_at)
-        )",
-    )
-    .execute(pool)
-    .await?;
-
     crate::trace_model::ensure_mysql_schema(pool).await?;
 
     tracing::info!("gateway schema ensured");
     Ok(())
-}
-
-pub async fn save_pending_message(
-    pool: &MySqlPool,
-    platform: &str,
-    chat_id: &str,
-    user_id: &str,
-    text: &str,
-) -> Result<i64, sqlx::Error> {
-    let result = sqlx::query(
-        "INSERT INTO gw_pending_messages (platform, chat_id, user_id, text) VALUES (?, ?, ?, ?)",
-    )
-    .bind(platform)
-    .bind(chat_id)
-    .bind(user_id)
-    .bind(text)
-    .execute(pool)
-    .await?;
-    Ok(result.last_insert_id() as i64)
-}
-
-pub async fn list_pending_messages(
-    pool: &MySqlPool,
-    platform: Option<&str>,
-) -> Result<Vec<(i64, String, String, String, String)>, sqlx::Error> {
-    if let Some(platform) = platform {
-        sqlx::query_as(
-            "SELECT id, platform, chat_id, user_id, text
-             FROM gw_pending_messages
-             WHERE platform = ?
-             ORDER BY created_at
-             LIMIT 50",
-        )
-        .bind(platform)
-        .fetch_all(pool)
-        .await
-    } else {
-        sqlx::query_as(
-            "SELECT id, platform, chat_id, user_id, text
-             FROM gw_pending_messages
-             ORDER BY created_at
-             LIMIT 50",
-        )
-        .fetch_all(pool)
-        .await
-    }
-}
-
-pub async fn delete_pending_message(pool: &MySqlPool, id: i64) -> Result<u64, sqlx::Error> {
-    let result = sqlx::query("DELETE FROM gw_pending_messages WHERE id = ?")
-        .bind(id)
-        .execute(pool)
-        .await?;
-    Ok(result.rows_affected())
 }
 
 // ─── User operations ────────────────────────────────────────────────────────

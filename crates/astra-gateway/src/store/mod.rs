@@ -64,16 +64,6 @@ pub struct SessionRecord {
     pub created_at: String,
 }
 
-/// A message queued for async delivery (e.g. when the CLI is busy).
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct PendingMessage {
-    pub id: i64,
-    pub platform: String,
-    pub chat_id: String,
-    pub user_id: String,
-    pub text: String,
-}
-
 /// Parameters for creating a new cron job.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CronJobSpec {
@@ -292,22 +282,6 @@ pub trait GatewayStore: Send + Sync + 'static {
         user_id: &str,
         credential_type: &str,
     ) -> Result<bool, StoreError>;
-
-    // ── Pending messages ────────────────────────────────────────────────
-    async fn save_pending_message(
-        &self,
-        platform: &str,
-        chat_id: &str,
-        user_id: &str,
-        text: &str,
-    ) -> Result<i64, StoreError>;
-
-    async fn list_pending_messages(
-        &self,
-        platform: Option<&str>,
-    ) -> Result<Vec<PendingMessage>, StoreError>;
-
-    async fn delete_pending_message(&self, id: i64) -> Result<u64, StoreError>;
 
     // ── Usage ───────────────────────────────────────────────────────────
     async fn record_usage(&self, record: &UsageRecord) -> Result<(), StoreError>;
@@ -1170,19 +1144,6 @@ url: "mysql://root:111@127.0.0.1:6001/astra_gateway""#;
     }
 
     #[test]
-    fn pending_message_fields() {
-        let m = PendingMessage {
-            id: 42,
-            platform: "weixin".into(),
-            chat_id: "chat-1".into(),
-            user_id: "u-1".into(),
-            text: "hello".into(),
-        };
-        assert_eq!(m.id, 42);
-        assert_eq!(m.text, "hello");
-    }
-
-    #[test]
     fn cron_job_spec_fields() {
         let spec = CronJobSpec {
             job_id: "j-1".into(),
@@ -1314,20 +1275,6 @@ url: "mysql://root:111@127.0.0.1:6001/astra_gateway""#;
         let decoded: SessionRecord = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded.session_id, original.session_id);
         assert_eq!(decoded.is_current, original.is_current);
-    }
-
-    #[test]
-    fn pending_message_serde_roundtrip() {
-        let original = PendingMessage {
-            id: 7,
-            platform: "telegram".into(),
-            chat_id: "c".into(),
-            user_id: "u".into(),
-            text: "msg with \"quotes\"".into(),
-        };
-        let json = serde_json::to_string(&original).unwrap();
-        let decoded: PendingMessage = serde_json::from_str(&json).unwrap();
-        assert_eq!(decoded.text, original.text);
     }
 
     #[test]
@@ -1511,23 +1458,6 @@ url: "mysql://root:111@127.0.0.1:6001/astra_gateway""#;
         assert!(store.delete_cron_job("j-test").await.unwrap());
         assert!(!store.delete_cron_job("j-test").await.unwrap());
 
-        // Pending messages
-        let id = store
-            .save_pending_message("test", "c1", "u1", "hello")
-            .await
-            .unwrap();
-        let msgs = store.list_pending_messages(Some("test")).await.unwrap();
-        assert_eq!(msgs.len(), 1);
-        assert_eq!(msgs[0].text, "hello");
-        store.delete_pending_message(id).await.unwrap();
-        assert!(
-            store
-                .list_pending_messages(Some("test"))
-                .await
-                .unwrap()
-                .is_empty()
-        );
-
         // Credentials
         let creds = serde_json::json!({"key": "value"});
         store
@@ -1581,41 +1511,6 @@ url: "mysql://root:111@127.0.0.1:6001/astra_gateway""#;
                 .await
                 .unwrap()
         );
-
-        // Pending messages
-        let id = store
-            .save_pending_message("test", "c1", "u1", "hello")
-            .await
-            .unwrap();
-        let msgs = store.list_pending_messages(Some("test")).await.unwrap();
-        assert_eq!(msgs.len(), 1);
-        assert_eq!(msgs[0].text, "hello");
-        store.delete_pending_message(id).await.unwrap();
-        assert!(
-            store
-                .list_pending_messages(Some("test"))
-                .await
-                .unwrap()
-                .is_empty()
-        );
-
-        // list_pending_messages with None (all platforms)
-        let id_a = store
-            .save_pending_message("plat_a", "c1", "u1", "msg_a")
-            .await
-            .unwrap();
-        let id_b = store
-            .save_pending_message("plat_b", "c1", "u1", "msg_b")
-            .await
-            .unwrap();
-        let all = store.list_pending_messages(None).await.unwrap();
-        assert!(
-            all.len() >= 2,
-            "should list from all platforms, got {}",
-            all.len()
-        );
-        store.delete_pending_message(id_a).await.unwrap();
-        store.delete_pending_message(id_b).await.unwrap();
 
         // Credentials
         let creds = serde_json::json!({"key": "value"});

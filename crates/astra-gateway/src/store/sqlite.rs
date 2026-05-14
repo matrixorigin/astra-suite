@@ -5,8 +5,8 @@
 //! and INTEGER for booleans, matching SQLite's type affinity model.
 
 use super::{
-    CronJobRecord, CronJobSpec, DueJob, GatewayStore, PendingMessage, PlatformCredential,
-    SessionRecord, SkillRecord, StoreError, UsageRecord, UsageSummary, next_cron_run_str,
+    CronJobRecord, CronJobSpec, DueJob, GatewayStore, PlatformCredential, SessionRecord,
+    SkillRecord, StoreError, UsageRecord, UsageSummary, next_cron_run_str,
 };
 use async_trait::async_trait;
 use sqlx::SqlitePool;
@@ -115,19 +115,6 @@ impl GatewayStore for SqliteGatewayStore {
                 created_at TEXT DEFAULT (strftime('%Y-%m-%d %H:%M:%f', 'now')),
                 updated_at TEXT DEFAULT (strftime('%Y-%m-%d %H:%M:%f', 'now')),
                 PRIMARY KEY (platform, user_id, credential_type)
-            )",
-        )
-        .execute(&self.pool)
-        .await?;
-
-        sqlx::query(
-            "CREATE TABLE IF NOT EXISTS gw_pending_messages (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                platform TEXT NOT NULL,
-                chat_id TEXT NOT NULL,
-                user_id TEXT NOT NULL,
-                text TEXT NOT NULL,
-                created_at TEXT DEFAULT (strftime('%Y-%m-%d %H:%M:%f', 'now'))
             )",
         )
         .execute(&self.pool)
@@ -713,73 +700,6 @@ impl GatewayStore for SqliteGatewayStore {
         Ok(result.rows_affected() > 0)
     }
 
-    // ── Pending messages ────────────────────────────────────────────────
-
-    async fn save_pending_message(
-        &self,
-        platform: &str,
-        chat_id: &str,
-        user_id: &str,
-        text: &str,
-    ) -> Result<i64, StoreError> {
-        let result = sqlx::query(
-            "INSERT INTO gw_pending_messages (platform, chat_id, user_id, text) VALUES (?, ?, ?, ?)",
-        )
-        .bind(platform)
-        .bind(chat_id)
-        .bind(user_id)
-        .bind(text)
-        .execute(&self.pool)
-        .await?;
-        Ok(result.last_insert_rowid())
-    }
-
-    async fn list_pending_messages(
-        &self,
-        platform: Option<&str>,
-    ) -> Result<Vec<PendingMessage>, StoreError> {
-        let rows: Vec<(i64, String, String, String, String)> = if let Some(plat) = platform {
-            sqlx::query_as(
-                "SELECT id, platform, chat_id, user_id, text
-                 FROM gw_pending_messages
-                 WHERE platform = ?
-                 ORDER BY created_at
-                 LIMIT 50",
-            )
-            .bind(plat)
-            .fetch_all(&self.pool)
-            .await?
-        } else {
-            sqlx::query_as(
-                "SELECT id, platform, chat_id, user_id, text
-                 FROM gw_pending_messages
-                 ORDER BY created_at
-                 LIMIT 50",
-            )
-            .fetch_all(&self.pool)
-            .await?
-        };
-
-        Ok(rows
-            .into_iter()
-            .map(|(id, plat, chat, uid, txt)| PendingMessage {
-                id,
-                platform: plat,
-                chat_id: chat,
-                user_id: uid,
-                text: txt,
-            })
-            .collect())
-    }
-
-    async fn delete_pending_message(&self, id: i64) -> Result<u64, StoreError> {
-        let result = sqlx::query("DELETE FROM gw_pending_messages WHERE id = ?")
-            .bind(id)
-            .execute(&self.pool)
-            .await?;
-        Ok(result.rows_affected())
-    }
-
     // ── Usage ───────────────────────────────────────────────────────────
 
     async fn record_usage(&self, r: &UsageRecord) -> Result<(), StoreError> {
@@ -1129,41 +1049,6 @@ mod tests {
         assert!(store.delete_cron_job("j1").await.unwrap());
         assert!(!store.delete_cron_job("j1").await.unwrap()); // already deleted
         assert!(store.list_cron_jobs("wx", "c1").await.unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn pending_message_roundtrip() {
-        let store = make_store().await;
-
-        let id1 = store
-            .save_pending_message("wx", "c1", "u1", "hello")
-            .await
-            .unwrap();
-        let id2 = store
-            .save_pending_message("wx", "c1", "u1", "world")
-            .await
-            .unwrap();
-        assert_ne!(id1, id2);
-
-        // List all.
-        let msgs = store.list_pending_messages(None).await.unwrap();
-        assert_eq!(msgs.len(), 2);
-        assert_eq!(msgs[0].text, "hello");
-        assert_eq!(msgs[1].text, "world");
-
-        // List filtered by platform.
-        let msgs = store.list_pending_messages(Some("wx")).await.unwrap();
-        assert_eq!(msgs.len(), 2);
-        let msgs = store.list_pending_messages(Some("tg")).await.unwrap();
-        assert!(msgs.is_empty());
-
-        // Delete first.
-        let affected = store.delete_pending_message(id1).await.unwrap();
-        assert_eq!(affected, 1);
-
-        let msgs = store.list_pending_messages(None).await.unwrap();
-        assert_eq!(msgs.len(), 1);
-        assert_eq!(msgs[0].text, "world");
     }
 
     #[tokio::test]
@@ -1735,57 +1620,6 @@ mod tests {
 
         let total = store.get_usage_total("wx", "unknown-user").await.unwrap();
         assert_eq!(total.messages, 0);
-    }
-
-    // ── Pending messages edge cases ────────────────────────────────────
-
-    #[tokio::test]
-    async fn pending_message_delete_removes_only_target() {
-        let store = make_store().await;
-
-        let id1 = store
-            .save_pending_message("wx", "c1", "u1", "first")
-            .await
-            .unwrap();
-        let _id2 = store
-            .save_pending_message("wx", "c1", "u1", "second")
-            .await
-            .unwrap();
-
-        // Delete only the first.
-        let affected = store.delete_pending_message(id1).await.unwrap();
-        assert_eq!(affected, 1);
-
-        let remaining = store.list_pending_messages(Some("wx")).await.unwrap();
-        assert_eq!(remaining.len(), 1);
-        assert_eq!(remaining[0].text, "second");
-    }
-
-    #[tokio::test]
-    async fn pending_message_list_orders_by_created_at() {
-        let store = make_store().await;
-
-        // Insert 3 messages with small delays to ensure distinct timestamps.
-        store
-            .save_pending_message("wx", "c1", "u1", "alpha")
-            .await
-            .unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        store
-            .save_pending_message("wx", "c1", "u1", "beta")
-            .await
-            .unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        store
-            .save_pending_message("wx", "c1", "u1", "gamma")
-            .await
-            .unwrap();
-
-        let msgs = store.list_pending_messages(Some("wx")).await.unwrap();
-        assert_eq!(msgs.len(), 3);
-        assert_eq!(msgs[0].text, "alpha");
-        assert_eq!(msgs[1].text, "beta");
-        assert_eq!(msgs[2].text, "gamma");
     }
 
     // ── Concurrent / stress ────────────────────────────────────────────

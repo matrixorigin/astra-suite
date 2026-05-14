@@ -544,49 +544,6 @@ impl GatewayRunner {
         &self.cli_profile
     }
 
-    /// Replay messages that were pending when gateway crashed.
-    pub async fn replay_pending_messages(&self, adapter: &dyn PlatformAdapter) {
-        if let Some(ref store) = self.store {
-            let platform = adapter.name();
-            let loaded = retry_once_on_transient("list_pending_messages", || async {
-                store
-                    .list_pending_messages(Some(platform))
-                    .await
-                    .map_err(|e| e.to_string())
-            })
-            .await;
-            match loaded {
-                Ok(msgs) if msgs.is_empty() => {}
-                Ok(msgs) => {
-                    tracing::info!(platform, count = msgs.len(), "replaying pending messages");
-                    for pm in &msgs {
-                        let msg = crate::platforms::InboundMessage {
-                            platform,
-                            chat_id: pm.chat_id.clone(),
-                            user_id: pm.user_id.clone(),
-                            text: pm.text.clone(),
-                            msg_id: format!("replay-{}", pm.id),
-                            chat_type: crate::platforms::ChatType::DirectMessage,
-                            reply_token: None,
-                            route_override: None,
-                        };
-                        if let Some(response) = self
-                            .handle_message_inner(&msg, adapter, Some(pm.id), false, None)
-                            .await
-                        {
-                            for chunk in split_message(&response.text) {
-                                if let Err(e) = adapter.send_text(&pm.chat_id, chunk, None).await {
-                                    tracing::warn!(error = %e, chat_id = %pm.chat_id, "failed to deliver pending replay");
-                                }
-                            }
-                        }
-                    }
-                }
-                Err(e) => tracing::warn!(error = %e, "failed to load pending messages"),
-            }
-        }
-    }
-
     pub async fn sweep_stale_tasks(&self) {
         if let Some(ref store) = self.durable_store {
             let result = retry_once_on_transient("sweep_stale_tasks", || async {
@@ -837,7 +794,7 @@ impl GatewayRunner {
         msg: &InboundMessage,
         adapter: &dyn PlatformAdapter,
     ) -> Option<String> {
-        self.handle_message_inner(msg, adapter, None, true, None)
+        self.handle_message_inner(msg, adapter, None)
             .await
             .map(|outbound| outbound.text)
     }
@@ -846,8 +803,6 @@ impl GatewayRunner {
         &self,
         msg: &InboundMessage,
         adapter: &dyn PlatformAdapter,
-        existing_pending_id: Option<i64>,
-        save_pending: bool,
         trace: Option<OutboxDeliveryTrace>,
     ) -> Option<OutboundMessage> {
         // Group chat: per-user session isolation
@@ -1122,26 +1077,6 @@ impl GatewayRunner {
                 .unwrap_or(ReasoningDisplay::Off)
         } else {
             ReasoningDisplay::Off
-        };
-
-        // Save as pending (for crash recovery)
-        let pending_id = if save_pending {
-            if let Some(ref store) = self.store {
-                match store
-                    .save_pending_message(msg.platform, &effective_chat_id, &msg.user_id, &msg.text)
-                    .await
-                {
-                    Ok(id) => Some(id),
-                    Err(e) => {
-                        tracing::warn!(error = %e, "failed to save pending message");
-                        None
-                    }
-                }
-            } else {
-                None
-            }
-        } else {
-            existing_pending_id
         };
 
         // Run CLI with rich progress heartbeats and a bounded lifetime.
@@ -1699,7 +1634,6 @@ impl GatewayRunner {
                     }
                     let _ = writer.fail_request(&e).await;
                 }
-                self.clear_pending_message(pending_id).await;
                 let text = cli_bridge::translate_cli_error(&cli_profile, -1, &e);
                 let text = format!("[{request_tag}] {text}");
                 return Some(
@@ -1723,7 +1657,6 @@ impl GatewayRunner {
                     }
                     let _ = writer.fail_request(&e.to_string()).await;
                 }
-                self.clear_pending_message(pending_id).await;
                 return Some(
                     self.outbound_response(
                         trace.as_ref(),
@@ -1822,7 +1755,6 @@ impl GatewayRunner {
                         .text
                         .as_deref()
                         .unwrap_or(retry_result.stdout.trim());
-                    self.clear_pending_message(pending_id).await;
                     let text = if text.is_empty() { "(无回复)" } else { text };
                     return Some(
                         self.outbound_response(
@@ -1897,7 +1829,6 @@ impl GatewayRunner {
                 } else {
                     &result.stderr
                 };
-                self.clear_pending_message(pending_id).await;
                 if let Some(writer) = trace_writer.as_ref() {
                     if let Some(ref run_id) = run_id {
                         let _ = writer
@@ -2069,9 +2000,6 @@ impl GatewayRunner {
             tracing::warn!(error = %e, "failed to record usage");
         }
 
-        // Clear pending message (successfully processed)
-        self.clear_pending_message(pending_id).await;
-
         let text = if text.is_empty() {
             "(无回复)".to_string()
         } else {
@@ -2107,15 +2035,6 @@ impl GatewayRunner {
                 )
                 .await,
             )
-        }
-    }
-
-    async fn clear_pending_message(&self, pending_id: Option<i64>) {
-        let (Some(id), Some(store)) = (pending_id, self.store.as_ref()) else {
-            return;
-        };
-        if let Err(e) = store.delete_pending_message(id).await {
-            tracing::warn!(id, error = %e, "failed to delete pending message");
         }
     }
 
@@ -2614,7 +2533,7 @@ impl GatewayRunner {
                 continue;
             }
             match self
-                .handle_message_inner(&queued.msg, &NullAdapter, None, true, queued.trace.clone())
+                .handle_message_inner(&queued.msg, &NullAdapter, queued.trace.clone())
                 .await
             {
                 Some(outbound) => {
@@ -2839,9 +2758,6 @@ impl GatewayRunner {
         self.sweep_stale_traces().await;
         self.replay_retryable_outbox(&adapters, &adapter_indices)
             .await;
-        for adapter in &adapters {
-            self.replay_pending_messages(adapter.as_ref()).await;
-        }
         // Drain any progressive chunks that accumulated in the outbound channel
         // during replay (the main select loop wasn't consuming yet).
         while let Ok(outbound) = cron_rx.try_recv() {
