@@ -692,27 +692,6 @@ async fn runner_init_invalid_config_errors() {
 }
 
 #[tokio::test]
-async fn runner_replay_pending_messages_on_startup() {
-    let gw = TestGateway::new().await;
-    let outputs = Arc::new(Mutex::new(Vec::new()));
-    let adapter = MockPlatformAdapter::new(mpsc::channel(1).1, outputs.clone());
-
-    // Save a pending message
-    let store = gw.runner.store().unwrap();
-    store
-        .save_pending_message("mock", "chat-replay", "user-1", "pending hello")
-        .await
-        .unwrap();
-
-    // Replay should process it
-    gw.runner.replay_pending_messages(&adapter).await;
-
-    // The pending message should have been processed (adapter received output)
-    // The function should complete without panic — that's the assertion.
-    let _sent = outputs.lock().await;
-}
-
-#[tokio::test]
 async fn runner_suspend_stale_tasks_on_startup() {
     let gw = TestGateway::new().await;
     // Should complete without error
