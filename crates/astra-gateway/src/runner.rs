@@ -3,7 +3,9 @@
 //! Each inbound message spawns `astra chat -m "..." --session-id X`
 //! and streams CLI progress to the chat platform while waiting for output.
 
-use crate::cli_bridge::{self, CliProfile, CliProgress, ReasoningDisplay, ReasoningKind};
+use crate::cli_bridge::{
+    self, CliProfile, CliProgress, CliResult, ReasoningDisplay, ReasoningKind,
+};
 use crate::commands::{self, CommandContext};
 use crate::config::GatewayConfig;
 use crate::gateway_context::GatewayContext;
@@ -356,8 +358,8 @@ pub struct GatewayRunner {
     shared_auth: Option<SharedAuthToken>,
     /// Monotonic counter for generating short request tags when no trace exists.
     request_counter: AtomicU32,
-    /// Active CLI processes indexed by trace_id. Used by `/kill` to abort
-    /// running tasks immediately (SIGKILL) instead of only marking DB state.
+    /// Active CLI turns indexed by trace_id. Used by `/esc` to interrupt
+    /// running turns immediately instead of only marking DB state.
     active_tasks: Arc<dashmap::DashMap<String, CancellationToken>>,
     /// Per-conversation send circuit breaker. Workers check this before
     /// emitting heartbeats — stops sending after consecutive failures to
@@ -369,6 +371,8 @@ pub struct GatewayRunner {
     gateway_start: chrono::DateTime<chrono::Utc>,
     /// Pool of long-lived Claude CLI processes (persistent mode).
     cli_pool: Arc<tokio::sync::Mutex<crate::cli_pool::CliProcessPool>>,
+    /// Pool of long-lived Codex app-server processes (persistent mode).
+    codex_app_pool: Arc<tokio::sync::Mutex<crate::codex_app_pool::CodexAppPool>>,
 }
 
 /// No-op adapter used in spawned CLI tasks (typing/heartbeats not available in background).
@@ -522,6 +526,9 @@ impl GatewayRunner {
             cli_pool: Arc::new(tokio::sync::Mutex::new(
                 crate::cli_pool::CliProcessPool::new(),
             )),
+            codex_app_pool: Arc::new(tokio::sync::Mutex::new(
+                crate::codex_app_pool::CodexAppPool::new(),
+            )),
         })
     }
 
@@ -672,9 +679,9 @@ impl GatewayRunner {
             return Ok(Some(self.handle_auth_command(&cli_profile).await));
         }
 
-        // /manage cancel, /manage kill → redirect to fast-path /cancel, /kill
+        // /manage cancel, /manage esc/kill → redirect to fast-path commands
         // so they execute immediately even when a task is running. For
-        // bulk cleanup the user should type /kill all directly — we don't
+        // bulk cleanup the user should type /esc all directly — we don't
         // try to guess bulk intent from natural language (too brittle,
         // CN/EN case-explosion), and the AI slow-path would queue behind
         // the very tasks the user wants to clear.
@@ -684,8 +691,14 @@ impl GatewayRunner {
                 || rest.starts_with("cancel ")
                 || rest == "kill"
                 || rest.starts_with("kill ")
+                || rest == "esc"
+                || rest.starts_with("esc ")
             {
-                let rewritten_cmd = format!("/{rest}");
+                let rewritten_cmd = if rest == "kill" || rest.starts_with("kill ") {
+                    format!("/esc{}", rest.strip_prefix("kill").unwrap_or_default())
+                } else {
+                    format!("/{rest}")
+                };
                 // Build command context and dispatch directly (avoids async recursion).
                 let cmd_ctx = CommandContext {
                     astra: &self.thin,
@@ -766,7 +779,7 @@ impl GatewayRunner {
                 || msg.text.starts_with("/workspace ")
                 || msg.text.starts_with("/ws ");
             if invalidates_pool {
-                // For /model, only kill the pool when the argument actually
+                // For /model, only reset the pool when the argument actually
                 // resolved to a valid model. Otherwise the user just gets an
                 // error message back and the existing session stays warm.
                 let should_kill = if let Some(arg) = msg.text.strip_prefix("/model ") {
@@ -779,6 +792,7 @@ impl GatewayRunner {
                 };
                 if should_kill {
                     self.cli_pool.lock().await.kill(&effective_chat_id);
+                    self.codex_app_pool.lock().await.kill(&effective_chat_id);
                 }
             }
             return Ok(Some(response));
@@ -1046,7 +1060,11 @@ impl GatewayRunner {
             }
             ctx
         };
-        let system_prompt = if crate::cli_pool::CliProcessPool::supports_persistent(&cli_profile) {
+        let supports_claude_pool =
+            crate::cli_pool::CliProcessPool::supports_persistent(&cli_profile);
+        let supports_codex_app_pool =
+            crate::codex_app_pool::CodexAppPool::supports_persistent(&cli_profile);
+        let system_prompt = if supports_claude_pool || supports_codex_app_pool {
             let mut prompt = gw_context.to_slim_system_prompt();
             if let Some(ref extra) = self.config.system_prompt_extra
                 && !extra.is_empty()
@@ -1100,7 +1118,7 @@ impl GatewayRunner {
 
         let (progress_tx, mut progress_rx) = tokio::sync::mpsc::channel::<CliProgress>(64);
 
-        // Register cancellation token for this task so /kill can abort it.
+        // Register cancellation token for this task so /esc can interrupt it.
         let cancel_token = CancellationToken::new();
         let kill_registry_key = trace
             .as_ref()
@@ -1109,9 +1127,10 @@ impl GatewayRunner {
         self.active_tasks
             .insert(kill_registry_key.clone(), cancel_token.clone());
 
-        let use_pool = crate::cli_pool::CliProcessPool::supports_persistent(&cli_profile);
+        let use_claude_pool = supports_claude_pool;
+        let use_codex_app_pool = supports_codex_app_pool;
 
-        let mcp_config_path = if use_pool {
+        let mcp_config_path = if use_claude_pool {
             let storage_env = match &self.config.storage {
                 crate::store::StorageConfig::Mysql { url }
                 | crate::store::StorageConfig::MatrixOne { url } => {
@@ -1141,7 +1160,7 @@ impl GatewayRunner {
             None
         };
 
-        let cli_handle = if use_pool {
+        let cli_handle = if use_claude_pool {
             // Long-lived process path: send message via pool, forward progress events
             let pool = self.cli_pool.clone();
             let pool_key = effective_chat_id.clone();
@@ -1246,6 +1265,89 @@ impl GatewayRunner {
                     tokens_prompt,
                     tokens_completion,
                 })
+            })
+        } else if use_codex_app_pool {
+            // Long-lived Codex app-server path: JSON-RPC thread + turn protocol.
+            let pool = self.codex_app_pool.clone();
+            let pool_key = effective_chat_id.clone();
+            let profile = cli_profile.clone();
+            let msg_text = message_text.clone();
+            let sp = system_prompt.clone();
+            let ws = workspace.clone();
+            let kill_token = cancel_token.clone();
+
+            tokio::spawn(async move {
+                let mut pool_guard = pool.lock().await;
+                let mut pool_progress_rx = pool_guard
+                    .begin_turn(
+                        &pool_key,
+                        &msg_text,
+                        &profile,
+                        sid.as_deref(),
+                        ws.as_deref(),
+                        Some(&sp),
+                    )
+                    .await?;
+                drop(pool_guard);
+
+                let deadline = tokio::time::sleep(cli_timeout);
+                tokio::pin!(deadline);
+                loop {
+                    tokio::select! {
+                        ev = pool_progress_rx.recv() => {
+                            match ev {
+                                Some(event) => {
+                                    let _ = progress_tx.send(event).await;
+                                }
+                                None => break,
+                            }
+                        }
+                        _ = kill_token.cancelled() => {
+                            let pool_guard = pool.lock().await;
+                            let _ = pool_guard.interrupt(&pool_key).await;
+                            drop(pool_guard);
+                            let drain_deadline = tokio::time::sleep(Duration::from_secs(3));
+                            tokio::pin!(drain_deadline);
+                            loop {
+                                tokio::select! {
+                                    ev = pool_progress_rx.recv() => {
+                                        match ev {
+                                            Some(event) => { let _ = progress_tx.send(event).await; }
+                                            None => break,
+                                        }
+                                    }
+                                    _ = &mut drain_deadline => break,
+                                }
+                            }
+                            break;
+                        }
+                        _ = &mut deadline => {
+                            tracing::warn!(key = %pool_key, "codex app-server turn timed out, killing process");
+                            pool.lock().await.kill(&pool_key);
+                            break;
+                        }
+                    }
+                }
+
+                let pool_guard = pool.lock().await;
+                let result = pool_guard.result(&pool_key).await.unwrap_or(CliResult {
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    exit_code: 0,
+                    success: true,
+                    error_kind: None,
+                    trace_id: None,
+                    request_id: None,
+                    run_id: None,
+                    session_id: None,
+                    text: None,
+                    tool_calls_count: None,
+                    tools_used: Vec::new(),
+                    tokens_prompt: None,
+                    tokens_completion: None,
+                });
+                drop(pool_guard);
+                Ok(result)
             })
         } else {
             // Legacy per-request spawn path
@@ -1370,7 +1472,7 @@ impl GatewayRunner {
         loop {
             tokio::select! {
                 _ = cancel_token.cancelled() => {
-                    tracing::info!(tag = %request_tag, "task cancelled by user — CLI process will be killed by bridge");
+                    tracing::info!(tag = %request_tag, "task interrupted by user");
                     break;
                 }
                 progress = progress_rx.recv() => {
@@ -1566,26 +1668,28 @@ impl GatewayRunner {
         // Deregister from active tasks registry.
         self.active_tasks.remove(&kill_registry_key);
 
-        // If the task was cancelled, the CLI bridge returns Err("killed by user").
-        // Short-circuit: mark trace as failed and return a kill confirmation
+        // If the task was cancelled, the persistent pools translate it to
+        // native Esc/interrupt for the active turn. One-shot CLIs are
+        // terminated by the bridge. Short-circuit: mark trace as failed
+        // and return an interrupt confirmation
         // without processing the result as a normal completion.
         if cancel_token.is_cancelled() {
             if let Some(writer) = trace_writer.as_ref()
-                && let Err(e) = writer.fail_request("killed by user").await
+                && let Err(e) = writer.fail_request("interrupted by user").await
             {
-                tracing::warn!(error = %e, "failed to mark trace as killed");
+                tracing::warn!(error = %e, "failed to mark trace as interrupted");
             }
             if let Err(e) = cli_handle.await {
                 tracing::debug!(error = %e, "cli task join error after cancel");
             }
-            tracing::info!(tag = %request_tag, "task killed, skipping result processing");
+            tracing::info!(tag = %request_tag, "task interrupted, skipping result processing");
             return Some(
                 self.outbound_response(
                     trace.as_ref(),
                     msg.platform,
                     &msg.chat_id,
                     msg.reply_token.clone(),
-                    format!("[{request_tag}] 💀 任务已终止"),
+                    format!("[{request_tag}] ⎋ 当前 turn 已中断"),
                 )
                 .await,
             );
@@ -2333,7 +2437,7 @@ impl GatewayRunner {
                     ));
                 }
                 sections.push("\n可用操作:".to_string());
-                sections.push("- 终止运行中: [[GATEWAY:trace_kill:<trace_id>]]".to_string());
+                sections.push("- 中断运行中: [[GATEWAY:trace_kill:<trace_id>]]".to_string());
                 sections
                     .push("- 清除失败投递: [[GATEWAY:outbox_dismiss:<request_id>]]".to_string());
             } else {
@@ -3740,11 +3844,14 @@ async fn execute_gateway_actions_with_policy(
                     "⚠️ 请指定 trace ID".into()
                 } else if let Some(repo) = trace_repo {
                     let tid = TraceId::from_string(trace_id_str.to_string());
-                    match repo.force_fail_request(&tid, "killed via manage").await {
+                    match repo
+                        .force_fail_request(&tid, "interrupted via manage")
+                        .await
+                    {
                         Ok(true) => {
                             tracing::info!(trace_id = trace_id_str, "gateway action: trace_kill");
                             format!(
-                                "💀 已终止请求 `{}`",
+                                "⎋ 已中断请求 `{}`",
                                 &trace_id_str[..8.min(trace_id_str.len())]
                             )
                         }
@@ -3752,7 +3859,7 @@ async fn execute_gateway_actions_with_policy(
                             "⚠️ 请求 `{}` 已是终态",
                             &trace_id_str[..8.min(trace_id_str.len())]
                         ),
-                        Err(e) => format!("⚠️ 终止失败: {e}"),
+                        Err(e) => format!("⚠️ 中断失败: {e}"),
                     }
                 } else {
                     "⚠️ 需要 trace 支持".into()
@@ -5086,8 +5193,8 @@ async fn action_trace_kill_with_repo() {
     .await;
     assert_eq!(r.len(), 1);
     assert!(
-        r[0].contains("已终止"),
-        "expected kill confirmation, got: {}",
+        r[0].contains("已中断"),
+        "expected interrupt confirmation, got: {}",
         r[0]
     );
 }
@@ -5496,7 +5603,7 @@ async fn typing_sent_before_cli_spawn() {
     assert!(adapter.send_typing("chat").await.is_ok());
 }
 
-// ── Kill registry tests ────────────────────────────────────────────────
+// ── Active turn interruption registry tests ────────────────────────────
 
 #[test]
 fn active_tasks_registry_insert_and_cancel() {
@@ -5505,14 +5612,14 @@ fn active_tasks_registry_insert_and_cancel() {
     registry.insert("trace-1".into(), token.clone());
     assert!(!token.is_cancelled());
 
-    // Simulate /kill: remove + cancel
+    // Simulate /esc: remove + cancel
     let (_, removed_token) = registry.remove("trace-1").unwrap();
     removed_token.cancel();
     assert!(token.is_cancelled());
 }
 
 #[test]
-fn active_tasks_registry_kill_nonexistent_returns_none() {
+fn active_tasks_registry_esc_nonexistent_returns_none() {
     let registry: dashmap::DashMap<String, CancellationToken> = dashmap::DashMap::new();
     assert!(registry.remove("ghost").is_none());
 }
@@ -5524,7 +5631,7 @@ async fn cancellation_token_aborts_spawned_task() {
 
     let handle = tokio::spawn(async move {
         tokio::select! {
-            _ = token_inner.cancelled() => "killed",
+            _ = token_inner.cancelled() => "interrupted",
             _ = tokio::time::sleep(Duration::from_secs(60)) => "completed",
         }
     });
@@ -5532,24 +5639,24 @@ async fn cancellation_token_aborts_spawned_task() {
     // Cancel immediately
     token.cancel();
     let result = handle.await.unwrap();
-    assert_eq!(result, "killed");
+    assert_eq!(result, "interrupted");
 }
 
 #[tokio::test]
-async fn kill_command_removes_and_cancels_token() {
+async fn esc_command_removes_and_cancels_token() {
     let registry: Arc<dashmap::DashMap<String, CancellationToken>> =
         Arc::new(dashmap::DashMap::new());
     let token = CancellationToken::new();
     registry.insert("trace-abc".into(), token.clone());
 
-    let killed = if let Some((_, t)) = registry.remove("trace-abc") {
+    let interrupted = if let Some((_, t)) = registry.remove("trace-abc") {
         t.cancel();
         true
     } else {
         false
     };
 
-    assert!(killed);
+    assert!(interrupted);
     assert!(token.is_cancelled());
     assert!(registry.is_empty());
 }
@@ -5559,11 +5666,13 @@ async fn kill_command_removes_and_cancels_token() {
 // ── /manage redirect routing tests ─────────────────────────────────────
 
 #[test]
-fn manage_redirect_recognizes_cancel_and_kill() {
+fn manage_redirect_recognizes_cancel_esc_and_kill_alias() {
     // Verifies the routing predicate used in handle_fast.
     for input in [
         "/manage cancel",
         "/manage cancel 1",
+        "/manage esc",
+        "/manage esc 2",
         "/manage kill",
         "/manage kill 2",
     ] {
@@ -5571,6 +5680,8 @@ fn manage_redirect_recognizes_cancel_and_kill() {
         assert!(
             rest == "cancel"
                 || rest.starts_with("cancel ")
+                || rest == "esc"
+                || rest.starts_with("esc ")
                 || rest == "kill"
                 || rest.starts_with("kill "),
             "'{input}' should redirect to fast path"
@@ -5581,6 +5692,8 @@ fn manage_redirect_recognizes_cancel_and_kill() {
         let rest = input.strip_prefix("/manage ").unwrap_or("").trim();
         let should_redirect = rest == "cancel"
             || rest.starts_with("cancel ")
+            || rest == "esc"
+            || rest.starts_with("esc ")
             || rest == "kill"
             || rest.starts_with("kill ");
         assert!(!should_redirect, "'{input}' should NOT redirect");
@@ -5684,7 +5797,7 @@ fn kill_registry_notrace_key_is_findable() {
     let key = "notrace:#A7".to_string();
     registry.insert(key.clone(), token.clone());
 
-    // /kill can find it by the synthetic key
+    // /esc can find it by the synthetic key
     let found = registry.remove(&key);
     assert!(found.is_some());
     found.unwrap().1.cancel();

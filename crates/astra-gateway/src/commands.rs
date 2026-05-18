@@ -25,7 +25,7 @@ pub struct CommandContext<'a> {
     pub project_dirs: &'a [String],
     pub cli_availability: &'a [(String, crate::cli_bridge::CliAvailability)],
     pub auth_status: Option<String>,
-    /// Active task registry — allows /kill to actually terminate CLI processes.
+    /// Active task registry — allows /esc to interrupt live CLI turns.
     pub active_tasks: Option<&'a dashmap::DashMap<String, tokio_util::sync::CancellationToken>>,
     /// Gateway process start time. Used by /running to flag zombie
     /// requests whose created_at predates this process (i.e. leftovers
@@ -706,7 +706,7 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
              **任务管理**\n\
              `/running` — 查看正在执行的任务 (带编号)\n\
              `/cancel [N|text]` — 取消排队请求 (序号/文本/ID)\n\
-             `/kill [N|text]` — 终止运行中请求 (序号/文本/ID)\n\
+             `/esc [N|text]` — 中断当前运行 turn (序号/文本/ID；`/kill` 兼容别名)\n\
              `/retry` — 查看发送失败的消息\n\
              `/retry dismiss` — 清除所有失败消息\n\
              `/manage [指令]` — AI 辅助任务管理\n\
@@ -951,7 +951,7 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
                 }
                 if zombie_count > 0 {
                     lines.push(format!(
-                        "\n🧟 发现 {zombie_count} 个僵尸请求 (创建时间早于本次 gateway 启动)。用 `/kill all` 一键清空。"
+                        "\n🧟 发现 {zombie_count} 个僵尸请求 (创建时间早于本次 gateway 启动)。用 `/esc all` 一键清空。"
                     ));
                 }
                 if stuck_outbox_count > 0 {
@@ -959,7 +959,7 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
                         "\n📬 有 {stuck_outbox_count} 个消息发送失败。用 `/retry` 查看，`/retry dismiss` 清除。"
                     ));
                 }
-                lines.push("\n💡 `/kill 1` 终止 | `/kill all` 清空 | `/cancel 2` 取消 | `/manage` AI 辅助管理".into());
+                lines.push("\n💡 `/esc 1` 中断 | `/esc all` 清空 | `/cancel 2` 取消 | `/manage` AI 辅助管理".into());
                 Some(lines.join("\n"))
             }
         }
@@ -1031,7 +1031,7 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
                     .ok()
                     .and_then(|rows| rows.into_iter().find(|r| r.is_cancellable()));
                 let Some(row) = row else {
-                    return Some("✅ 当前没有可取消的排队请求。运行中的请求请用 `/kill`。".into());
+                    return Some("✅ 当前没有可取消的排队请求。运行中的请求请用 `/esc`。".into());
                 };
                 match repo
                     .cancel_accepted_request(
@@ -1045,7 +1045,7 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
                         Some(format!("🚫 已取消: {}", truncate_text(&r.text_preview, 40)))
                     }
                     Ok(CancelRequestOutcome::AlreadyRunning(_)) => {
-                        Some("⚠️ 请求已在运行，用 `/kill` 终止。".into())
+                        Some("⚠️ 请求已在运行，用 `/esc` 中断。".into())
                     }
                     Ok(CancelRequestOutcome::NotFound) => Some("❌ 找不到可取消请求".into()),
                     Err(e) => Some(format!("⚠️ 取消失败: {e}")),
@@ -1057,7 +1057,7 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
                 };
                 if !row.is_cancellable() {
                     return Some(format!(
-                        "⚠️ 请求 [{}] 已在运行，用 `/kill` 终止。",
+                        "⚠️ 请求 [{}] 已在运行，用 `/esc` 中断。",
                         truncate_text(&row.text_preview, 30)
                     ));
                 }
@@ -1073,7 +1073,7 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
                         Some(format!("🚫 已取消: {}", truncate_text(&r.text_preview, 40)))
                     }
                     Ok(CancelRequestOutcome::AlreadyRunning(_)) => {
-                        Some("⚠️ 请求已在运行，用 `/kill` 终止。".into())
+                        Some("⚠️ 请求已在运行，用 `/esc` 中断。".into())
                     }
                     Ok(CancelRequestOutcome::NotFound) => {
                         Some(format!("❌ 找不到可取消请求 `{arg}`"))
@@ -1083,10 +1083,11 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
             }
         }
 
-        "/kill" => {
+        "/esc" | "/kill" => {
             let repo = require_trace_repo!(ctx);
             let conversation =
                 ConversationKey::new(ctx.platform, ctx.chat_id, ctx.resolved_cli.name());
+            let command_name = cmd;
 
             if arg == "all" {
                 return Some(
@@ -1094,7 +1095,11 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
                         repo,
                         &conversation,
                         ctx.active_tasks,
-                        "killed by user via /kill all",
+                        if command_name == "/kill" {
+                            "interrupted by user via /esc all (/kill alias)"
+                        } else {
+                            "interrupted by user via /esc all"
+                        },
                     )
                     .await,
                 );
@@ -1121,12 +1126,21 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
                 return Some(format!("❌ 找不到匹配 `{arg}` 的请求"));
             };
             match repo
-                .force_fail_request(&row.trace_id, "killed by user via /kill")
+                .force_fail_request(
+                    &row.trace_id,
+                    if command_name == "/kill" {
+                        "interrupted by user via /esc (/kill alias)"
+                    } else {
+                        "interrupted by user via /esc"
+                    },
+                )
                 .await
             {
                 Ok(true) => {
-                    // Actually kill the CLI process via cancellation token.
-                    let process_killed = ctx
+                    // Fire the cancellation token. Persistent CLIs translate
+                    // this to their native Esc/interrupt protocol for the
+                    // active turn; one-shot CLIs are terminated by the bridge.
+                    let interrupted_live_turn = ctx
                         .active_tasks
                         .map(|tasks| {
                             if let Some((_, token)) = tasks.remove(row.trace_id.as_str()) {
@@ -1137,13 +1151,13 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
                             }
                         })
                         .unwrap_or(false);
-                    let suffix = if process_killed {
+                    let suffix = if interrupted_live_turn {
                         ""
                     } else {
                         " (等待自然退出)"
                     };
                     Some(format!(
-                        "💀 已终止: {}{}",
+                        "⎋ 已中断: {}{}",
                         truncate_text(&row.text_preview, 40),
                         suffix
                     ))
@@ -1152,7 +1166,7 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
                     "⚠️ 请求已是终态: {}",
                     truncate_text(&row.text_preview, 30)
                 )),
-                Err(e) => Some(format!("⚠️ 终止失败: {e}")),
+                Err(e) => Some(format!("⚠️ 中断失败: {e}")),
             }
         }
 
@@ -1411,7 +1425,8 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
             lines.push("| `/task list` | Durable tasks |".to_string());
             lines.push("| `/running` | Active requests (numbered) |".to_string());
             lines.push("| `/cancel [N\\|text]` | Cancel queued request |".to_string());
-            lines.push("| `/kill [N\\|text]` | Force-kill running request |".to_string());
+            lines
+                .push("| `/esc [N\\|text]` | Interrupt running turn (`/kill` alias) |".to_string());
             lines.push("| `/retry` | View/dismiss failed outbox |".to_string());
             lines.push("| `/manage [hint]` | AI-assisted task management |".to_string());
             lines.push("| `/trace [id]` | Request trace |".to_string());
@@ -1437,7 +1452,7 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
                 lines.push("| `dtask_complete:<id>` | Mark complete |".to_string());
                 lines.push("| `workspace_set:<path>` | Switch workspace |".to_string());
                 lines.push("| `skill_add:<name>:<md>` | Save reusable skill |".to_string());
-                lines.push("| `trace_kill:<trace_id>` | Force-kill request |".to_string());
+                lines.push("| `trace_kill:<trace_id>` | Interrupt request |".to_string());
                 lines.push("| `outbox_dismiss:<request_id>` | Dismiss failed outbox |".to_string());
             }
 
@@ -1545,12 +1560,13 @@ pub fn is_zombie_request(created_at: &str, gateway_start: chrono::DateTime<chron
 }
 
 /// Sweep every active request in `conversation`: force-fail in the DB,
-/// cancel the in-memory cancellation token (so the live CLI child exits),
-/// and remove it from `active_tasks`. Returns a user-facing summary with
-/// the count killed + the count of stale DB rows whose process was
-/// already gone (no token in the map — typical zombie case).
+/// cancel the in-memory cancellation token (persistent CLIs translate that
+/// to native Esc/interrupt), and remove it from `active_tasks`. Returns a
+/// user-facing summary with the count interrupted + the count of stale DB
+/// rows whose process was already gone (no token in the map — typical
+/// zombie case).
 ///
-/// Shared by `/kill all` and `/cancel all` since both do the same
+/// Shared by `/esc all`, `/kill all`, and `/cancel all` since all clear
 /// thing for already-running requests.
 async fn kill_or_cancel_all(
     repo: &dyn TraceRepository,
@@ -1566,7 +1582,7 @@ async fn kill_or_cancel_all(
         return "✅ 当前会话没有活跃请求 (0 个清理)。".into();
     }
     let mut db_cleared = 0usize;
-    let mut process_killed = 0usize;
+    let mut live_interrupted = 0usize;
     let mut zombie_cleared = 0usize;
     for row in &rows {
         match repo.force_fail_request(&row.trace_id, reason).await {
@@ -1581,7 +1597,7 @@ async fn kill_or_cancel_all(
                     target: "gateway::commands",
                     trace_id = %row.trace_id.as_str(),
                     error = %e,
-                    "force_fail_request failed during /kill all"
+                    "force_fail_request failed during /esc all"
                 );
             }
         }
@@ -1589,12 +1605,12 @@ async fn kill_or_cancel_all(
             && let Some((_, token)) = tasks.remove(row.trace_id.as_str())
         {
             token.cancel();
-            process_killed += 1;
+            live_interrupted += 1;
         }
     }
-    let mut out = format!("💀 已终止 {db_cleared} 个请求");
-    if process_killed > 0 {
-        out.push_str(&format!(" (进程杀死 {process_killed})"));
+    let mut out = format!("⎋ 已中断 {db_cleared} 个请求");
+    if live_interrupted > 0 {
+        out.push_str(&format!(" (实时中断 {live_interrupted})"));
     }
     if zombie_cleared > 0 {
         out.push_str(&format!("，清理 🧟 僵尸 {zombie_cleared} 个"));
@@ -2681,7 +2697,7 @@ mod tests {
             );
         }
     });
-    cmd_test!(cmd_kill_requires_trace_repo, "/kill abc123", |r| {
+    cmd_test!(cmd_esc_requires_trace_repo, "/esc abc123", |r| {
         {
             let msg = r.unwrap();
             assert!(
@@ -2690,7 +2706,7 @@ mod tests {
             );
         }
     });
-    cmd_test!(cmd_kill_no_arg_auto_pick_or_no_db, "/kill", |r| {
+    cmd_test!(cmd_esc_no_arg_auto_pick_or_no_db, "/esc", |r| {
         {
             let msg = r.unwrap();
             assert!(
@@ -2699,9 +2715,9 @@ mod tests {
             );
         }
     });
-    cmd_test!(cmd_help_includes_kill, "/help", |r| {
+    cmd_test!(cmd_help_includes_esc, "/help", |r| {
         let s = r.unwrap();
-        assert!(s.contains("/kill"), "help should include /kill");
+        assert!(s.contains("/esc"), "help should include /esc");
     });
     cmd_test!(cmd_help_includes_gateway, "/help", |r| {
         let s = r.unwrap();
@@ -2817,7 +2833,7 @@ mod tests {
         // Verify commands table
         assert!(s.contains("/new"), "missing /new in commands table");
         assert!(s.contains("/model"), "missing /model in commands table");
-        assert!(s.contains("/kill"), "missing /kill in commands table");
+        assert!(s.contains("/esc"), "missing /esc in commands table");
         assert!(s.contains("/manage"), "missing /manage in commands table");
         assert!(s.contains("/retry"), "missing /retry in commands table");
         assert!(s.contains("/trace"), "missing /trace in commands table");
@@ -3056,7 +3072,7 @@ mod tests {
     // A request whose `created_at` predates the current gateway process
     // start cannot make progress (its cancel_token is gone, its CLI
     // subprocess is gone, its outbox scheduler is gone). Tag these with
-    // 🧟 in /running so the operator knows they need /kill all.
+    // 🧟 in /running so the operator knows they need /esc all.
 
     #[test]
     fn is_zombie_flags_request_created_before_gateway_start() {
@@ -3105,11 +3121,11 @@ mod tests {
         );
     }
 
-    // ── R5-#1: /kill all — sweep every active request in the conversation ──
+    // ── R5-#1: /esc all — sweep every active request in the conversation ──
     //
     // Scenario: 8 running + queued requests pile up (user repeatedly
     // retries because gateway is stuck). Operator needs a single command
-    // to clear them all without guessing trace_ids. Previous /kill only
+    // to clear them all without guessing trace_ids. Previous /esc only
     // accepted ONE selector — "all" returned "not found".
 
     async fn build_ctx_with_repo<'a>(
@@ -3155,7 +3171,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn kill_all_fails_every_active_request_in_conversation() {
+    async fn esc_all_fails_every_active_request_in_conversation() {
         use crate::trace_model::InMemoryTraceRepository;
         let repo = InMemoryTraceRepository::default();
         let config = test_config();
@@ -3170,11 +3186,11 @@ mod tests {
         let other = seed_running_request(&repo, cli.name(), "other_chat", "msg4").await;
 
         let ctx = build_ctx_with_repo(&config, &cli, &astra, &repo, None).await;
-        let result = handle_command(&ctx, "/kill all").await.unwrap();
+        let result = handle_command(&ctx, "/esc all").await.unwrap();
 
         assert!(
-            result.contains("3") && (result.contains("终止") || result.contains("killed")),
-            "response should report 3 killed: {result}"
+            result.contains("3") && (result.contains("中断") || result.contains("interrupted")),
+            "response should report 3 interrupted: {result}"
         );
 
         // Confirm the target conversation is empty afterward.
@@ -3188,20 +3204,20 @@ mod tests {
         // And trace_ids match what we seeded.
         let _ = (t1, t2, t3);
 
-        // The other conversation's request stays running — /kill all is
+        // The other conversation's request stays running — /esc all is
         // scoped to the invoker's conversation, not global.
         let other_conv = ConversationKey::new("test", "other_chat", cli.name());
         let still_there = repo.list_active_requests(&other_conv, 20).await.unwrap();
         assert_eq!(
             still_there.len(),
             1,
-            "requests in other conversations must NOT be swept by /kill all"
+            "requests in other conversations must NOT be swept by /esc all"
         );
         assert_eq!(still_there[0].trace_id, other);
     }
 
     #[tokio::test]
-    async fn kill_all_on_empty_conversation_reports_zero() {
+    async fn esc_all_on_empty_conversation_reports_zero() {
         use crate::trace_model::InMemoryTraceRepository;
         let repo = InMemoryTraceRepository::default();
         let config = test_config();
@@ -3209,15 +3225,15 @@ mod tests {
         let astra = astra::Client::new("http://localhost:8080", None).unwrap();
 
         let ctx = build_ctx_with_repo(&config, &cli, &astra, &repo, None).await;
-        let result = handle_command(&ctx, "/kill all").await.unwrap();
+        let result = handle_command(&ctx, "/esc all").await.unwrap();
         assert!(
             result.contains("0") || result.contains("没有"),
-            "empty-conversation /kill all should report zero: {result}"
+            "empty-conversation /esc all should report zero: {result}"
         );
     }
 
     #[tokio::test]
-    async fn kill_all_also_cancels_in_memory_tokens() {
+    async fn esc_all_also_cancels_in_memory_tokens() {
         use crate::trace_model::InMemoryTraceRepository;
         let repo = InMemoryTraceRepository::default();
         let config = test_config();
@@ -3231,12 +3247,12 @@ mod tests {
         active_tasks.insert(t1.as_str().to_string(), token.clone());
 
         let ctx = build_ctx_with_repo(&config, &cli, &astra, &repo, Some(&active_tasks)).await;
-        handle_command(&ctx, "/kill all").await.unwrap();
+        handle_command(&ctx, "/esc all").await.unwrap();
 
         assert!(
             token.is_cancelled(),
-            "/kill all must cancel the in-memory cancellation token too, so the \
-             live CLI child exits — not just mark DB as failed"
+            "/esc all must cancel the in-memory cancellation token too, so the \
+             live turn is interrupted — not just mark DB as failed"
         );
         assert!(
             active_tasks.get(t1.as_str()).is_none(),
@@ -3246,7 +3262,7 @@ mod tests {
 
     #[tokio::test]
     async fn cancel_all_sweeps_like_kill_all() {
-        // Symmetry: /cancel all behaves identically to /kill all for
+        // Symmetry: /cancel all behaves identically to /esc all for
         // already-running requests (cancel is just a gentler noun).
         use crate::trace_model::InMemoryTraceRepository;
         let repo = InMemoryTraceRepository::default();
