@@ -14,8 +14,8 @@
 
 # ─── Storage ─────────────────────────────────────────────────────────────────
 #
-# Controls persistence for sessions, cron jobs, reminders, pending messages,
-# usage tracking, credentials, durable tasks, and trace/audit events.
+# Controls persistence for sessions, cron jobs, reminders, usage tracking,
+# credentials, durable tasks, and trace/audit events.
 #
 # Available backends:
 #
@@ -29,7 +29,7 @@
 #   matrixone — Alias for mysql (MatrixOne is MySQL-protocol compatible).
 #
 #   file      — JSON files on disk. Single-user friendly, NOT for production.
-#               Supports: sessions, cron, reminders, pending messages, usage.
+#               Supports: sessions, cron, reminders, usage.
 #               Does NOT support: trace, durable tasks.
 #
 #   none      — No persistence. State is lost on restart; no cron / reminders.

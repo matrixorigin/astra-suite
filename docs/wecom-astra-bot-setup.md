@@ -413,7 +413,6 @@ LIMIT 20;
 | `gw_trace_requests` | `completed` | 企业微信消息已完整处理 |
 | `gw_trace_runs` | `succeeded` | Codex / Agent CLI 调用成功 |
 | `gw_trace_outbox` | `sent` | 回复已发送回企业微信 |
-| `gw_pending_messages` | 有记录 | 有消息积压或等待恢复 |
 
 ## 7. 常见问题排查
 
