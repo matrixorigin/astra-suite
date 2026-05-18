@@ -224,7 +224,7 @@ impl CronScheduler {
         } else {
             self.config.cli.clone()
         };
-        let model_key = store::model_preference_key(profile.name());
+        let model_key = store::model_preference_key(profile.name(), None);
         if let Ok(Some(model_name)) = self
             .store
             .get_user_preference(platform, user_id, &model_key)

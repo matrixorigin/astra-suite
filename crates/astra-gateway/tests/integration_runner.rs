@@ -965,7 +965,7 @@ async fn handle_fast_upserts_user_for_first_time_slash_command() {
         "user row should have been upserted by handle_fast"
     );
     let cli_name = gw.runner.cli_profile().name();
-    let key = astra_gateway::store::model_preference_key(cli_name);
+    let key = astra_gateway::store::model_preference_key(cli_name, Some("chat-nc"));
     let stored = store
         .get_user_preference("mock", "newcomer", &key)
         .await
@@ -991,7 +991,7 @@ async fn per_user_model_override_isolated() {
     // Verify preference was stored for alice
     let store = gw.runner.store().unwrap();
     let cli_name = gw.runner.cli_profile().name();
-    let key = astra_gateway::store::model_preference_key(cli_name);
+    let key = astra_gateway::store::model_preference_key(cli_name, Some("chat-model-a"));
     let alice_model = store
         .get_user_preference("mock", "alice", &key)
         .await

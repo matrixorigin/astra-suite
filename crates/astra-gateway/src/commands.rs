@@ -462,7 +462,7 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
                 return Some(format!("🤖 模型已切换: `{display}`\n(下次消息生效)"));
             };
 
-            let model_key = store::model_preference_key(ctx.resolved_cli.name());
+            let model_key = store::model_preference_key(ctx.resolved_cli.name(), Some(&ctx.chat_id));
             let (stored_value, display) = match &resolved {
                 ResolvedModel::Default => ("".to_string(), "默认".to_string()),
                 ResolvedModel::Id(id) => (id.clone(), display_model_name(id, &entries)),
