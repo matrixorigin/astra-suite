@@ -184,7 +184,6 @@ All tables are created automatically on first run. Prefix `gw_`:
 | `gw_cron_jobs`            | Recurring + one-time scheduled tasks |
 | `gw_durable_tasks`        | Checkpointable long-running tasks |
 | `gw_platform_credentials` | WeChat tokens, context tokens, sync cursors |
-| `gw_pending_messages`     | Crash recovery queue |
 | `gw_trace_requests`       | User / scheduler request state |
 | `gw_trace_runs`           | CLI / runtime attempt state |
 | `gw_trace_events`         | Append-only trace / audit event stream |
