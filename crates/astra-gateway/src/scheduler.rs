@@ -12,6 +12,7 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 
 const POLL_INTERVAL: Duration = Duration::from_secs(60);
+const WEBHOOK_MAX_LEN: usize = 4000;
 #[cfg(test)]
 const CLI_TIMEOUT: Duration = Duration::from_secs(300);
 
@@ -168,7 +169,20 @@ impl CronScheduler {
 
             let prefix = format!("⏰ **定时任务 `{}`**\n\n", &job_id[..8.min(job_id.len())]);
             let body = format!("{prefix}{response}");
-            if let Some(writer) = trace.as_ref() {
+
+            // WeCom groups cannot receive proactive messages via AI Bot — use webhook if configured.
+            if platform == "wecom"
+                && let Some(ref webhook_url) = self
+                    .config
+                    .platforms
+                    .wecom
+                    .as_ref()
+                    .and_then(|w| w.webhook_url.clone())
+            {
+                if let Err(e) = send_webhook(webhook_url, &body).await {
+                    tracing::warn!(error = %e, "scheduler: webhook send failed");
+                }
+            } else if let Some(writer) = trace.as_ref() {
                 match writer.enqueue_outbox(platform, chat_id, None, &body).await {
                     Ok(outbox_id) => {
                         if let Err(e) = self
@@ -304,6 +318,33 @@ impl CronScheduler {
             },
         ))
     }
+}
+
+/// Send a message to a WeCom group via webhook bot.
+async fn send_webhook(url: &str, text: &str) -> Result<(), String> {
+    let truncated = if text.len() > WEBHOOK_MAX_LEN {
+        format!("{}…\n\n_(truncated)_", &text[..WEBHOOK_MAX_LEN])
+    } else {
+        text.to_string()
+    };
+    let payload = serde_json::json!({
+        "msgtype": "markdown",
+        "markdown": { "content": truncated }
+    });
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(url)
+        .json(&payload)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!("webhook returned {status}: {body}"));
+    }
+    tracing::info!("cron result sent via webhook");
+    Ok(())
 }
 
 #[cfg(test)]
