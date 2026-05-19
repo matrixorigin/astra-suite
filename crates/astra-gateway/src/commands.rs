@@ -20,6 +20,8 @@ pub struct CommandContext<'a> {
     pub chat_id: &'a str,
     pub user_id: &'a str,
     pub resolved_cli: &'a crate::cli_bridge::CliProfile,
+    /// Resolved provider name for the active model (e.g. "bedrock", "dashscope").
+    pub resolved_provider: Option<&'a str>,
     pub durable_store: Option<&'a dyn astra_task_store::DurableTaskStore>,
     pub trace_repo: Option<&'a dyn TraceRepository>,
     pub project_dirs: &'a [String],
@@ -1998,8 +2000,10 @@ fn format_duration(ms: u64) -> String {
 struct ModelEntry {
     label: &'static str,
     desc: &'static str,
-    /// Full Bedrock inference profile id, or `None` to mean "follow default".
+    /// Full model identifier, or `None` to mean "follow default".
     full_id: Option<&'static str>,
+    /// Which provider this model uses (e.g. "bedrock", "dashscope").
+    provider: Option<&'static str>,
 }
 
 impl ModelEntry {
@@ -2014,31 +2018,16 @@ impl ModelEntry {
 
 fn model_entries() -> Vec<ModelEntry> {
     vec![
-        ModelEntry {
-            label: "默认",
-            desc: "跟随配置",
-            full_id: None,
-        },
-        ModelEntry {
-            label: "Sonnet",
-            desc: "日常任务",
-            full_id: Some("us.anthropic.claude-sonnet-4-6"),
-        },
-        ModelEntry {
-            label: "Haiku",
-            desc: "快 / 省",
-            full_id: Some("us.anthropic.claude-haiku-4-5-20251001-v1:0"),
-        },
-        ModelEntry {
-            label: "Opus 4.7",
-            desc: "最强 / 复杂任务",
-            full_id: Some("us.anthropic.claude-opus-4-7"),
-        },
-        ModelEntry {
-            label: "Opus 4.6",
-            desc: "上一代 Opus",
-            full_id: Some("us.anthropic.claude-opus-4-6-v1"),
-        },
+        ModelEntry { label: "默认", desc: "跟随配置", full_id: None, provider: None },
+        ModelEntry { label: "Sonnet", desc: "日常任务 · Bedrock", full_id: Some("us.anthropic.claude-sonnet-4-6"), provider: Some("bedrock") },
+        ModelEntry { label: "Haiku", desc: "快 / 省 · Bedrock", full_id: Some("us.anthropic.claude-haiku-4-5-20251001-v1:0"), provider: Some("bedrock") },
+        ModelEntry { label: "Opus 4.7", desc: "最强 / 复杂任务 · Bedrock", full_id: Some("us.anthropic.claude-opus-4-7"), provider: Some("bedrock") },
+        ModelEntry { label: "Opus 4.6", desc: "上一代 Opus · Bedrock", full_id: Some("us.anthropic.claude-opus-4-6-v1"), provider: Some("bedrock") },
+        ModelEntry { label: "DeepSeek V4 Pro", desc: "最强 / 代码 · DashScope", full_id: Some("deepseek-v4-pro"), provider: Some("dashscope") },
+        ModelEntry { label: "Qwen 3.6+", desc: "通义旗舰 / thinking · DashScope", full_id: Some("qwen3.6-plus"), provider: Some("dashscope") },
+        ModelEntry { label: "Qwen 3.6 Flash", desc: "快 / 省 · DashScope", full_id: Some("qwen3.6-flash"), provider: Some("dashscope") },
+        ModelEntry { label: "Kimi K2.6", desc: "Moonshot · DashScope", full_id: Some("kimi-k2.6"), provider: Some("dashscope") },
+        ModelEntry { label: "GLM 5.1", desc: "智谱 · DashScope", full_id: Some("glm-5.1"), provider: Some("dashscope") },
     ]
 }
 
@@ -2046,14 +2035,14 @@ fn model_entries() -> Vec<ModelEntry> {
 pub(crate) enum ResolvedModel {
     /// Clear the override — runner falls back to yaml default.
     Default,
-    /// A concrete Bedrock inference profile id.
+    /// A concrete model identifier.
     Id(String),
     /// Input didn't match any known label or full id.
     Unrecognized,
 }
 
 /// Match against: numeric index · "默认"/"default" · "opus" shorthand · label
-/// (case-insensitive, whitespace ignored) · full Bedrock id in entries.
+/// (case-insensitive, whitespace ignored) · full model id.
 /// Anything else → `Unrecognized`. No passthrough.
 pub(crate) fn resolve_model_input(input: &str) -> ResolvedModel {
     let entries = model_entries();
@@ -2097,11 +2086,8 @@ pub(crate) fn resolve_model_input(input: &str) -> ResolvedModel {
         }
     }
 
-    // Broader Bedrock id whitelist: any Claude model id the installed CLI
-    // bundle knows about. Menu UI stays short (5 entries), but power users
-    // who type a full `us.anthropic.…` id or a CLI short name like
-    // `claude-opus-4-5-20251101` get accepted rather than rejected.
-    for id in known_bedrock_ids() {
+    // Extended model id whitelist: accept any known model identifier.
+    for id in known_model_ids() {
         if trimmed.eq_ignore_ascii_case(id) {
             return ResolvedModel::Id(id.to_string());
         }
@@ -2110,14 +2096,9 @@ pub(crate) fn resolve_model_input(input: &str) -> ResolvedModel {
     ResolvedModel::Unrecognized
 }
 
-/// All Claude model identifiers the bundled Claude CLI (2.1.138) will accept.
-/// Kept in sync manually — update when upgrading the CLI or when a new model
-/// ships on Bedrock `us-east-1`. Both full `us.anthropic.…` ids and CLI
-/// short names (`claude-opus-4-7`) are accepted; the CLI normalises short
-/// names to the full id before signing the request.
-fn known_bedrock_ids() -> &'static [&'static str] {
+/// All model identifiers the gateway accepts.
+fn known_model_ids() -> &'static [&'static str] {
     &[
-        // Full Bedrock inference profile ids (what Bedrock actually signs).
         "us.anthropic.claude-opus-4-7",
         "us.anthropic.claude-opus-4-6-v1",
         "us.anthropic.claude-opus-4-5-20251101-v1:0",
@@ -2127,8 +2108,6 @@ fn known_bedrock_ids() -> &'static [&'static str] {
         "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
         "us.anthropic.claude-sonnet-4-20250514-v1:0",
         "us.anthropic.claude-haiku-4-5-20251001-v1:0",
-        // CLI short names (no provider prefix). Claude CLI normalises these
-        // to the corresponding us.anthropic.… id before signing.
         "claude-opus-4-7",
         "claude-opus-4-6",
         "claude-opus-4-5",
@@ -2147,7 +2126,23 @@ fn known_bedrock_ids() -> &'static [&'static str] {
         "claude-haiku-4-5",
         "claude-haiku-4-5-20251001",
         "claude-haiku-4",
+        // DashScope (Aliyun) model ids.
+        "deepseek-v4-pro",
+        "qwen3.6-plus",
+        "qwen3.6-flash",
+        "kimi-k2.6",
+        "glm-5.1",
     ]
+}
+
+/// Map a concrete model ID to its provider name, or None.
+pub(crate) fn model_provider(model_id: &str) -> Option<&'static str> {
+    for entry in &model_entries() {
+        if entry.full_id == Some(model_id) {
+            return entry.provider;
+        }
+    }
+    None
 }
 
 fn strip_whitespace(s: &str) -> String {
@@ -2367,6 +2362,7 @@ mod tests {
             database: None,
             cli: Default::default(),
             cli_profiles: Default::default(),
+            providers: Default::default(),
             cli_timeout_secs: 3600,
             platforms: Default::default(),
             skills_dir: None,
@@ -2399,6 +2395,7 @@ mod tests {
                     chat_id: "chat_1",
                     user_id: "user_1",
                     resolved_cli: &cli,
+                    resolved_provider: None,
                     durable_store: None,
                     trace_repo: None,
                     project_dirs: &config.project_dirs,
@@ -2641,6 +2638,7 @@ mod tests {
             chat_id: "chat_1",
             user_id: "user_1",
             resolved_cli: &cli,
+            resolved_provider: None,
             durable_store: None,
             trace_repo: None,
             project_dirs: &config.project_dirs,
@@ -3143,6 +3141,7 @@ mod tests {
             chat_id: "chat_kill_all",
             user_id: "user_1",
             resolved_cli: cli,
+            resolved_provider: None,
             durable_store: None,
             trace_repo: Some(repo),
             project_dirs: &config.project_dirs,

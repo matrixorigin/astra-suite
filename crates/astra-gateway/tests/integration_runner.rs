@@ -290,6 +290,7 @@ impl TestGateway {
                 text_field: Some("text".into()),
             },
             cli_profiles: std::collections::HashMap::new(),
+            providers: std::collections::HashMap::new(),
             cli_timeout_secs: 30,
             platforms: PlatformConfigs::default(),
             skills_dir: None,
@@ -671,6 +672,7 @@ async fn runner_init_invalid_config_errors() {
             text_field: None,
         },
         cli_profiles: std::collections::HashMap::new(),
+        providers: std::collections::HashMap::new(),
         cli_timeout_secs: 30,
         platforms: PlatformConfigs::default(),
         skills_dir: None,
@@ -1207,6 +1209,7 @@ async fn cli_timeout_returns_error_message() {
         None,
         None,
         Some(Duration::from_secs(1)),
+        None,
         None,
     )
     .await;

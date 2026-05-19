@@ -97,7 +97,8 @@ impl CronScheduler {
             }
             // once_exec and recurring cron both invoke the agent below
 
-            let cli_profile = self.resolve_cli_profile(platform, &user_id).await;
+            let (cli_profile, provider_config) =
+                self.resolve_cli_profile(platform, &user_id).await;
             let cli_name = cli_profile.name().to_string();
             let workspace = self.resolve_workspace(platform, &user_id).await;
             let session_id = self
@@ -124,6 +125,7 @@ impl CronScheduler {
                 None,
                 Some(Duration::from_secs(self.config.cli_timeout_secs.max(1))),
                 None, // scheduler does not use shared auth token
+                provider_config.as_ref(),
             );
 
             let response = match cli_future.await {
@@ -213,7 +215,11 @@ impl CronScheduler {
         }
     }
 
-    async fn resolve_cli_profile(&self, platform: &str, user_id: &str) -> CliProfile {
+    async fn resolve_cli_profile(
+        &self,
+        platform: &str,
+        user_id: &str,
+    ) -> (CliProfile, Option<crate::config::ProviderConfig>) {
         let mut profile = if let Ok(Some(name)) = self
             .store
             .get_user_preference(platform, user_id, "cli_profile")
@@ -232,7 +238,11 @@ impl CronScheduler {
         {
             profile.set_model_override(model_name);
         }
-        profile
+        let provider = profile
+            .model_name()
+            .and_then(|mid| crate::commands::model_provider(mid))
+            .and_then(|pn| self.config.providers.get(pn).cloned());
+        (profile, provider)
     }
 
     async fn resolve_workspace(&self, platform: &str, user_id: &str) -> Option<std::path::PathBuf> {

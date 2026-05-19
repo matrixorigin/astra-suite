@@ -584,7 +584,12 @@ impl GatewayRunner {
     }
 
     /// Resolve the active CLI profile for a user (may be overridden via /cli + /model).
-    async fn resolve_cli_profile(&self, platform: &str, user_id: &str) -> CliProfile {
+    async fn resolve_cli_profile(
+        &self,
+        platform: &str,
+        user_id: &str,
+    ) -> (CliProfile, Option<crate::config::ProviderConfig>) {
+
         let mut profile = if let Some(ref store) = self.store
             && let Ok(Some(name)) = store
                 .get_user_preference(platform, user_id, "cli_profile")
@@ -596,9 +601,9 @@ impl GatewayRunner {
             self.cli_profile.clone()
         };
 
-        // Apply per-user model override scoped to this CLI. Empty string is the
-        // "use default" sentinel written by `/model 默认` — treat as no override.
+
         let model_key = store::model_preference_key(profile.name());
+
         if let Some(ref store) = self.store
             && let Ok(Some(model_name)) = store
                 .get_user_preference(platform, user_id, &model_key)
@@ -608,7 +613,12 @@ impl GatewayRunner {
             profile.set_model_override(model_name);
         }
 
-        profile
+        let provider = profile
+            .model_name()
+            .and_then(|mid| crate::commands::model_provider(mid))
+            .and_then(|pn| self.config.providers.get(pn).cloned());
+
+        (profile, provider)
     }
 
     /// Fast path: access control + slash commands. Returns Some if handled (no CLI needed).
@@ -670,7 +680,13 @@ impl GatewayRunner {
         };
 
         // Resolve active CLI profile
-        let cli_profile = self.resolve_cli_profile(msg.platform, &msg.user_id).await;
+
+        let (cli_profile, _provider_config) =
+            self.resolve_cli_profile(msg.platform, &msg.user_id).await;
+        let provider_name = cli_profile
+            .model_name()
+            .and_then(|mid| crate::commands::model_provider(mid));
+
 
         let trimmed = msg.text.trim();
 
@@ -708,6 +724,7 @@ impl GatewayRunner {
                     chat_id: &effective_chat_id,
                     user_id: &msg.user_id,
                     resolved_cli: &cli_profile,
+                    resolved_provider: provider_name,
                     durable_store: self
                         .durable_store
                         .as_ref()
@@ -756,6 +773,7 @@ impl GatewayRunner {
             chat_id: &effective_chat_id,
             user_id: &msg.user_id,
             resolved_cli: &cli_profile,
+            resolved_provider: provider_name,
             durable_store: self
                 .durable_store
                 .as_ref()
@@ -828,7 +846,10 @@ impl GatewayRunner {
             msg.chat_id.clone()
         };
 
-        let cli_profile = self.resolve_cli_profile(msg.platform, &msg.user_id).await;
+
+        let (cli_profile, provider_config) =
+            self.resolve_cli_profile(msg.platform, &msg.user_id).await;
+
 
         // Check first-time user BEFORE upsert (upsert creates the row)
         let is_first = if let Some(ref store) = self.store {
@@ -1171,6 +1192,7 @@ impl GatewayRunner {
             let token = access_token.clone();
             let kill_token = cancel_token.clone();
             let mcp_cfg = mcp_config_path.clone();
+            let pc = provider_config.clone();
 
             tokio::spawn(async move {
                 let mut pool_guard = pool.lock().await;
@@ -1183,6 +1205,7 @@ impl GatewayRunner {
                         Some(&sp),
                         token.as_deref(),
                         mcp_cfg.as_deref(),
+                        pc.as_ref(),
                     )
                     .await?;
                 drop(pool_guard); // release lock before reading progress
@@ -1359,6 +1382,7 @@ impl GatewayRunner {
             let kill_token = cancel_token.clone();
             let trace_id_str = trace.as_ref().map(|t| t.trace_id.to_string());
             let request_id_str = trace.as_ref().map(|t| t.request_id.to_string());
+            let pc = provider_config.clone();
             tokio::spawn(async move {
                 cli_bridge::run_cli_with_cancel(
                     &profile,
@@ -1372,6 +1396,7 @@ impl GatewayRunner {
                     Some(cli_timeout),
                     token.as_deref(),
                     Some(kill_token),
+                    pc.as_ref(),
                 )
                 .await
             })
@@ -1817,6 +1842,7 @@ impl GatewayRunner {
                         None,
                         Some(&system_prompt),
                         access_token.as_deref(),
+                        None,
                     )
                     .await
                 }
@@ -2517,7 +2543,10 @@ impl GatewayRunner {
         msg: InboundMessage,
         profile_override: Option<&str>,
     ) -> QueuedRequest {
-        let resolved = self.resolve_cli_profile(msg.platform, &msg.user_id).await;
+
+        let (resolved, _provider_config) =
+            self.resolve_cli_profile(msg.platform, &msg.user_id).await;
+
         let conv_profile = profile_override.unwrap_or(resolved.name());
         let effective_chat_id = self.effective_chat_id(&msg);
         let conversation = ConversationKey::new(msg.platform, effective_chat_id, conv_profile);

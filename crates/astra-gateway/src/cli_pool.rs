@@ -67,6 +67,7 @@ impl CliProcessPool {
         system_prompt: Option<&str>,
         access_token: Option<&str>,
         mcp_config: Option<&Path>,
+        provider_config: Option<&crate::config::ProviderConfig>,
     ) -> Result<mpsc::Receiver<CliProgress>, String> {
         if !self.processes.contains_key(key) || !self.is_alive(key) {
             self.processes.remove(key);
@@ -77,6 +78,7 @@ impl CliProcessPool {
                 system_prompt,
                 access_token,
                 mcp_config,
+                provider_config,
             )
             .await?;
         }
@@ -156,6 +158,7 @@ impl CliProcessPool {
         system_prompt: Option<&str>,
         access_token: Option<&str>,
         mcp_config: Option<&Path>,
+        provider_config: Option<&crate::config::ProviderConfig>,
     ) -> Result<(), String> {
         let mut cmd = build_persistent_command(profile, working_dir, system_prompt, mcp_config)
             .ok_or("profile does not support persistent mode")?;
@@ -166,6 +169,11 @@ impl CliProcessPool {
         profile
             .apply_runtime_environment(&mut cmd)
             .map_err(|e| format!("failed to prepare CLI environment: {e}"))?;
+
+        if let Some(pc) = provider_config {
+            crate::cli_bridge::apply_provider_environment(&mut cmd, pc)
+                .map_err(|e| format!("failed to prepare provider environment: {e}"))?;
+        }
 
         cmd.stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
