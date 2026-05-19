@@ -2021,15 +2021,10 @@ impl ModelEntry {
 fn model_entries() -> Vec<ModelEntry> {
     vec![
         ModelEntry { label: "默认".into(), desc: "跟随配置".into(), full_id: None, provider: None, aliases: vec![] },
-        ModelEntry { label: "Sonnet".into(), desc: "日常任务 · Bedrock".into(), full_id: Some("us.anthropic.claude-sonnet-4-6".into()), provider: Some("bedrock".into()), aliases: vec![] },
-        ModelEntry { label: "Haiku".into(), desc: "快 / 省 · Bedrock".into(), full_id: Some("us.anthropic.claude-haiku-4-5-20251001-v1:0".into()), provider: Some("bedrock".into()), aliases: vec![] },
-        ModelEntry { label: "Opus 4.7".into(), desc: "最强 / 复杂任务 · Bedrock".into(), full_id: Some("us.anthropic.claude-opus-4-7".into()), provider: Some("bedrock".into()), aliases: vec![] },
-        ModelEntry { label: "Opus 4.6".into(), desc: "上一代 Opus · Bedrock".into(), full_id: Some("us.anthropic.claude-opus-4-6-v1".into()), provider: Some("bedrock".into()), aliases: vec![] },
-        ModelEntry { label: "DeepSeek V4 Pro".into(), desc: "最强 / 代码 · DashScope".into(), full_id: Some("deepseek-v4-pro".into()), provider: Some("dashscope".into()), aliases: vec!["deepseek".into(), "ds".into()] },
-        ModelEntry { label: "Qwen 3.6+".into(), desc: "通义旗舰 / thinking · DashScope".into(), full_id: Some("qwen3.6-plus".into()), provider: Some("dashscope".into()), aliases: vec!["qwen".into()] },
-        ModelEntry { label: "Qwen 3.6 Flash".into(), desc: "快 / 省 · DashScope".into(), full_id: Some("qwen3.6-flash".into()), provider: Some("dashscope".into()), aliases: vec![] },
-        ModelEntry { label: "Kimi K2.6".into(), desc: "Moonshot · DashScope".into(), full_id: Some("kimi-k2.6".into()), provider: Some("dashscope".into()), aliases: vec!["kimi".into()] },
-        ModelEntry { label: "GLM 5.1".into(), desc: "智谱 · DashScope".into(), full_id: Some("glm-5.1".into()), provider: Some("dashscope".into()), aliases: vec!["glm".into()] },
+        ModelEntry { label: "Sonnet".into(), desc: "日常任务".into(), full_id: Some("us.anthropic.claude-sonnet-4-6".into()), provider: Some("bedrock".into()), aliases: vec![] },
+        ModelEntry { label: "Haiku".into(), desc: "快 / 省".into(), full_id: Some("us.anthropic.claude-haiku-4-5-20251001-v1:0".into()), provider: Some("bedrock".into()), aliases: vec![] },
+        ModelEntry { label: "Opus 4.7".into(), desc: "最强 / 复杂任务".into(), full_id: Some("us.anthropic.claude-opus-4-7".into()), provider: Some("bedrock".into()), aliases: vec![] },
+        ModelEntry { label: "Opus 4.6".into(), desc: "上一代 Opus".into(), full_id: Some("us.anthropic.claude-opus-4-6-v1".into()), provider: Some("bedrock".into()), aliases: vec![] },
     ]
 }
 
@@ -2161,12 +2156,6 @@ fn known_model_ids() -> &'static [&'static str] {
         "claude-haiku-4-5",
         "claude-haiku-4-5-20251001",
         "claude-haiku-4",
-        // DashScope (Aliyun) model ids.
-        "deepseek-v4-pro",
-        "qwen3.6-plus",
-        "qwen3.6-flash",
-        "kimi-k2.6",
-        "glm-5.1",
     ]
 }
 
@@ -2518,12 +2507,9 @@ mod tests {
             id(resolve_model_input("us.anthropic.claude-opus-4-5-20251101-v1:0", &e)),
             "us.anthropic.claude-opus-4-5-20251101-v1:0"
         );
-        // Built-in aliases for DashScope models
-        assert_eq!(id(resolve_model_input("deepseek", &e)), "deepseek-v4-pro");
-        assert_eq!(id(resolve_model_input("ds", &e)), "deepseek-v4-pro");
-        assert_eq!(id(resolve_model_input("qwen", &e)), "qwen3.6-plus");
-        assert_eq!(id(resolve_model_input("kimi", &e)), "kimi-k2.6");
-        assert_eq!(id(resolve_model_input("glm", &e)), "glm-5.1");
+        // DashScope models not in built-in list (need extra_models config)
+        assert!(matches!(resolve_model_input("deepseek", &e), ResolvedModel::Unrecognized));
+        assert!(matches!(resolve_model_input("deepseek-v4-pro", &e), ResolvedModel::Unrecognized));
         // Anything else rejected
         assert!(matches!(resolve_model_input("xyz-model", &e), ResolvedModel::Unrecognized));
         assert!(matches!(resolve_model_input("opus 12345", &e), ResolvedModel::Unrecognized));
@@ -2543,20 +2529,27 @@ mod tests {
         }
         let mut e = model_entries();
         e.push(ModelEntry {
-            label: "MyCustom".into(),
-            desc: "test".into(),
-            full_id: Some("custom-model-v1".into()),
-            provider: Some("custom".into()),
-            aliases: vec!["mc".into(), "custom".into()],
+            label: "DeepSeek V4 Pro".into(),
+            desc: "DashScope".into(),
+            full_id: Some("deepseek-v4-pro".into()),
+            provider: Some("dashscope".into()),
+            aliases: vec!["deepseek".into(), "ds".into()],
         });
-        assert_eq!(id(resolve_model_input("mc", &e)), "custom-model-v1");
-        assert_eq!(id(resolve_model_input("custom", &e)), "custom-model-v1");
-        assert_eq!(id(resolve_model_input("MyCustom", &e)), "custom-model-v1");
-        assert_eq!(id(resolve_model_input("custom-model-v1", &e)), "custom-model-v1");
-        // Numeric index for the extra entry (11th)
-        assert_eq!(id(resolve_model_input("11", &e)), "custom-model-v1");
+        // Alias resolution
+        assert_eq!(id(resolve_model_input("deepseek", &e)), "deepseek-v4-pro");
+        assert_eq!(id(resolve_model_input("ds", &e)), "deepseek-v4-pro");
+        assert_eq!(id(resolve_model_input("DS", &e)), "deepseek-v4-pro");
+        // Label resolution
+        assert_eq!(id(resolve_model_input("DeepSeek V4 Pro", &e)), "deepseek-v4-pro");
+        assert_eq!(id(resolve_model_input("deepseekv4pro", &e)), "deepseek-v4-pro");
+        // Exact ID
+        assert_eq!(id(resolve_model_input("deepseek-v4-pro", &e)), "deepseek-v4-pro");
+        // Numeric index (6th entry)
+        assert_eq!(id(resolve_model_input("6", &e)), "deepseek-v4-pro");
         // Built-in models still work
         assert_eq!(id(resolve_model_input("opus", &e)), "us.anthropic.claude-opus-4-7");
+        // Unknown still rejected
+        assert!(matches!(resolve_model_input("xyz", &e), ResolvedModel::Unrecognized));
     }
 
     #[test]
