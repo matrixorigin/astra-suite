@@ -305,6 +305,7 @@ impl TestGateway {
             project_dirs: vec![],
             system_prompt_extra: None,
             api_port: None,
+            extra_models: vec![],
         }
     }
 }
@@ -687,6 +688,7 @@ async fn runner_init_invalid_config_errors() {
         project_dirs: vec![],
         system_prompt_extra: None,
         api_port: None,
+        extra_models: vec![],
     };
 
     let result = GatewayRunner::new(config).await;

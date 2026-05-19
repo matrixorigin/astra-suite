@@ -613,10 +613,11 @@ impl GatewayRunner {
             profile.set_model_override(model_name);
         }
 
+        let entries = crate::commands::all_model_entries(&self.config);
         let provider = profile
             .model_name()
-            .and_then(|mid| crate::commands::model_provider(mid))
-            .and_then(|pn| self.config.providers.get(pn).cloned());
+            .and_then(|mid| crate::commands::model_provider(mid, &entries))
+            .and_then(|pn| self.config.providers.get(&pn).cloned());
 
         (profile, provider)
     }
@@ -683,9 +684,10 @@ impl GatewayRunner {
 
         let (cli_profile, _provider_config) =
             self.resolve_cli_profile(msg.platform, &msg.user_id).await;
+        let entries = crate::commands::all_model_entries(&self.config);
         let provider_name = cli_profile
             .model_name()
-            .and_then(|mid| crate::commands::model_provider(mid));
+            .and_then(|mid| crate::commands::model_provider(mid, &entries));
 
 
         let trimmed = msg.text.trim();
@@ -724,7 +726,7 @@ impl GatewayRunner {
                     chat_id: &effective_chat_id,
                     user_id: &msg.user_id,
                     resolved_cli: &cli_profile,
-                    resolved_provider: provider_name,
+                    resolved_provider: provider_name.as_deref(),
                     durable_store: self
                         .durable_store
                         .as_ref()
@@ -773,7 +775,7 @@ impl GatewayRunner {
             chat_id: &effective_chat_id,
             user_id: &msg.user_id,
             resolved_cli: &cli_profile,
-            resolved_provider: provider_name,
+            resolved_provider: provider_name.as_deref(),
             durable_store: self
                 .durable_store
                 .as_ref()
@@ -801,8 +803,9 @@ impl GatewayRunner {
                 // resolved to a valid model. Otherwise the user just gets an
                 // error message back and the existing session stays warm.
                 let should_kill = if let Some(arg) = msg.text.strip_prefix("/model ") {
+                    let entries = commands::all_model_entries(&self.config);
                     !matches!(
-                        commands::resolve_model_input(arg),
+                        commands::resolve_model_input(arg, &entries),
                         commands::ResolvedModel::Unrecognized
                     )
                 } else {

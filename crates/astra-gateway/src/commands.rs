@@ -112,7 +112,7 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
             // by comparing against `config.cli`.
             let resolved_model = ctx.resolved_cli.model_name();
             let yaml_default = ctx.config.cli.model_name();
-            let entries = model_entries();
+            let entries = all_model_entries(ctx.config);
             let model_line = match resolved_model {
                 Some(id) => {
                     let pretty = display_model_name(id, &entries);
@@ -400,7 +400,7 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
             // user has no per-user override, resolve_cli_profile returns this
             // untouched, so current_model == config_default_model.
             let config_default_model = ctx.config.cli.model_name();
-            let entries = model_entries();
+            let entries = all_model_entries(ctx.config);
 
             if arg.is_empty() {
                 let current_display = current_model
@@ -447,7 +447,7 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
                 return Some(denial);
             }
 
-            let resolved = resolve_model_input(arg);
+            let resolved = resolve_model_input(arg, &entries);
             if matches!(resolved, ResolvedModel::Unrecognized) {
                 return Some(format!(
                     "⚠️ 未识别模型: `{arg}`，当前模型未改变。\n\
@@ -1997,18 +1997,20 @@ fn format_duration(ms: u64) -> String {
 }
 
 /// An entry in the `/model` selection list.
-struct ModelEntry {
-    label: &'static str,
-    desc: &'static str,
+pub(crate) struct ModelEntry {
+    label: String,
+    desc: String,
     /// Full model identifier, or `None` to mean "follow default".
-    full_id: Option<&'static str>,
+    full_id: Option<String>,
     /// Which provider this model uses (e.g. "bedrock", "dashscope").
-    provider: Option<&'static str>,
+    provider: Option<String>,
+    /// Extra shorthand aliases for resolution (e.g. ["deepseek", "ds"]).
+    aliases: Vec<String>,
 }
 
 impl ModelEntry {
     fn matches_current(&self, current: Option<&str>) -> bool {
-        match (self.full_id, current) {
+        match (self.full_id.as_deref(), current) {
             (None, None) => true,
             (Some(id), Some(cur)) => id == cur,
             _ => false,
@@ -2018,17 +2020,31 @@ impl ModelEntry {
 
 fn model_entries() -> Vec<ModelEntry> {
     vec![
-        ModelEntry { label: "默认", desc: "跟随配置", full_id: None, provider: None },
-        ModelEntry { label: "Sonnet", desc: "日常任务 · Bedrock", full_id: Some("us.anthropic.claude-sonnet-4-6"), provider: Some("bedrock") },
-        ModelEntry { label: "Haiku", desc: "快 / 省 · Bedrock", full_id: Some("us.anthropic.claude-haiku-4-5-20251001-v1:0"), provider: Some("bedrock") },
-        ModelEntry { label: "Opus 4.7", desc: "最强 / 复杂任务 · Bedrock", full_id: Some("us.anthropic.claude-opus-4-7"), provider: Some("bedrock") },
-        ModelEntry { label: "Opus 4.6", desc: "上一代 Opus · Bedrock", full_id: Some("us.anthropic.claude-opus-4-6-v1"), provider: Some("bedrock") },
-        ModelEntry { label: "DeepSeek V4 Pro", desc: "最强 / 代码 · DashScope", full_id: Some("deepseek-v4-pro"), provider: Some("dashscope") },
-        ModelEntry { label: "Qwen 3.6+", desc: "通义旗舰 / thinking · DashScope", full_id: Some("qwen3.6-plus"), provider: Some("dashscope") },
-        ModelEntry { label: "Qwen 3.6 Flash", desc: "快 / 省 · DashScope", full_id: Some("qwen3.6-flash"), provider: Some("dashscope") },
-        ModelEntry { label: "Kimi K2.6", desc: "Moonshot · DashScope", full_id: Some("kimi-k2.6"), provider: Some("dashscope") },
-        ModelEntry { label: "GLM 5.1", desc: "智谱 · DashScope", full_id: Some("glm-5.1"), provider: Some("dashscope") },
+        ModelEntry { label: "默认".into(), desc: "跟随配置".into(), full_id: None, provider: None, aliases: vec![] },
+        ModelEntry { label: "Sonnet".into(), desc: "日常任务 · Bedrock".into(), full_id: Some("us.anthropic.claude-sonnet-4-6".into()), provider: Some("bedrock".into()), aliases: vec![] },
+        ModelEntry { label: "Haiku".into(), desc: "快 / 省 · Bedrock".into(), full_id: Some("us.anthropic.claude-haiku-4-5-20251001-v1:0".into()), provider: Some("bedrock".into()), aliases: vec![] },
+        ModelEntry { label: "Opus 4.7".into(), desc: "最强 / 复杂任务 · Bedrock".into(), full_id: Some("us.anthropic.claude-opus-4-7".into()), provider: Some("bedrock".into()), aliases: vec![] },
+        ModelEntry { label: "Opus 4.6".into(), desc: "上一代 Opus · Bedrock".into(), full_id: Some("us.anthropic.claude-opus-4-6-v1".into()), provider: Some("bedrock".into()), aliases: vec![] },
+        ModelEntry { label: "DeepSeek V4 Pro".into(), desc: "最强 / 代码 · DashScope".into(), full_id: Some("deepseek-v4-pro".into()), provider: Some("dashscope".into()), aliases: vec!["deepseek".into(), "ds".into()] },
+        ModelEntry { label: "Qwen 3.6+".into(), desc: "通义旗舰 / thinking · DashScope".into(), full_id: Some("qwen3.6-plus".into()), provider: Some("dashscope".into()), aliases: vec!["qwen".into()] },
+        ModelEntry { label: "Qwen 3.6 Flash".into(), desc: "快 / 省 · DashScope".into(), full_id: Some("qwen3.6-flash".into()), provider: Some("dashscope".into()), aliases: vec![] },
+        ModelEntry { label: "Kimi K2.6".into(), desc: "Moonshot · DashScope".into(), full_id: Some("kimi-k2.6".into()), provider: Some("dashscope".into()), aliases: vec!["kimi".into()] },
+        ModelEntry { label: "GLM 5.1".into(), desc: "智谱 · DashScope".into(), full_id: Some("glm-5.1".into()), provider: Some("dashscope".into()), aliases: vec!["glm".into()] },
     ]
+}
+
+pub(crate) fn all_model_entries(config: &crate::config::GatewayConfig) -> Vec<ModelEntry> {
+    let mut entries = model_entries();
+    for extra in &config.extra_models {
+        entries.push(ModelEntry {
+            label: extra.label.clone(),
+            desc: extra.desc.clone(),
+            full_id: Some(extra.id.clone()),
+            provider: extra.provider.clone(),
+            aliases: extra.aliases.clone(),
+        });
+    }
+    entries
 }
 
 /// Result of resolving a user-provided `/model` argument.
@@ -2042,10 +2058,9 @@ pub(crate) enum ResolvedModel {
 }
 
 /// Match against: numeric index · "默认"/"default" · "opus" shorthand · label
-/// (case-insensitive, whitespace ignored) · full model id.
-/// Anything else → `Unrecognized`. No passthrough.
-pub(crate) fn resolve_model_input(input: &str) -> ResolvedModel {
-    let entries = model_entries();
+/// (case-insensitive, whitespace ignored) · alias · exact id · extended whitelist.
+/// Anything else → `Unrecognized`.
+pub(crate) fn resolve_model_input(input: &str, entries: &[ModelEntry]) -> ResolvedModel {
     let trimmed = input.trim();
     if trimmed.is_empty() {
         return ResolvedModel::Unrecognized;
@@ -2056,9 +2071,9 @@ pub(crate) fn resolve_model_input(input: &str) -> ResolvedModel {
         && idx >= 1
         && idx <= entries.len()
     {
-        return match entries[idx - 1].full_id {
+        return match &entries[idx - 1].full_id {
             None => ResolvedModel::Default,
-            Some(id) => ResolvedModel::Id(id.to_string()),
+            Some(id) => ResolvedModel::Id(id.clone()),
         };
     }
 
@@ -2074,19 +2089,39 @@ pub(crate) fn resolve_model_input(input: &str) -> ResolvedModel {
         return ResolvedModel::Id("us.anthropic.claude-opus-4-7".to_string());
     }
 
-    // Label match with whitespace ignored, case-insensitive. "Opus 4.7" /
-    // "opus 4.7" / "opus4.7" / "  Opus  4.7 " all collapse and match.
+    // Label match with whitespace ignored, case-insensitive.
     let stripped = strip_whitespace(trimmed);
-    for entry in &entries {
-        if stripped.eq_ignore_ascii_case(&strip_whitespace(entry.label)) {
-            return match entry.full_id {
+    for entry in entries {
+        if stripped.eq_ignore_ascii_case(&strip_whitespace(&entry.label)) {
+            return match &entry.full_id {
                 None => ResolvedModel::Default,
-                Some(id) => ResolvedModel::Id(id.to_string()),
+                Some(id) => ResolvedModel::Id(id.clone()),
             };
         }
     }
 
-    // Extended model id whitelist: accept any known model identifier.
+    // Alias match (case-insensitive).
+    for entry in entries {
+        for alias in &entry.aliases {
+            if trimmed.eq_ignore_ascii_case(alias) {
+                return match &entry.full_id {
+                    None => ResolvedModel::Default,
+                    Some(id) => ResolvedModel::Id(id.clone()),
+                };
+            }
+        }
+    }
+
+    // Exact id match against entries (case-insensitive).
+    for entry in entries {
+        if let Some(id) = &entry.full_id {
+            if trimmed.eq_ignore_ascii_case(id) {
+                return ResolvedModel::Id(id.clone());
+            }
+        }
+    }
+
+    // Extended model id whitelist.
     for id in known_model_ids() {
         if trimmed.eq_ignore_ascii_case(id) {
             return ResolvedModel::Id(id.to_string());
@@ -2136,10 +2171,10 @@ fn known_model_ids() -> &'static [&'static str] {
 }
 
 /// Map a concrete model ID to its provider name, or None.
-pub(crate) fn model_provider(model_id: &str) -> Option<&'static str> {
-    for entry in &model_entries() {
-        if entry.full_id == Some(model_id) {
-            return entry.provider;
+pub(crate) fn model_provider(model_id: &str, entries: &[ModelEntry]) -> Option<String> {
+    for entry in entries {
+        if entry.full_id.as_deref() == Some(model_id) {
+            return entry.provider.clone();
         }
     }
     None
@@ -2149,12 +2184,12 @@ fn strip_whitespace(s: &str) -> String {
     s.chars().filter(|c| !c.is_whitespace()).collect()
 }
 
-/// Render a Bedrock model id using the friendly label from the entries list,
+/// Render a model id using the friendly label from the entries list,
 /// falling back to the raw id if unknown.
 fn display_model_name(id: &str, entries: &[ModelEntry]) -> String {
     for entry in entries {
-        if entry.full_id == Some(id) {
-            return entry.label.to_string();
+        if entry.full_id.as_deref() == Some(id) {
+            return entry.label.clone();
         }
     }
     id.to_string()
@@ -2377,6 +2412,7 @@ mod tests {
             project_dirs: vec![],
             system_prompt_extra: None,
             api_port: None,
+            extra_models: vec![],
         }
     }
 
@@ -2444,6 +2480,7 @@ mod tests {
 
     #[test]
     fn resolve_model_input_variants() {
+        let e = model_entries();
         fn id(r: ResolvedModel) -> String {
             match r {
                 ResolvedModel::Id(s) => s,
@@ -2453,103 +2490,73 @@ mod tests {
         }
 
         // "opus" shorthand → latest Opus
-        assert_eq!(
-            id(resolve_model_input("opus")),
-            "us.anthropic.claude-opus-4-7"
-        );
-        assert_eq!(
-            id(resolve_model_input("Opus")),
-            "us.anthropic.claude-opus-4-7"
-        );
+        assert_eq!(id(resolve_model_input("opus", &e)), "us.anthropic.claude-opus-4-7");
+        assert_eq!(id(resolve_model_input("Opus", &e)), "us.anthropic.claude-opus-4-7");
         // Exact label match (case-insensitive)
-        assert_eq!(
-            id(resolve_model_input("Opus 4.7")),
-            "us.anthropic.claude-opus-4-7"
-        );
-        assert_eq!(
-            id(resolve_model_input("opus 4.7")),
-            "us.anthropic.claude-opus-4-7"
-        );
-        assert_eq!(
-            id(resolve_model_input("Opus 4.6")),
-            "us.anthropic.claude-opus-4-6-v1"
-        );
-        assert_eq!(
-            id(resolve_model_input("sonnet")),
-            "us.anthropic.claude-sonnet-4-6"
-        );
-        assert_eq!(
-            id(resolve_model_input("Haiku")),
-            "us.anthropic.claude-haiku-4-5-20251001-v1:0"
-        );
+        assert_eq!(id(resolve_model_input("Opus 4.7", &e)), "us.anthropic.claude-opus-4-7");
+        assert_eq!(id(resolve_model_input("opus 4.7", &e)), "us.anthropic.claude-opus-4-7");
+        assert_eq!(id(resolve_model_input("Opus 4.6", &e)), "us.anthropic.claude-opus-4-6-v1");
+        assert_eq!(id(resolve_model_input("sonnet", &e)), "us.anthropic.claude-sonnet-4-6");
+        assert_eq!(id(resolve_model_input("Haiku", &e)), "us.anthropic.claude-haiku-4-5-20251001-v1:0");
         // Numeric index: 1=默认, 2=Sonnet, 3=Haiku, 4=Opus 4.7, 5=Opus 4.6
-        assert!(matches!(resolve_model_input("1"), ResolvedModel::Default));
-        assert_eq!(id(resolve_model_input("4")), "us.anthropic.claude-opus-4-7");
+        assert!(matches!(resolve_model_input("1", &e), ResolvedModel::Default));
+        assert_eq!(id(resolve_model_input("4", &e)), "us.anthropic.claude-opus-4-7");
         // Default
-        assert!(matches!(
-            resolve_model_input("默认"),
-            ResolvedModel::Default
-        ));
-        assert!(matches!(
-            resolve_model_input("default"),
-            ResolvedModel::Default
-        ));
+        assert!(matches!(resolve_model_input("默认", &e), ResolvedModel::Default));
+        assert!(matches!(resolve_model_input("default", &e), ResolvedModel::Default));
         // Full id of a known entry accepted
-        assert_eq!(
-            id(resolve_model_input("us.anthropic.claude-opus-4-7")),
-            "us.anthropic.claude-opus-4-7"
-        );
+        assert_eq!(id(resolve_model_input("us.anthropic.claude-opus-4-7", &e)), "us.anthropic.claude-opus-4-7");
         // Whitespace collapsed inside labels
-        assert_eq!(
-            id(resolve_model_input("  opus  4.7  ")),
-            "us.anthropic.claude-opus-4-7"
-        );
-        assert_eq!(
-            id(resolve_model_input("opus4.7")),
-            "us.anthropic.claude-opus-4-7"
-        );
-        assert_eq!(
-            id(resolve_model_input("OPUS4.7")),
-            "us.anthropic.claude-opus-4-7"
-        );
-        // Extended whitelist: CLI short name accepted (passed through to CLI
-        // which will normalise internally).
-        assert_eq!(
-            id(resolve_model_input("claude-opus-4-7")),
-            "claude-opus-4-7"
-        );
-        assert_eq!(
-            id(resolve_model_input("claude-sonnet-4-5-20250929")),
-            "claude-sonnet-4-5-20250929"
-        );
+        assert_eq!(id(resolve_model_input("  opus  4.7  ", &e)), "us.anthropic.claude-opus-4-7");
+        assert_eq!(id(resolve_model_input("opus4.7", &e)), "us.anthropic.claude-opus-4-7");
+        assert_eq!(id(resolve_model_input("OPUS4.7", &e)), "us.anthropic.claude-opus-4-7");
+        // Extended whitelist: CLI short name
+        assert_eq!(id(resolve_model_input("claude-opus-4-7", &e)), "claude-opus-4-7");
+        assert_eq!(id(resolve_model_input("claude-sonnet-4-5-20250929", &e)), "claude-sonnet-4-5-20250929");
         // Extended whitelist: older Bedrock ids not in the menu still accepted
         assert_eq!(
-            id(resolve_model_input(
-                "us.anthropic.claude-opus-4-5-20251101-v1:0"
-            )),
+            id(resolve_model_input("us.anthropic.claude-opus-4-5-20251101-v1:0", &e)),
             "us.anthropic.claude-opus-4-5-20251101-v1:0"
         );
-        // Anything else rejected (no passthrough)
-        assert!(matches!(
-            resolve_model_input("xyz-model"),
-            ResolvedModel::Unrecognized
-        ));
-        assert!(matches!(
-            resolve_model_input("opus 12345"),
-            ResolvedModel::Unrecognized
-        ));
-        assert!(matches!(
-            resolve_model_input("opus 5"),
-            ResolvedModel::Unrecognized
-        ));
-        assert!(matches!(
-            resolve_model_input("random text"),
-            ResolvedModel::Unrecognized
-        ));
-        assert!(matches!(
-            resolve_model_input("us.anthropic.claude-opus-9-9"),
-            ResolvedModel::Unrecognized
-        ));
+        // Built-in aliases for DashScope models
+        assert_eq!(id(resolve_model_input("deepseek", &e)), "deepseek-v4-pro");
+        assert_eq!(id(resolve_model_input("ds", &e)), "deepseek-v4-pro");
+        assert_eq!(id(resolve_model_input("qwen", &e)), "qwen3.6-plus");
+        assert_eq!(id(resolve_model_input("kimi", &e)), "kimi-k2.6");
+        assert_eq!(id(resolve_model_input("glm", &e)), "glm-5.1");
+        // Anything else rejected
+        assert!(matches!(resolve_model_input("xyz-model", &e), ResolvedModel::Unrecognized));
+        assert!(matches!(resolve_model_input("opus 12345", &e), ResolvedModel::Unrecognized));
+        assert!(matches!(resolve_model_input("opus 5", &e), ResolvedModel::Unrecognized));
+        assert!(matches!(resolve_model_input("random text", &e), ResolvedModel::Unrecognized));
+        assert!(matches!(resolve_model_input("us.anthropic.claude-opus-9-9", &e), ResolvedModel::Unrecognized));
+    }
+
+    #[test]
+    fn resolve_model_input_with_config_extras() {
+        fn id(r: ResolvedModel) -> String {
+            match r {
+                ResolvedModel::Id(s) => s,
+                ResolvedModel::Default => "__DEFAULT__".to_string(),
+                ResolvedModel::Unrecognized => "__UNRECOGNIZED__".to_string(),
+            }
+        }
+        let mut e = model_entries();
+        e.push(ModelEntry {
+            label: "MyCustom".into(),
+            desc: "test".into(),
+            full_id: Some("custom-model-v1".into()),
+            provider: Some("custom".into()),
+            aliases: vec!["mc".into(), "custom".into()],
+        });
+        assert_eq!(id(resolve_model_input("mc", &e)), "custom-model-v1");
+        assert_eq!(id(resolve_model_input("custom", &e)), "custom-model-v1");
+        assert_eq!(id(resolve_model_input("MyCustom", &e)), "custom-model-v1");
+        assert_eq!(id(resolve_model_input("custom-model-v1", &e)), "custom-model-v1");
+        // Numeric index for the extra entry (11th)
+        assert_eq!(id(resolve_model_input("11", &e)), "custom-model-v1");
+        // Built-in models still work
+        assert_eq!(id(resolve_model_input("opus", &e)), "us.anthropic.claude-opus-4-7");
     }
 
     #[test]
