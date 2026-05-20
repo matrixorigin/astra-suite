@@ -112,7 +112,8 @@ impl CodexAppPool {
 
         if let CliProfile::Codex { model, sandbox, .. } = profile {
             if let Some(model) = model {
-                params["model"] = Value::String(model.clone());
+                params["model"] =
+                    Value::String(model.strip_prefix("@taas/").unwrap_or(model).to_string());
             }
             params["sandboxPolicy"] = sandbox_policy_json(sandbox, working_dir);
         }
@@ -400,7 +401,8 @@ fn thread_start_params(
     } = profile
     {
         if let Some(model) = model {
-            params["model"] = Value::String(model.clone());
+            params["model"] =
+                Value::String(model.strip_prefix("@taas/").unwrap_or(model).to_string());
         }
         params["sandbox"] = Value::String(sandbox.clone());
         params["ephemeral"] = Value::Bool(*ephemeral);
@@ -432,7 +434,8 @@ fn thread_resume_params(
 
     if let CliProfile::Codex { model, sandbox, .. } = profile {
         if let Some(model) = model {
-            params["model"] = Value::String(model.clone());
+            params["model"] =
+                Value::String(model.strip_prefix("@taas/").unwrap_or(model).to_string());
         }
         params["sandbox"] = Value::String(sandbox.clone());
     }

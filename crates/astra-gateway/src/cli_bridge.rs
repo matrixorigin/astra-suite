@@ -558,6 +558,8 @@ impl CliProfile {
                     cmd.arg("--ephemeral");
                 }
                 if let Some(m) = model {
+                    // Strip @provider/ prefix used internally for disambiguation
+                    let m = m.strip_prefix("@taas/").unwrap_or(m);
                     cmd.arg("--model").arg(m);
                 }
                 for arg in extra_args {
