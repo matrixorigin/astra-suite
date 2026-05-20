@@ -150,6 +150,7 @@ impl CliProcessPool {
             .unwrap_or(false)
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn spawn(
         &mut self,
         key: &str,

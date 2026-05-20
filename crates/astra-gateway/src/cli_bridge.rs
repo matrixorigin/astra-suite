@@ -1627,6 +1627,7 @@ pub async fn run_cli(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run_cli_with_context(
     profile: &CliProfile,
     message: &str,

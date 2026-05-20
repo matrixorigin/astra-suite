@@ -2177,10 +2177,10 @@ pub(crate) fn resolve_model_input(input: &str, entries: &[ModelEntry]) -> Resolv
 
     // Exact id match against entries (case-insensitive).
     for entry in entries {
-        if let Some(id) = &entry.full_id {
-            if trimmed.eq_ignore_ascii_case(id) {
-                return ResolvedModel::Id(id.clone());
-            }
+        if let Some(id) = &entry.full_id
+            && trimmed.eq_ignore_ascii_case(id)
+        {
+            return ResolvedModel::Id(id.clone());
         }
     }
 
