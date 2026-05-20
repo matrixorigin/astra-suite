@@ -25,8 +25,8 @@ providers:
       CLAUDE_CODE_USE_BEDROCK: "1"
       AWS_REGION: "us-east-1"
       AWS_BEARER_TOKEN_BEDROCK: ""    # ← FILL ME (Bedrock bearer token)
-  dashscope:
-    env:
+    dashscope:
+     env:
       ANTHROPIC_API_KEY: ""           # ← FILL ME (DashScope API key)
       ANTHROPIC_BASE_URL: "https://dashscope.aliyuncs.com/apps/anthropic"
 

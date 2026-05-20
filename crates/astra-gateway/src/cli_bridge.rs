@@ -2604,7 +2604,7 @@ launcher:
             None,
             Some(Duration::from_millis(50)),
             None,
-        None,
+            None,
         )
         .await
         .unwrap_err();
@@ -2634,7 +2634,7 @@ launcher:
             Some("req-1"),
             None,
             None,
-        None,
+            None,
         )
         .await
         .unwrap();
@@ -2661,7 +2661,7 @@ launcher:
             None,
             None,
             Some("test-token-xyz"),
-        None,
+            None,
         )
         .await
         .unwrap();
@@ -2681,8 +2681,7 @@ launcher:
             session_id_field: None,
         };
         let r = run_cli_with_context_trace_and_timeout(
-            &p, "ignored", None, None, None, None, None, None, None, None,
-        None,
+            &p, "ignored", None, None, None, None, None, None, None, None, None,
         )
         .await
         .unwrap();
@@ -2728,8 +2727,7 @@ printf '%s\n' '{"type":"assistant.message_delta","data":{"deltaContent":"from sc
             extra_args: vec![],
         };
         let r = run_cli_with_context_trace_and_timeout(
-            &p, "ignored", None, None, None, None, None, None, None, None,
-        None,
+            &p, "ignored", None, None, None, None, None, None, None, None, None,
         )
         .await
         .unwrap();
