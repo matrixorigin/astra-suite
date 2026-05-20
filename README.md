@@ -70,18 +70,25 @@ astra-suite/
 ## Development
 
 ```bash
-make build          # compile workspace
-make check          # format + clippy + 848 tests (~6s)
-make test           # tests only
+make help           # show all targets
+make build          # compile workspace (all targets)
+make release        # release build (astra-gateway only)
+make check          # format + clippy + test (full CI)
+make test           # fast offline tests
+make test-live      # all tests including live integrations
 make format         # auto-format
-make lint           # fmt check + clippy (CI)
+make lint           # fmt check + clippy (CI gate)
 ```
 
 ```bash
-make run            # start gateway (background)
-make stop           # stop
+make init           # generate gateway config + release build
+make run            # start gateway (auto-inits config if missing)
+make stop           # graceful shutdown
 make restart        # stop + start
 make log            # tail -f gateway log
+make login-weixin   # WeChat QR login
+make setup          # run gateway setup script
+make clean          # remove all build artifacts
 ```
 
 ## Roadmap
