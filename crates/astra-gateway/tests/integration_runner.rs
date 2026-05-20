@@ -305,7 +305,6 @@ impl TestGateway {
             project_dirs: vec![],
             system_prompt_extra: None,
             api_port: None,
-            extra_models: vec![],
         }
     }
 }
@@ -688,7 +687,6 @@ async fn runner_init_invalid_config_errors() {
         project_dirs: vec![],
         system_prompt_extra: None,
         api_port: None,
-        extra_models: vec![],
     };
 
     let result = GatewayRunner::new(config).await;
@@ -969,7 +967,7 @@ async fn handle_fast_upserts_user_for_first_time_slash_command() {
         "user row should have been upserted by handle_fast"
     );
     let cli_name = gw.runner.cli_profile().name();
-    let key = astra_gateway::store::model_preference_key(cli_name);
+    let key = astra_gateway::store::model_preference_key(cli_name, Some("chat-nc"));
     let stored = store
         .get_user_preference("mock", "newcomer", &key)
         .await
@@ -995,7 +993,7 @@ async fn per_user_model_override_isolated() {
     // Verify preference was stored for alice
     let store = gw.runner.store().unwrap();
     let cli_name = gw.runner.cli_profile().name();
-    let key = astra_gateway::store::model_preference_key(cli_name);
+    let key = astra_gateway::store::model_preference_key(cli_name, Some("chat-model-a"));
     let alice_model = store
         .get_user_preference("mock", "alice", &key)
         .await
@@ -1013,6 +1011,36 @@ async fn per_user_model_override_isolated() {
         "alice's /model should have persisted (handle_fast must upsert)"
     );
     assert_ne!(alice_model, bob_model, "model overrides should be per-user");
+}
+
+#[tokio::test]
+async fn same_user_model_override_is_scoped_by_chat() {
+    let gw = TestGateway::new().await;
+    let store = gw.runner.store().unwrap();
+    let cli_name = gw.runner.cli_profile().name();
+
+    let first = msg("chat-one", "alice", "/model opus");
+    let second = msg("chat-two", "alice", "/model haiku");
+    assert!(gw.runner.handle_fast(&first).await.unwrap().is_some());
+    assert!(gw.runner.handle_fast(&second).await.unwrap().is_some());
+
+    let key_one = astra_gateway::store::model_preference_key(cli_name, Some("chat-one"));
+    let key_two = astra_gateway::store::model_preference_key(cli_name, Some("chat-two"));
+    let model_one = store
+        .get_user_preference("mock", "alice", &key_one)
+        .await
+        .unwrap();
+    let model_two = store
+        .get_user_preference("mock", "alice", &key_two)
+        .await
+        .unwrap();
+
+    assert_eq!(model_one.as_deref(), Some("us.anthropic.claude-opus-4-7"));
+    assert_eq!(
+        model_two.as_deref(),
+        Some("us.anthropic.claude-haiku-4-5-20251001-v1:0")
+    );
+    assert_ne!(model_one, model_two);
 }
 
 #[tokio::test]

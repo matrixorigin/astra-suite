@@ -174,20 +174,6 @@ providers:
 #   api_key: ""
 #   default_model: "MiniMax-M2.7"
 
-# ─── Extra Models (optional) ────────────────────────────────────────────────
-#
-# Models listed here appear in the /model menu alongside built-in entries.
-# The `id` is passed as-is via --model to the CLI binary.
-# `aliases` are optional shorthand names for quick `/model <alias>` switching.
-# `provider` links to a providers: entry for env injection.
-
-# extra_models:
-#   - label: "My Model"
-#     desc: "自定义 · MyProvider"
-#     id: "my-model-v1"
-#     provider: "my_provider"
-#     aliases: ["mm", "mymodel"]
-
 # ─── Concurrency ────────────────────────────────────────────────────────────
 #
 # Max parallel CLI runs across all users. Same-session messages still serialize

@@ -588,8 +588,8 @@ impl GatewayRunner {
         &self,
         platform: &str,
         user_id: &str,
+        chat_id: &str,
     ) -> (CliProfile, Option<crate::config::ProviderConfig>) {
-
         let mut profile = if let Some(ref store) = self.store
             && let Ok(Some(name)) = store
                 .get_user_preference(platform, user_id, "cli_profile")
@@ -601,8 +601,7 @@ impl GatewayRunner {
             self.cli_profile.clone()
         };
 
-
-        let model_key = store::model_preference_key(profile.name());
+        let model_key = store::model_preference_key(profile.name(), Some(chat_id));
 
         if let Some(ref store) = self.store
             && let Ok(Some(model_name)) = store
@@ -682,13 +681,13 @@ impl GatewayRunner {
 
         // Resolve active CLI profile
 
-        let (cli_profile, _provider_config) =
-            self.resolve_cli_profile(msg.platform, &msg.user_id).await;
+        let (cli_profile, _provider_config) = self
+            .resolve_cli_profile(msg.platform, &msg.user_id, &effective_chat_id)
+            .await;
         let entries = crate::commands::all_model_entries(&self.config);
         let provider_name = cli_profile
             .model_name()
             .and_then(|mid| crate::commands::model_provider(mid, &entries));
-
 
         let trimmed = msg.text.trim();
 
@@ -849,10 +848,9 @@ impl GatewayRunner {
             msg.chat_id.clone()
         };
 
-
-        let (cli_profile, provider_config) =
-            self.resolve_cli_profile(msg.platform, &msg.user_id).await;
-
+        let (cli_profile, provider_config) = self
+            .resolve_cli_profile(msg.platform, &msg.user_id, &effective_chat_id)
+            .await;
 
         // Check first-time user BEFORE upsert (upsert creates the row)
         let is_first = if let Some(ref store) = self.store {
@@ -2546,12 +2544,12 @@ impl GatewayRunner {
         msg: InboundMessage,
         profile_override: Option<&str>,
     ) -> QueuedRequest {
-
-        let (resolved, _provider_config) =
-            self.resolve_cli_profile(msg.platform, &msg.user_id).await;
+        let effective_chat_id = self.effective_chat_id(&msg);
+        let (resolved, _provider_config) = self
+            .resolve_cli_profile(msg.platform, &msg.user_id, &effective_chat_id)
+            .await;
 
         let conv_profile = profile_override.unwrap_or(resolved.name());
-        let effective_chat_id = self.effective_chat_id(&msg);
         let conversation = ConversationKey::new(msg.platform, effective_chat_id, conv_profile);
         let trace = if let Some(repo) = self.trace_repo.as_ref() {
             let request = GatewayRequest::new(

@@ -97,8 +97,7 @@ impl CronScheduler {
             }
             // once_exec and recurring cron both invoke the agent below
 
-            let (cli_profile, provider_config) =
-                self.resolve_cli_profile(platform, &user_id).await;
+            let (cli_profile, provider_config) = self.resolve_cli_profile(platform, &user_id).await;
             let cli_name = cli_profile.name().to_string();
             let workspace = self.resolve_workspace(platform, &user_id).await;
             let session_id = self
@@ -230,7 +229,7 @@ impl CronScheduler {
         } else {
             self.config.cli.clone()
         };
-        let model_key = store::model_preference_key(profile.name());
+        let model_key = store::model_preference_key(profile.name(), None);
         if let Ok(Some(model_name)) = self
             .store
             .get_user_preference(platform, user_id, &model_key)

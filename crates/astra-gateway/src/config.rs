@@ -64,20 +64,6 @@ pub struct GatewayConfig {
     /// HTTP API port for message injection (e.g. 9090). Disabled when absent.
     #[serde(default)]
     pub api_port: Option<u16>,
-    /// Extra models shown in the `/model` menu alongside built-in entries.
-    #[serde(default)]
-    pub extra_models: Vec<ExtraModelEntry>,
-}
-
-#[derive(Debug, Clone, serde::Deserialize)]
-pub struct ExtraModelEntry {
-    pub label: String,
-    pub desc: String,
-    pub id: String,
-    #[serde(default)]
-    pub provider: Option<String>,
-    #[serde(default)]
-    pub aliases: Vec<String>,
 }
 
 #[derive(Clone, Default, serde::Deserialize)]
@@ -168,7 +154,11 @@ impl std::fmt::Debug for ProviderConfig {
             .env
             .iter()
             .map(|(k, v)| {
-                let display = if v.is_empty() { "(empty)" } else { "[REDACTED]" };
+                let display = if v.is_empty() {
+                    "(empty)"
+                } else {
+                    "[REDACTED]"
+                };
                 (k, display)
             })
             .collect();

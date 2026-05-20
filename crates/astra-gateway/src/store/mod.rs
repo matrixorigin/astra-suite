@@ -562,12 +562,25 @@ pub fn cron_dow_to_chrono(cron_day: u32) -> u32 {
 }
 
 /// Build a JSON-path-safe preference key for per-CLI model overrides.
-pub fn model_preference_key(cli_name: &str) -> String {
+///
+/// When `chat_id` is `Some`, the key is scoped to the conversation so that
+/// `/model` in different group chats do not overwrite each other. When `None`
+/// (scheduler cron jobs), the unscoped legacy key is used.
+pub fn model_preference_key(cli_name: &str, chat_id: Option<&str>) -> String {
     let safe: String = cli_name
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
         .collect();
-    format!("model_override_{safe}")
+    match chat_id {
+        Some(chat) => {
+            let safe_chat: String = chat
+                .chars()
+                .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+                .collect();
+            format!("model_override_{safe}_{safe_chat}")
+        }
+        None => format!("model_override_{safe}"),
+    }
 }
 
 // ─── Storage configuration ────────────────────────────────────────────────
@@ -918,15 +931,26 @@ mod tests {
 
     #[test]
     fn model_override_key_basic() {
-        assert_eq!(model_preference_key("astra"), "model_override_astra");
-        assert_eq!(model_preference_key("claude"), "model_override_claude");
-        assert_eq!(model_preference_key("codex"), "model_override_codex");
+        assert_eq!(model_preference_key("astra", None), "model_override_astra");
+        assert_eq!(
+            model_preference_key("claude", None),
+            "model_override_claude"
+        );
+        assert_eq!(model_preference_key("codex", None), "model_override_codex");
+    }
+
+    #[test]
+    fn model_override_key_scoped() {
+        assert_eq!(
+            model_preference_key("claude", Some("group-123")),
+            "model_override_claude_group_123"
+        );
     }
 
     #[test]
     fn model_override_key_uses_underscore_separator() {
         for cli_name in &["astra", "claude", "codex"] {
-            let key = model_preference_key(cli_name);
+            let key = model_preference_key(cli_name, None);
             assert!(
                 key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'),
                 "key must be alphanumeric + underscore only: {key}"
@@ -937,11 +961,11 @@ mod tests {
     #[test]
     fn model_override_key_sanitizes_special_chars() {
         assert_eq!(
-            model_preference_key("/opt/my-cli.v2"),
+            model_preference_key("/opt/my-cli.v2", None),
             "model_override__opt_my_cli_v2"
         );
         assert_eq!(
-            model_preference_key("some:tool"),
+            model_preference_key("some:tool", None),
             "model_override_some_tool"
         );
     }
