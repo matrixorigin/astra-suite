@@ -141,8 +141,19 @@ selected CLI explicitly exposes; WeChat renders them as separate text blocks.
 ## Development
 
 ```bash
-cargo test --workspace         # unit + integration tests (700+)
-cargo clippy --workspace --all-targets
+# From workspace root — see Makefile for all targets
+make build          # cargo build --workspace --all-targets
+make release        # cargo build --release -p astra-gateway
+make check          # format + clippy + test (full CI)
+make test           # unit + integration tests (700+)
+make lint           # fmt --check + clippy -D warnings
+```
+
+Or directly:
+
+```bash
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
 cargo build --release -p astra-gateway
 ```
 
