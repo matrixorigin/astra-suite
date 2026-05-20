@@ -616,7 +616,7 @@ impl GatewayRunner {
             profile.set_model_override(model_name);
         }
 
-        let entries = crate::commands::all_model_entries(&self.config);
+        let entries = crate::commands::all_model_entries(&self.config, profile.name());
         let provider = profile
             .model_name()
             .and_then(|mid| crate::commands::model_provider(mid, &entries))
@@ -687,7 +687,7 @@ impl GatewayRunner {
         let (cli_profile, _provider_config) = self
             .resolve_cli_profile(msg.platform, &msg.user_id, &effective_chat_id)
             .await;
-        let entries = crate::commands::all_model_entries(&self.config);
+        let entries = crate::commands::all_model_entries(&self.config, cli_profile.name());
         let provider_name = cli_profile
             .model_name()
             .and_then(|mid| crate::commands::model_provider(mid, &entries));
@@ -805,7 +805,7 @@ impl GatewayRunner {
                 // resolved to a valid model. Otherwise the user just gets an
                 // error message back and the existing session stays warm.
                 let should_kill = if let Some(arg) = msg.text.strip_prefix("/model ") {
-                    let entries = commands::all_model_entries(&self.config);
+                    let entries = commands::all_model_entries(&self.config, cli_profile.name());
                     !matches!(
                         commands::resolve_model_input(arg, &entries),
                         commands::ResolvedModel::Unrecognized

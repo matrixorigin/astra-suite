@@ -237,7 +237,7 @@ impl CronScheduler {
         {
             profile.set_model_override(model_name);
         }
-        let entries = crate::commands::all_model_entries(&self.config);
+        let entries = crate::commands::all_model_entries(&self.config, profile.name());
         let provider = profile
             .model_name()
             .and_then(|mid| crate::commands::model_provider(mid, &entries))
