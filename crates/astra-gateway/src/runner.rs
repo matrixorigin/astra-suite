@@ -587,7 +587,12 @@ impl GatewayRunner {
     ///
     /// `chat_id` scopes `/model` preferences to the conversation so that
     /// different group chats do not interfere with each other.
-    async fn resolve_cli_profile(&self, platform: &str, user_id: &str, chat_id: &str) -> CliProfile {
+    async fn resolve_cli_profile(
+        &self,
+        platform: &str,
+        user_id: &str,
+        chat_id: &str,
+    ) -> (CliProfile, Option<crate::config::ProviderConfig>) {
         let mut profile = if let Some(ref store) = self.store
             && let Ok(Some(name)) = store
                 .get_user_preference(platform, user_id, "cli_profile")
@@ -611,7 +616,13 @@ impl GatewayRunner {
             profile.set_model_override(model_name);
         }
 
-        profile
+        let entries = crate::commands::all_model_entries(&self.config);
+        let provider = profile
+            .model_name()
+            .and_then(|mid| crate::commands::model_provider(mid, &entries))
+            .and_then(|pn| self.config.providers.get(&pn).cloned());
+
+        (profile, provider)
     }
 
     /// Fast path: access control + slash commands. Returns Some if handled (no CLI needed).
@@ -673,7 +684,13 @@ impl GatewayRunner {
         };
 
         // Resolve active CLI profile
-        let cli_profile = self.resolve_cli_profile(msg.platform, &msg.user_id, &msg.chat_id).await;
+        let (cli_profile, _provider_config) = self
+            .resolve_cli_profile(msg.platform, &msg.user_id, &effective_chat_id)
+            .await;
+        let entries = crate::commands::all_model_entries(&self.config);
+        let provider_name = cli_profile
+            .model_name()
+            .and_then(|mid| crate::commands::model_provider(mid, &entries));
 
         let trimmed = msg.text.trim();
 
@@ -711,6 +728,7 @@ impl GatewayRunner {
                     chat_id: &effective_chat_id,
                     user_id: &msg.user_id,
                     resolved_cli: &cli_profile,
+                    resolved_provider: provider_name.as_deref(),
                     durable_store: self
                         .durable_store
                         .as_ref()
@@ -759,6 +777,7 @@ impl GatewayRunner {
             chat_id: &effective_chat_id,
             user_id: &msg.user_id,
             resolved_cli: &cli_profile,
+            resolved_provider: provider_name.as_deref(),
             durable_store: self
                 .durable_store
                 .as_ref()
@@ -786,8 +805,9 @@ impl GatewayRunner {
                 // resolved to a valid model. Otherwise the user just gets an
                 // error message back and the existing session stays warm.
                 let should_kill = if let Some(arg) = msg.text.strip_prefix("/model ") {
+                    let entries = commands::all_model_entries(&self.config);
                     !matches!(
-                        commands::resolve_model_input(arg),
+                        commands::resolve_model_input(arg, &entries),
                         commands::ResolvedModel::Unrecognized
                     )
                 } else {
@@ -831,7 +851,9 @@ impl GatewayRunner {
             msg.chat_id.clone()
         };
 
-        let cli_profile = self.resolve_cli_profile(msg.platform, &msg.user_id, &msg.chat_id).await;
+        let (cli_profile, provider_config) = self
+            .resolve_cli_profile(msg.platform, &msg.user_id, &effective_chat_id)
+            .await;
 
         // Check first-time user BEFORE upsert (upsert creates the row)
         let is_first = if let Some(ref store) = self.store {
@@ -1174,6 +1196,7 @@ impl GatewayRunner {
             let token = access_token.clone();
             let kill_token = cancel_token.clone();
             let mcp_cfg = mcp_config_path.clone();
+            let pc = provider_config.clone();
 
             tokio::spawn(async move {
                 let mut pool_guard = pool.lock().await;
@@ -1186,6 +1209,7 @@ impl GatewayRunner {
                         Some(&sp),
                         token.as_deref(),
                         mcp_cfg.as_deref(),
+                        pc.as_ref(),
                     )
                     .await?;
                 drop(pool_guard); // release lock before reading progress
@@ -1362,6 +1386,7 @@ impl GatewayRunner {
             let kill_token = cancel_token.clone();
             let trace_id_str = trace.as_ref().map(|t| t.trace_id.to_string());
             let request_id_str = trace.as_ref().map(|t| t.request_id.to_string());
+            let pc = provider_config.clone();
             tokio::spawn(async move {
                 cli_bridge::run_cli_with_cancel(
                     &profile,
@@ -1375,6 +1400,7 @@ impl GatewayRunner {
                     Some(cli_timeout),
                     token.as_deref(),
                     Some(kill_token),
+                    pc.as_ref(),
                 )
                 .await
             })
@@ -1820,6 +1846,7 @@ impl GatewayRunner {
                         None,
                         Some(&system_prompt),
                         access_token.as_deref(),
+                        None,
                     )
                     .await
                 }
@@ -2520,9 +2547,12 @@ impl GatewayRunner {
         msg: InboundMessage,
         profile_override: Option<&str>,
     ) -> QueuedRequest {
-        let resolved = self.resolve_cli_profile(msg.platform, &msg.user_id, &msg.chat_id).await;
-        let conv_profile = profile_override.unwrap_or(resolved.name());
         let effective_chat_id = self.effective_chat_id(&msg);
+        let (resolved, _provider_config) = self
+            .resolve_cli_profile(msg.platform, &msg.user_id, &effective_chat_id)
+            .await;
+
+        let conv_profile = profile_override.unwrap_or(resolved.name());
         let conversation = ConversationKey::new(msg.platform, effective_chat_id, conv_profile);
         let trace = if let Some(repo) = self.trace_repo.as_ref() {
             let request = GatewayRequest::new(

@@ -17,6 +17,11 @@ pub struct GatewayConfig {
     /// Named CLI profiles available for /cli switch.
     #[serde(default)]
     pub cli_profiles: std::collections::HashMap<String, crate::cli_bridge::CliProfile>,
+    /// Model provider configurations. Maps provider name (e.g. "bedrock",
+    /// "dashscope") to the env vars injected at CLI spawn when a model
+    /// belonging to that provider is selected via /model.
+    #[serde(default)]
+    pub providers: std::collections::HashMap<String, ProviderConfig>,
     /// Maximum seconds a spawned CLI may run for one gateway message.
     #[serde(default = "default_cli_timeout_secs")]
     pub cli_timeout_secs: u64,
@@ -130,6 +135,38 @@ impl std::fmt::Debug for AstraServerConfig {
 
 fn default_base_url() -> String {
     "http://localhost:8080".into()
+}
+
+/// Environment variables injected into the CLI process when a model belonging
+/// to this provider is selected via /model. Provider env is layered on top of
+/// cli.env (provider wins on key conflict).
+#[derive(Clone, Default, serde::Deserialize)]
+pub struct ProviderConfig {
+    #[serde(default)]
+    pub env: std::collections::BTreeMap<String, String>,
+    #[serde(default)]
+    pub env_file: Option<String>,
+}
+
+impl std::fmt::Debug for ProviderConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let redacted: std::collections::BTreeMap<_, _> = self
+            .env
+            .iter()
+            .map(|(k, v)| {
+                let display = if v.is_empty() {
+                    "(empty)"
+                } else {
+                    "[REDACTED]"
+                };
+                (k, display)
+            })
+            .collect();
+        f.debug_struct("ProviderConfig")
+            .field("env", &redacted)
+            .field("env_file", &self.env_file)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Default, serde::Deserialize)]

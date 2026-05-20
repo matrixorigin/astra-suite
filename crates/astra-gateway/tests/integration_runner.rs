@@ -290,6 +290,7 @@ impl TestGateway {
                 text_field: Some("text".into()),
             },
             cli_profiles: std::collections::HashMap::new(),
+            providers: std::collections::HashMap::new(),
             cli_timeout_secs: 30,
             platforms: PlatformConfigs::default(),
             skills_dir: None,
@@ -671,6 +672,7 @@ async fn runner_init_invalid_config_errors() {
             text_field: None,
         },
         cli_profiles: std::collections::HashMap::new(),
+        providers: std::collections::HashMap::new(),
         cli_timeout_secs: 30,
         platforms: PlatformConfigs::default(),
         skills_dir: None,
@@ -1012,6 +1014,36 @@ async fn per_user_model_override_isolated() {
 }
 
 #[tokio::test]
+async fn same_user_model_override_is_scoped_by_chat() {
+    let gw = TestGateway::new().await;
+    let store = gw.runner.store().unwrap();
+    let cli_name = gw.runner.cli_profile().name();
+
+    let first = msg("chat-one", "alice", "/model opus");
+    let second = msg("chat-two", "alice", "/model haiku");
+    assert!(gw.runner.handle_fast(&first).await.unwrap().is_some());
+    assert!(gw.runner.handle_fast(&second).await.unwrap().is_some());
+
+    let key_one = astra_gateway::store::model_preference_key(cli_name, Some("chat-one"));
+    let key_two = astra_gateway::store::model_preference_key(cli_name, Some("chat-two"));
+    let model_one = store
+        .get_user_preference("mock", "alice", &key_one)
+        .await
+        .unwrap();
+    let model_two = store
+        .get_user_preference("mock", "alice", &key_two)
+        .await
+        .unwrap();
+
+    assert_eq!(model_one.as_deref(), Some("us.anthropic.claude-opus-4-7"));
+    assert_eq!(
+        model_two.as_deref(),
+        Some("us.anthropic.claude-haiku-4-5-20251001-v1:0")
+    );
+    assert_ne!(model_one, model_two);
+}
+
+#[tokio::test]
 async fn per_user_cli_switch_isolated() {
     let fake_cli = create_fake_cli_script("cli switch test");
     let mut config = TestGateway::build_config(&script_path(&fake_cli));
@@ -1207,6 +1239,7 @@ async fn cli_timeout_returns_error_message() {
         None,
         None,
         Some(Duration::from_secs(1)),
+        None,
         None,
     )
     .await;

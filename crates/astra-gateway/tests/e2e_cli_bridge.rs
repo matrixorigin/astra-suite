@@ -245,6 +245,7 @@ async fn e2e_astra_append_system_prompt_canary() {
         None,
         Some(&system_prompt),
         None,
+        None,
     )
     .await
     .expect("astra should succeed");
@@ -273,6 +274,7 @@ async fn e2e_claude_append_system_prompt_canary() {
         None,
         None,
         Some(&system_prompt),
+        None,
         None,
     )
     .await
@@ -305,6 +307,7 @@ Do it NOW for the user's request."#;
         None,
         Some(system_prompt),
         None,
+        None,
     )
     .await
     .expect("astra should succeed");
@@ -333,6 +336,7 @@ async fn e2e_astra_task_list_via_agent() {
         None,
         Some(system),
         None,
+        None,
     )
     .await
     .expect("should succeed");
@@ -360,6 +364,7 @@ Do it now."#;
         None,
         Some(system),
         None,
+        None,
     )
     .await
     .expect("should succeed");
@@ -386,6 +391,7 @@ Do it now for the user's request."#;
         None,
         None,
         Some(system),
+        None,
         None,
     )
     .await

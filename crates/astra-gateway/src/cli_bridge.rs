@@ -767,6 +767,22 @@ fn load_env_file(path: &str) -> Result<Vec<(String, String)>, String> {
     Ok(vars)
 }
 
+/// Apply provider-specific environment variables on top of the CLI profile env.
+pub(crate) fn apply_provider_environment(
+    cmd: &mut Command,
+    pc: &crate::config::ProviderConfig,
+) -> Result<(), String> {
+    if let Some(path) = pc.env_file.as_deref().filter(|p| !p.trim().is_empty()) {
+        for (key, value) in load_env_file(path)? {
+            cmd.env(key, value);
+        }
+    }
+    for (key, value) in &pc.env {
+        cmd.env(key, value);
+    }
+    Ok(())
+}
+
 // ─── JSON parsers ───────────────────────────────────────────────────────────
 
 const ASTRA_REQUIRED_FIELDS: &[&str] = &[
@@ -1606,10 +1622,12 @@ pub async fn run_cli(
         progress_tx,
         None,
         None,
+        None,
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run_cli_with_context(
     profile: &CliProfile,
     message: &str,
@@ -1618,6 +1636,7 @@ pub async fn run_cli_with_context(
     progress_tx: Option<mpsc::Sender<CliProgress>>,
     system_prompt: Option<&str>,
     access_token: Option<&str>,
+    provider_config: Option<&crate::config::ProviderConfig>,
 ) -> Result<CliResult, String> {
     run_cli_with_context_and_timeout(
         profile,
@@ -1628,6 +1647,7 @@ pub async fn run_cli_with_context(
         system_prompt,
         None,
         access_token,
+        provider_config,
     )
     .await
 }
@@ -1642,6 +1662,7 @@ pub async fn run_cli_with_context_and_timeout(
     system_prompt: Option<&str>,
     timeout: Option<Duration>,
     access_token: Option<&str>,
+    provider_config: Option<&crate::config::ProviderConfig>,
 ) -> Result<CliResult, String> {
     run_cli_with_context_trace_and_timeout(
         profile,
@@ -1654,6 +1675,7 @@ pub async fn run_cli_with_context_and_timeout(
         None,
         timeout,
         access_token,
+        provider_config,
     )
     .await
 }
@@ -1670,6 +1692,7 @@ pub async fn run_cli_with_context_trace_and_timeout(
     request_id: Option<&str>,
     timeout: Option<Duration>,
     access_token: Option<&str>,
+    provider_config: Option<&crate::config::ProviderConfig>,
 ) -> Result<CliResult, String> {
     run_cli_with_cancel(
         profile,
@@ -1683,6 +1706,7 @@ pub async fn run_cli_with_context_trace_and_timeout(
         timeout,
         access_token,
         None,
+        provider_config,
     )
     .await
 }
@@ -1702,6 +1726,7 @@ pub async fn run_cli_with_cancel(
     timeout: Option<Duration>,
     access_token: Option<&str>,
     cancel: Option<tokio_util::sync::CancellationToken>,
+    provider_config: Option<&crate::config::ProviderConfig>,
 ) -> Result<CliResult, String> {
     let mut cmd =
         profile.build_command_with_context(message, session_id, working_dir, system_prompt);
@@ -1711,6 +1736,14 @@ pub async fn run_cli_with_cancel(
             profile.name()
         )
     })?;
+    if let Some(pc) = provider_config {
+        apply_provider_environment(&mut cmd, pc).map_err(|e| {
+            format!(
+                "failed to prepare provider environment for `{}`: {e}",
+                profile.name()
+            )
+        })?;
+    }
     if let Some(trace_id) = trace_id {
         cmd.env("ASTRA_GATEWAY_TRACE_ID", trace_id);
     }
@@ -2572,6 +2605,7 @@ launcher:
             None,
             Some(Duration::from_millis(50)),
             None,
+            None,
         )
         .await
         .unwrap_err();
@@ -2601,6 +2635,7 @@ launcher:
             Some("req-1"),
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -2627,6 +2662,7 @@ launcher:
             None,
             None,
             Some("test-token-xyz"),
+            None,
         )
         .await
         .unwrap();
@@ -2646,7 +2682,7 @@ launcher:
             session_id_field: None,
         };
         let r = run_cli_with_context_trace_and_timeout(
-            &p, "ignored", None, None, None, None, None, None, None, None,
+            &p, "ignored", None, None, None, None, None, None, None, None, None,
         )
         .await
         .unwrap();
@@ -2692,7 +2728,7 @@ printf '%s\n' '{"type":"assistant.message_delta","data":{"deltaContent":"from sc
             extra_args: vec![],
         };
         let r = run_cli_with_context_trace_and_timeout(
-            &p, "ignored", None, None, None, None, None, None, None, None,
+            &p, "ignored", None, None, None, None, None, None, None, None, None,
         )
         .await
         .unwrap();

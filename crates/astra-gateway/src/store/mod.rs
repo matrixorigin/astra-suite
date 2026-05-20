@@ -564,7 +564,7 @@ pub fn cron_dow_to_chrono(cron_day: u32) -> u32 {
 /// Build a JSON-path-safe preference key for per-CLI model overrides.
 ///
 /// When `chat_id` is `Some`, the key is scoped to the conversation so that
-/// `/model` in different group chats do not overwrite each other.  When `None`
+/// `/model` in different group chats do not overwrite each other. When `None`
 /// (scheduler cron jobs), the unscoped legacy key is used.
 pub fn model_preference_key(cli_name: &str, chat_id: Option<&str>) -> String {
     let safe: String = cli_name
@@ -931,18 +931,12 @@ mod tests {
 
     #[test]
     fn model_override_key_basic() {
-        assert_eq!(
-            model_preference_key("astra", None),
-            "model_override_astra"
-        );
+        assert_eq!(model_preference_key("astra", None), "model_override_astra");
         assert_eq!(
             model_preference_key("claude", None),
             "model_override_claude"
         );
-        assert_eq!(
-            model_preference_key("codex", None),
-            "model_override_codex"
-        );
+        assert_eq!(model_preference_key("codex", None), "model_override_codex");
     }
 
     #[test]
