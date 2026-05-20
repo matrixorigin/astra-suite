@@ -1302,6 +1302,7 @@ impl GatewayRunner {
             let sp = system_prompt.clone();
             let ws = workspace.clone();
             let kill_token = cancel_token.clone();
+            let pc = provider_config.clone();
 
             tokio::spawn(async move {
                 let mut pool_guard = pool.lock().await;
@@ -1313,6 +1314,7 @@ impl GatewayRunner {
                         sid.as_deref(),
                         ws.as_deref(),
                         Some(&sp),
+                        pc.as_ref(),
                     )
                     .await?;
                 drop(pool_guard);

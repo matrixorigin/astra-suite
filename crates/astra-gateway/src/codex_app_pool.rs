@@ -64,11 +64,19 @@ impl CodexAppPool {
         session_id: Option<&str>,
         working_dir: Option<&Path>,
         system_prompt: Option<&str>,
+        provider_config: Option<&crate::config::ProviderConfig>,
     ) -> Result<mpsc::Receiver<CliProgress>, String> {
         if !self.processes.contains_key(key) || !self.is_alive(key) {
             self.processes.remove(key);
-            self.spawn(key, profile, session_id, working_dir, system_prompt)
-                .await?;
+            self.spawn(
+                key,
+                profile,
+                session_id,
+                working_dir,
+                system_prompt,
+                provider_config,
+            )
+            .await?;
         }
 
         let handle = self.processes.get(key).ok_or("codex app-server missing")?;
@@ -193,9 +201,19 @@ impl CodexAppPool {
         session_id: Option<&str>,
         working_dir: Option<&Path>,
         system_prompt: Option<&str>,
+        provider_config: Option<&crate::config::ProviderConfig>,
     ) -> Result<(), String> {
         let mut cmd = build_app_server_command(profile, working_dir)
             .ok_or("profile does not support codex app-server mode")?;
+
+        profile
+            .apply_runtime_environment(&mut cmd)
+            .map_err(|e| format!("failed to prepare codex CLI environment: {e}"))?;
+        if let Some(pc) = provider_config {
+            crate::cli_bridge::apply_provider_environment(&mut cmd, pc)
+                .map_err(|e| format!("failed to prepare codex provider environment: {e}"))?;
+        }
+
         cmd.stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
@@ -916,6 +934,8 @@ mod tests {
             extra_args: vec![],
             skip_git_repo_check: false,
             ephemeral: true,
+            env: Default::default(),
+            env_file: None,
         };
         let params = thread_start_params(
             &profile,
@@ -947,6 +967,8 @@ mod tests {
             extra_args: vec![],
             skip_git_repo_check: false,
             ephemeral: false,
+            env: Default::default(),
+            env_file: None,
         };
         let params = thread_resume_params("thread-1", &profile, None, None);
         assert_eq!(params["threadId"], "thread-1");

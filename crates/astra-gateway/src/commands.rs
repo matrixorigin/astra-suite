@@ -2092,6 +2092,56 @@ fn model_entries() -> Vec<ModelEntry> {
             provider: Some("dashscope".into()),
             aliases: vec!["glm".into()],
         },
+        // TAAS (via Codex CLI)
+        ModelEntry {
+            label: "DeepSeek V4 Pro (TAAS)".into(),
+            desc: "最强 / 代码 · TAAS".into(),
+            full_id: Some("deepseek-v4-pro".into()),
+            provider: Some("taas".into()),
+            aliases: vec!["t-deepseek".into(), "t-ds".into()],
+        },
+        ModelEntry {
+            label: "Kimi K2.6 (TAAS)".into(),
+            desc: "Moonshot · TAAS".into(),
+            full_id: Some("kimi-k2.6".into()),
+            provider: Some("taas".into()),
+            aliases: vec!["t-kimi".into()],
+        },
+        ModelEntry {
+            label: "GLM 5.1 (TAAS)".into(),
+            desc: "智谱 · TAAS".into(),
+            full_id: Some("glm-5.1".into()),
+            provider: Some("taas".into()),
+            aliases: vec!["t-glm".into()],
+        },
+        ModelEntry {
+            label: "Qwen 3.6 Plus (TAAS)".into(),
+            desc: "通义旗舰 / thinking · TAAS".into(),
+            full_id: Some("qwen3.6-plus".into()),
+            provider: Some("taas".into()),
+            aliases: vec!["t-qwen".into()],
+        },
+        ModelEntry {
+            label: "Qwen 3.6 Flash (TAAS)".into(),
+            desc: "快 / 省 · TAAS".into(),
+            full_id: Some("qwen3.6-flash".into()),
+            provider: Some("taas".into()),
+            aliases: vec![],
+        },
+        ModelEntry {
+            label: "Opus 4.7 (TAAS)".into(),
+            desc: "最强 / 复杂任务 · TAAS".into(),
+            full_id: Some("claude-opus-4-7".into()),
+            provider: Some("taas".into()),
+            aliases: vec![],
+        },
+        ModelEntry {
+            label: "Sonnet 4.6 (TAAS)".into(),
+            desc: "日常任务 · TAAS".into(),
+            full_id: Some("claude-sonnet-4-6".into()),
+            provider: Some("taas".into()),
+            aliases: vec![],
+        },
     ]
 }
 

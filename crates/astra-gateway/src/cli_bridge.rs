@@ -238,6 +238,12 @@ pub enum CliProfile {
         /// Ephemeral mode: don't persist session files to disk.
         #[serde(default)]
         ephemeral: bool,
+        /// Environment variables injected into the spawned `codex` process.
+        #[serde(default)]
+        env: std::collections::BTreeMap<String, String>,
+        /// Optional dotenv-style KEY=VALUE file. Values from `env` override.
+        #[serde(default)]
+        env_file: Option<String>,
     },
     #[serde(rename = "custom")]
     Custom {
@@ -529,6 +535,8 @@ impl CliProfile {
                 extra_args,
                 skip_git_repo_check,
                 ephemeral,
+                env: _,
+                env_file: _,
             } => {
                 let mut cmd = Command::new(bin);
                 if let Some(sid) = session_id {
@@ -558,6 +566,7 @@ impl CliProfile {
                 if let Some(dir) = working_dir {
                     cmd.current_dir(dir);
                 }
+                self.apply_inline_env(&mut cmd);
                 cmd
             }
             Self::Custom {
@@ -690,9 +699,15 @@ impl CliProfile {
                 bin,
                 sandbox,
                 stream_json,
+                env,
+                env_file,
                 ..
             } => {
-                format!("codex:{bin}:sandbox={sandbox}:stream={stream_json}")
+                let env_keys: Vec<&String> = env.keys().collect();
+                format!(
+                    "codex:{bin}:sandbox={sandbox}:stream={stream_json}:\
+                     env_file={env_file:?}:env_keys={env_keys:?}"
+                )
             }
             Self::Custom {
                 bin,
@@ -727,7 +742,7 @@ impl CliProfile {
 
     fn apply_inline_env(&self, cmd: &mut Command) {
         match self {
-            Self::Copilot { env, .. } | Self::Claude { env, .. } => {
+            Self::Copilot { env, .. } | Self::Claude { env, .. } | Self::Codex { env, .. } => {
                 for (key, value) in env {
                     cmd.env(key, value);
                 }
@@ -738,9 +753,9 @@ impl CliProfile {
 
     pub(crate) fn apply_runtime_environment(&self, cmd: &mut Command) -> Result<(), String> {
         let (env_file, env) = match self {
-            Self::Copilot { env_file, env, .. } | Self::Claude { env_file, env, .. } => {
-                (env_file, env)
-            }
+            Self::Copilot { env_file, env, .. }
+            | Self::Claude { env_file, env, .. }
+            | Self::Codex { env_file, env, .. } => (env_file, env),
             _ => return Ok(()),
         };
         if let Some(path) = env_file.as_deref().filter(|p| !p.trim().is_empty()) {
@@ -3163,6 +3178,8 @@ printf '%s\n' '{"type":"assistant.message_delta","data":{"deltaContent":"from sc
             extra_args: vec![],
             skip_git_repo_check: false,
             ephemeral: false,
+            env: Default::default(),
+            env_file: None,
         };
         let cmd = p.build_command("fix the bug", None, None);
         let args: Vec<_> = cmd.as_std().get_args().collect();
@@ -3186,6 +3203,8 @@ printf '%s\n' '{"type":"assistant.message_delta","data":{"deltaContent":"from sc
             extra_args: vec![],
             skip_git_repo_check: true,
             ephemeral: true,
+            env: Default::default(),
+            env_file: None,
         };
         let cmd = p.build_command("follow up", Some("th-abc123"), None);
         let args: Vec<_> = cmd.as_std().get_args().collect();
@@ -3207,6 +3226,8 @@ printf '%s\n' '{"type":"assistant.message_delta","data":{"deltaContent":"from sc
             extra_args: vec!["--quiet".into()],
             skip_git_repo_check: false,
             ephemeral: false,
+            env: Default::default(),
+            env_file: None,
         };
         let cmd = p.build_command("hello", None, None);
         let args: Vec<_> = cmd.as_std().get_args().collect();

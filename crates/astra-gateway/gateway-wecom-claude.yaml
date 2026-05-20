@@ -30,6 +30,18 @@ providers:
       ANTHROPIC_API_KEY: ""           # ← FILL ME (DashScope API key)
       ANTHROPIC_BASE_URL: "https://dashscope.aliyuncs.com/apps/anthropic"
 
+  taas:
+    env:
+      OPENAI_API_KEY: ""           # ← FILL ME (TAAS API key)
+      OPENAI_BASE_URL: "https://catalog.moi.cn-dev.matrixorigin.cn/api/v1/taas/llm"
+
+# Named CLI profiles for /cli switching.
+cli_profiles:
+  codex-taas:
+    type: codex
+    bin: codex
+    stream_json: true
+
 platforms:
   wecom:
     enabled: true
