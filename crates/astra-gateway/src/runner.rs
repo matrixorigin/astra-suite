@@ -584,7 +584,10 @@ impl GatewayRunner {
     }
 
     /// Resolve the active CLI profile for a user (may be overridden via /cli + /model).
-    async fn resolve_cli_profile(&self, platform: &str, user_id: &str) -> CliProfile {
+    ///
+    /// `chat_id` scopes `/model` preferences to the conversation so that
+    /// different group chats do not interfere with each other.
+    async fn resolve_cli_profile(&self, platform: &str, user_id: &str, chat_id: &str) -> CliProfile {
         let mut profile = if let Some(ref store) = self.store
             && let Ok(Some(name)) = store
                 .get_user_preference(platform, user_id, "cli_profile")
@@ -598,7 +601,7 @@ impl GatewayRunner {
 
         // Apply per-user model override scoped to this CLI. Empty string is the
         // "use default" sentinel written by `/model 默认` — treat as no override.
-        let model_key = store::model_preference_key(profile.name());
+        let model_key = store::model_preference_key(profile.name(), Some(chat_id));
         if let Some(ref store) = self.store
             && let Ok(Some(model_name)) = store
                 .get_user_preference(platform, user_id, &model_key)
@@ -670,7 +673,7 @@ impl GatewayRunner {
         };
 
         // Resolve active CLI profile
-        let cli_profile = self.resolve_cli_profile(msg.platform, &msg.user_id).await;
+        let cli_profile = self.resolve_cli_profile(msg.platform, &msg.user_id, &msg.chat_id).await;
 
         let trimmed = msg.text.trim();
 
@@ -828,7 +831,7 @@ impl GatewayRunner {
             msg.chat_id.clone()
         };
 
-        let cli_profile = self.resolve_cli_profile(msg.platform, &msg.user_id).await;
+        let cli_profile = self.resolve_cli_profile(msg.platform, &msg.user_id, &msg.chat_id).await;
 
         // Check first-time user BEFORE upsert (upsert creates the row)
         let is_first = if let Some(ref store) = self.store {
@@ -2517,7 +2520,7 @@ impl GatewayRunner {
         msg: InboundMessage,
         profile_override: Option<&str>,
     ) -> QueuedRequest {
-        let resolved = self.resolve_cli_profile(msg.platform, &msg.user_id).await;
+        let resolved = self.resolve_cli_profile(msg.platform, &msg.user_id, &msg.chat_id).await;
         let conv_profile = profile_override.unwrap_or(resolved.name());
         let effective_chat_id = self.effective_chat_id(&msg);
         let conversation = ConversationKey::new(msg.platform, effective_chat_id, conv_profile);
