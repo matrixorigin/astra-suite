@@ -584,6 +584,9 @@ impl GatewayRunner {
     }
 
     /// Resolve the active CLI profile for a user (may be overridden via /cli + /model).
+    ///
+    /// `chat_id` scopes `/model` preferences to the conversation so that
+    /// different group chats do not interfere with each other.
     async fn resolve_cli_profile(
         &self,
         platform: &str,
@@ -601,8 +604,9 @@ impl GatewayRunner {
             self.cli_profile.clone()
         };
 
+        // Apply per-user model override scoped to this CLI. Empty string is the
+        // "use default" sentinel written by `/model 默认` — treat as no override.
         let model_key = store::model_preference_key(profile.name(), Some(chat_id));
-
         if let Some(ref store) = self.store
             && let Ok(Some(model_name)) = store
                 .get_user_preference(platform, user_id, &model_key)
@@ -680,7 +684,6 @@ impl GatewayRunner {
         };
 
         // Resolve active CLI profile
-
         let (cli_profile, _provider_config) = self
             .resolve_cli_profile(msg.platform, &msg.user_id, &effective_chat_id)
             .await;
