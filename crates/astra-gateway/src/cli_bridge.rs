@@ -423,6 +423,7 @@ impl CliProfile {
                     cmd.arg("--session-id").arg(sid);
                 }
                 if let Some(m) = model {
+                    let m = m.strip_prefix("@taas/").unwrap_or(m);
                     cmd.arg("--model").arg(m);
                 }
                 if let Some(sp) = system_prompt {
