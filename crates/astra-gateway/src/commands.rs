@@ -117,7 +117,7 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
             // by comparing against `config.cli`.
             let resolved_model = ctx.resolved_cli.model_name();
             let yaml_default = ctx.config.cli.model_name();
-            let entries = all_model_entries(ctx.config);
+            let entries = all_model_entries(ctx.config, ctx.resolved_cli.name());
             let model_line = match resolved_model {
                 Some(id) => {
                     let pretty = display_model_name(id, &entries);
@@ -405,7 +405,7 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
             // user has no per-user override, resolve_cli_profile returns this
             // untouched, so current_model == config_default_model.
             let config_default_model = ctx.config.cli.model_name();
-            let entries = all_model_entries(ctx.config);
+            let entries = all_model_entries(ctx.config, ctx.resolved_cli.name());
 
             if arg.is_empty() {
                 let current_display = current_model
@@ -2128,17 +2128,29 @@ fn model_entries() -> Vec<ModelEntry> {
     ]
 }
 
-/// Return model entries filtered by configured providers.
-/// Models whose provider is not in `config.providers` are hidden.
-/// The "默认" entry (provider=None) and bedrock entries (always available
-/// for `cli.type: claude`) are always included.
-pub(crate) fn all_model_entries(config: &crate::config::GatewayConfig) -> Vec<ModelEntry> {
+/// Return model entries filtered by configured providers and active CLI.
+///
+/// - "默认" (provider=None) always appears.
+/// - Bedrock/DashScope (Anthropic-compatible) only appear when using `claude` CLI.
+/// - TAAS (OpenAI-compatible) only appear when using `codex` CLI.
+/// - Other CLI types (astra, copilot, custom) see everything.
+/// - A provider must also be present in `config.providers` (bedrock is exempt).
+pub(crate) fn all_model_entries(
+    config: &crate::config::GatewayConfig,
+    cli_name: &str,
+) -> Vec<ModelEntry> {
     model_entries()
         .into_iter()
         .filter(|e| match &e.provider {
             None => true,
             Some(p) if p == "bedrock" => true,
             Some(p) => config.providers.contains_key(p.as_str()),
+        })
+        .filter(|e| match e.provider.as_deref() {
+            None => true,
+            Some("bedrock") | Some("dashscope") => cli_name != "codex",
+            Some("taas") => cli_name != "claude",
+            _ => true,
         })
         .collect()
 }
@@ -2565,7 +2577,7 @@ mod tests {
         assert!(s.contains("Opus"));
         assert!(s.contains("默认"));
         assert!(s.contains("切换"));
-    });
+    }
 
     #[test]
     fn resolve_model_input_variants() {
@@ -2698,7 +2710,7 @@ mod tests {
     fn all_model_entries_filters_by_provider() {
         let mut config = test_config();
         // No providers configured → only bedrock + default
-        let entries = all_model_entries(&config);
+        let entries = all_model_entries(&config, "claude");
         assert!(
             entries
                 .iter()
@@ -2711,16 +2723,32 @@ mod tests {
         ));
         let bedrock_only_count = entries.len();
 
-        // Add dashscope provider → DashScope models appear
+        // codex CLI without TAAS provider → only default
+        let entries = all_model_entries(&config, "codex");
+        assert!(
+            entries
+                .iter()
+                .all(|e| e.provider.as_deref() != Some("bedrock"))
+        );
+        assert_eq!(entries.len(), 1); // just "默认"
+
+        // Add dashscope provider → DashScope models appear for claude CLI
         config
             .providers
             .insert("dashscope".into(), Default::default());
-        let entries = all_model_entries(&config);
+        let entries = all_model_entries(&config, "claude");
         assert!(entries.len() > bedrock_only_count);
         assert!(entries.iter().any(|e| e.label == "DeepSeek V4 Pro"));
         assert!(entries.iter().any(|e| e.label == "Qwen 3.6+"));
         assert!(entries.iter().any(|e| e.label == "Kimi K2.6"));
 
+        // Add TAAS provider → TAAS models appear for codex CLI
+        config.providers.insert("taas".into(), Default::default());
+        let entries = all_model_entries(&config, "codex");
+        assert!(entries.iter().any(|e| e.label == "DeepSeek V4 Pro (TAAS)"));
+        assert!(entries.iter().any(|e| e.label == "Kimi K2.6 (TAAS)"));
+        // Bedrock/DashScope should NOT appear for codex CLI
+        assert!(!entries.iter().any(|e| e.label == "Sonnet"));
         // Aliases resolve against the filtered list
         fn id(r: ResolvedModel) -> String {
             match r {
