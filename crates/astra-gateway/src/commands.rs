@@ -2,6 +2,7 @@
 
 use crate::access_control::{ActionCapability, ActionSource};
 use crate::cli_bridge::{REASONING_PREF_KEY, ReasoningDisplay};
+use crate::codex_app_pool::{ApprovalDecision, CodexAppPool};
 use crate::config::GatewayConfig;
 use crate::store::{self, GatewayStore};
 use crate::trace_model::{
@@ -11,6 +12,9 @@ use crate::trace_model::{
 use astra_task_store::{
     DurableTask, DurableTaskStatus, DurableTaskStore, TaskFilter, resolve_task_for_owner,
 };
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::Mutex;
 
 pub struct CommandContext<'a> {
     pub astra: &'a astra::Client,
@@ -29,11 +33,15 @@ pub struct CommandContext<'a> {
     pub auth_status: Option<String>,
     /// Active task registry — allows /esc to interrupt live CLI turns.
     pub active_tasks: Option<&'a dashmap::DashMap<String, tokio_util::sync::CancellationToken>>,
+    /// Long-lived Codex/Astra app-server pool, used by approval slash commands.
+    pub(crate) codex_app_pool: Option<&'a Arc<Mutex<CodexAppPool>>>,
     /// Gateway process start time. Used by /running to flag zombie
     /// requests whose created_at predates this process (i.e. leftovers
     /// from the previous gateway lifecycle whose cancel tokens died).
     pub gateway_start: chrono::DateTime<chrono::Utc>,
 }
+
+const APPROVAL_COMMAND_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Helper: get store or return error message for storage-dependent commands.
 macro_rules! require_store {
@@ -678,15 +686,9 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
             }
         }
 
-        "/approve" => Some(
-            "🔐 **工具权限说明**\n\n\
-             Gateway 模式下工具自动执行（`--auto-approve`）。\n\
-             安全由 Harness 保障：\n\
-             - 🛡 BudgetVerifier 限制轮次/token\n\
-             - 🛡 TurnGuard 检测工具循环\n\
-             - 🛡 CostVerifier 限制成本"
-                .into(),
-        ),
+        "/approve" | "/approval" => Some(handle_approval_response_command(ctx, arg, false).await),
+
+        "/deny" => Some(handle_approval_response_command(ctx, arg, true).await),
 
         "/help" => Some(
             "💡 **命令列表**\n\n\
@@ -729,8 +731,7 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
              `/cron del <id>` — 删除\n\n\
              **其他**\n\
              `/auth` — 认证状态 + 重置 + 自动重登录\n\
-             `/gateway` — 完整能力概览\n\
-             `/approve` — 权限说明"
+             `/gateway` — 完整能力概览"
                 .into(),
         ),
 
@@ -1480,6 +1481,64 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
         }
 
         _ => None,
+    }
+}
+
+async fn handle_approval_response_command(
+    ctx: &CommandContext<'_>,
+    arg: &str,
+    is_deny: bool,
+) -> String {
+    let Some(pool) = ctx.codex_app_pool else {
+        return "⚠️ 当前 CLI 不支持审批响应。".to_string();
+    };
+
+    if !arg.trim().is_empty() {
+        return if is_deny {
+            "用法: `/deny`".to_string()
+        } else {
+            "用法: `/approve`".to_string()
+        };
+    }
+
+    let decision = if is_deny {
+        ApprovalDecision::Deny
+    } else {
+        ApprovalDecision::AllowOnce
+    };
+
+    let result = match tokio::time::timeout(APPROVAL_COMMAND_TIMEOUT, async {
+        let pool_guard = pool.lock().await;
+        pool_guard
+            .respond_current_approval(ctx.chat_id, decision)
+            .await
+    })
+    .await
+    {
+        Ok(Ok(approval)) => Ok(approval),
+        Ok(Err(e)) => Err(e),
+        Err(_) => {
+            return "⚠️ 审批处理超时，请稍后重试。".to_string();
+        }
+    };
+    match result {
+        Ok(approval) => {
+            let label = match decision {
+                ApprovalDecision::AllowOnce => "已批准",
+                ApprovalDecision::Deny => "已拒绝",
+            };
+            format!(
+                "{icon} {label} `{}` (`{}`)",
+                approval.tool,
+                short_id(&approval.id),
+                icon = if decision == ApprovalDecision::Deny {
+                    "🚫"
+                } else {
+                    "✅"
+                }
+            )
+        }
+        Err(e) => format!("⚠️ 审批处理失败: {e}"),
     }
 }
 
@@ -2496,6 +2555,7 @@ mod tests {
                     cli_availability: &[],
                     auth_status: None,
                     active_tasks: None,
+                    codex_app_pool: None,
                     gateway_start: chrono::Utc::now(),
                 };
                 let result = handle_command(&ctx, $input).await;
@@ -2523,9 +2583,6 @@ mod tests {
         assert!(s.contains("/trace"), "missing /trace");
         assert!(s.contains("/cancel"), "missing /cancel");
         assert!(s.contains("/ws"), "missing /ws alias");
-    });
-    cmd_test!(cmd_approve_returns_info, "/approve", |r| {
-        assert!(r.unwrap().contains("工具权限"));
     });
     cmd_test!(cmd_model_no_arg_shows_current, "/model", |r| {
         let s = r.unwrap();
@@ -2815,6 +2872,7 @@ mod tests {
             cli_availability: &[],
             auth_status: Some("⚠️ 暂停 (剩余 3m 42s)".to_string()),
             active_tasks: None,
+            codex_app_pool: None,
             gateway_start: chrono::Utc::now(),
         };
 
@@ -3318,6 +3376,7 @@ mod tests {
             cli_availability: &[],
             auth_status: None,
             active_tasks,
+            codex_app_pool: None,
             gateway_start: chrono::Utc::now(),
         }
     }

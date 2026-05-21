@@ -3,9 +3,7 @@
 //! Each inbound message spawns `astra chat -m "..." --session-id X`
 //! and streams CLI progress to the chat platform while waiting for output.
 
-use crate::cli_bridge::{
-    self, CliProfile, CliProgress, CliResult, ReasoningDisplay, ReasoningKind,
-};
+use crate::cli_bridge::{self, CliProfile, CliProgress, ReasoningDisplay, ReasoningKind};
 use crate::commands::{self, CommandContext};
 use crate::config::GatewayConfig;
 use crate::gateway_context::GatewayContext;
@@ -50,6 +48,14 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(25);
 #[allow(dead_code)]
 const PROGRESSIVE_FLUSH_INTERVAL: Duration = Duration::from_secs(8);
 const PROGRESSIVE_MIN_CHARS: usize = 200;
+
+fn is_astra_app_server_startup_error(error: &str) -> bool {
+    error.contains("codex app-server stdout closed")
+        || error.contains("codex app-server response channel closed")
+        || error.contains("failed to spawn codex app-server")
+        || error.contains("unrecognized subcommand")
+        || error.contains("unknown command")
+}
 
 // ─── Send Circuit Breaker ───────────────────────────────────────────────────
 
@@ -741,6 +747,7 @@ impl GatewayRunner {
                     cli_availability: &self.cli_availability,
                     auth_status: self.auth_status_line(cli_profile.name()),
                     active_tasks: Some(&self.active_tasks),
+                    codex_app_pool: Some(&self.codex_app_pool),
                     gateway_start: self.gateway_start,
                 };
                 if let Some(response) = commands::handle_command(&cmd_ctx, &rewritten_cmd).await {
@@ -790,6 +797,7 @@ impl GatewayRunner {
             cli_availability: &self.cli_availability,
             auth_status: self.auth_status_line(cli_profile.name()),
             active_tasks: Some(&self.active_tasks),
+            codex_app_pool: Some(&self.codex_app_pool),
             gateway_start: self.gateway_start,
         };
         if let Some(response) = commands::handle_command(&cmd_ctx, &msg.text).await {
@@ -1302,21 +1310,53 @@ impl GatewayRunner {
             let sp = system_prompt.clone();
             let ws = workspace.clone();
             let kill_token = cancel_token.clone();
+            let token = access_token.clone();
+            let pc = provider_config.clone();
 
             tokio::spawn(async move {
-                let mut pool_guard = pool.lock().await;
-                let mut pool_progress_rx = pool_guard
-                    .begin_turn(
-                        &pool_key,
-                        &msg_text,
-                        &profile,
-                        sid.as_deref(),
-                        ws.as_deref(),
-                        Some(&sp),
-                    )
-                    .await?;
-                drop(pool_guard);
+                let begin_turn_result = {
+                    let mut pool_guard = pool.lock().await;
+                    pool_guard
+                        .begin_turn(
+                            &pool_key,
+                            &msg_text,
+                            &profile,
+                            sid.as_deref(),
+                            ws.as_deref(),
+                            Some(&sp),
+                        )
+                        .await
+                };
+                let mut pool_progress_rx = match begin_turn_result {
+                    Ok(rx) => rx,
+                    Err(e)
+                        if matches!(&profile, CliProfile::Astra { .. })
+                            && is_astra_app_server_startup_error(&e) =>
+                    {
+                        tracing::warn!(
+                            error = %e,
+                            "astra app-server unavailable; falling back to one-shot astra chat"
+                        );
+                        return cli_bridge::run_cli_with_cancel(
+                            &profile,
+                            &msg_text,
+                            sid.as_deref(),
+                            ws.as_deref(),
+                            Some(progress_tx.clone()),
+                            Some(&sp),
+                            None,
+                            None,
+                            Some(cli_timeout),
+                            token.as_deref(),
+                            Some(kill_token.clone()),
+                            pc.as_ref(),
+                        )
+                        .await;
+                    }
+                    Err(e) => return Err(e),
+                };
 
+                let mut terminal_error: Option<String> = None;
                 let deadline = tokio::time::sleep(cli_timeout);
                 tokio::pin!(deadline);
                 loop {
@@ -1349,30 +1389,27 @@ impl GatewayRunner {
                             break;
                         }
                         _ = &mut deadline => {
+                            let error = format!(
+                                "codex app-server turn timed out after {}s",
+                                cli_timeout.as_secs()
+                            );
                             tracing::warn!(key = %pool_key, "codex app-server turn timed out, killing process");
                             pool.lock().await.kill(&pool_key);
+                            terminal_error = Some(error);
                             break;
                         }
                     }
                 }
 
+                if let Some(error) = terminal_error {
+                    return Err(error);
+                }
+
                 let pool_guard = pool.lock().await;
-                let result = pool_guard.result(&pool_key).await.unwrap_or(CliResult {
-                    stdout: String::new(),
-                    stderr: String::new(),
-                    exit_code: 0,
-                    success: true,
-                    error_kind: None,
-                    trace_id: None,
-                    request_id: None,
-                    run_id: None,
-                    session_id: None,
-                    text: None,
-                    tool_calls_count: None,
-                    tools_used: Vec::new(),
-                    tokens_prompt: None,
-                    tokens_completion: None,
-                });
+                let result = pool_guard
+                    .result(&pool_key)
+                    .await
+                    .ok_or_else(|| "codex app-server result unavailable".to_string())?;
                 drop(pool_guard);
                 Ok(result)
             })
@@ -1617,6 +1654,51 @@ impl GatewayRunner {
                                         stream_id.clone(),
                                     );
                                 }
+                            }
+                        }
+                        Some(CliProgress::ApprovalRequested { id, tool, header, detail, reason }) => {
+                            sent_initial_ack = true;
+                            if let Some(writer) = trace_writer.as_ref() {
+                                let _ = writer
+                                    .append(
+                                        GatewayEventKind::CliProgress,
+                                        serde_json::json!({
+                                            "phase": "approval_requested",
+                                            "id": id,
+                                            "tool": tool,
+                                            "header": header,
+                                            "detail": detail.as_deref().map(redact_sensitive),
+                                            "reason": reason,
+                                        }),
+                                    )
+                                    .await;
+                            }
+
+                            let mut lines = vec![
+                                format!("🔐 `{tool}` 需要确认"),
+                                header,
+                            ];
+                            if let Some(detail) = detail
+                                && !detail.trim().is_empty()
+                            {
+                                lines.push(format!("详情: {}", truncate_chars(&detail, 400)));
+                            }
+                            if !reason.trim().is_empty() {
+                                lines.push(format!("原因: {reason}"));
+                            }
+                            lines.push(String::new());
+                            lines.push("回复 `/approve` 继续，或 `/deny` 拒绝。".to_string());
+
+                            if let Some(ref tx) = self.outbound_tx {
+                                let _ = tx.try_send(OutboundMessage {
+                                    platform: msg.platform.to_string(),
+                                    chat_id: chat_id.clone(),
+                                    text: lines.join("\n"),
+                                    reply_token: reply_token.clone(),
+                                    outbox: None,
+                                    stream_id: None,
+                                    stream_finish: true,
+                                });
                             }
                         }
                         Some(CliProgress::Thinking(_)) => {}
@@ -4240,6 +4322,19 @@ fn answer_progressive_flush_enabled(reasoning_display: ReasoningDisplay) -> bool
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn astra_app_server_startup_error_detection_is_narrow() {
+        assert!(is_astra_app_server_startup_error(
+            "codex app-server stdout closed"
+        ));
+        assert!(is_astra_app_server_startup_error(
+            "error: unrecognized subcommand 'stdio'"
+        ));
+        assert!(!is_astra_app_server_startup_error(
+            "invalid permission mode 'oops'"
+        ));
+    }
 
     #[test]
     fn split_short() {
