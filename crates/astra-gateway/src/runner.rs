@@ -1674,10 +1674,8 @@ impl GatewayRunner {
                                     .await;
                             }
 
-                            let short = truncate_chars(&id, 8).to_string();
                             let mut lines = vec![
                                 format!("🔐 `{tool}` 需要确认"),
-                                format!("审批: `{short}`"),
                                 header,
                             ];
                             if let Some(detail) = detail
@@ -1689,9 +1687,7 @@ impl GatewayRunner {
                                 lines.push(format!("原因: {reason}"));
                             }
                             lines.push(String::new());
-                            lines.push(format!(
-                                "回复 `/approve {short}` 允许一次，`/approve always {short}` 允许并记住，`/deny {short}` 拒绝。"
-                            ));
+                            lines.push("回复 `/approve` 继续，或 `/deny` 拒绝。".to_string());
 
                             if let Some(ref tx) = self.outbound_tx {
                                 let _ = tx.try_send(OutboundMessage {
