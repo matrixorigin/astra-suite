@@ -1197,6 +1197,7 @@ impl GatewayRunner {
             let kill_token = cancel_token.clone();
             let mcp_cfg = mcp_config_path.clone();
             let pc = provider_config.clone();
+            let sid = sid.clone();
 
             tokio::spawn(async move {
                 let mut pool_guard = pool.lock().await;
@@ -1205,6 +1206,7 @@ impl GatewayRunner {
                         &pool_key,
                         &msg_text,
                         &profile,
+                        sid.as_deref(),
                         ws.as_deref(),
                         Some(&sp),
                         token.as_deref(),

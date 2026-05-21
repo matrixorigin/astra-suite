@@ -2150,8 +2150,12 @@ fn model_entries() -> Vec<ModelEntry> {
 /// - "默认" (provider=None) always appears.
 /// - Bedrock/DashScope (Anthropic-compatible) only appear when using `claude` CLI.
 /// - TAAS (OpenAI-compatible) only appear when using `codex` CLI.
+/// - Other CLI types (astra, copilot, custom) see everything.
 /// - A provider must also be present in `config.providers` (bedrock is exempt).
-pub(crate) fn all_model_entries(config: &crate::config::GatewayConfig, cli_name: &str) -> Vec<ModelEntry> {
+pub(crate) fn all_model_entries(
+    config: &crate::config::GatewayConfig,
+    cli_name: &str,
+) -> Vec<ModelEntry> {
     model_entries()
         .into_iter()
         .filter(|e| match &e.provider {
@@ -2161,8 +2165,8 @@ pub(crate) fn all_model_entries(config: &crate::config::GatewayConfig, cli_name:
         })
         .filter(|e| match e.provider.as_deref() {
             None => true,
-            Some("bedrock") | Some("dashscope") => cli_name == "claude",
-            Some("taas") => cli_name == "codex",
+            Some("bedrock") | Some("dashscope") => cli_name != "codex",
+            Some("taas") => cli_name != "claude",
             _ => true,
         })
         .collect()
@@ -2585,14 +2589,43 @@ mod tests {
     cmd_test!(cmd_approve_returns_info, "/approve", |r| {
         assert!(r.unwrap().contains("工具权限"));
     });
-    cmd_test!(cmd_model_no_arg_shows_current, "/model", |r| {
+    #[tokio::test]
+    async fn cmd_model_no_arg_shows_current() {
+        let config = test_config();
+        let cli = crate::cli_bridge::CliProfile::Claude {
+            bin: "claude".into(),
+            model: None,
+            stream_json: true,
+            extra_args: vec![],
+            env: Default::default(),
+            env_file: None,
+        };
+        let astra = astra::Client::new("http://localhost:8080", None).unwrap();
+        let ctx = CommandContext {
+            astra: &astra,
+            config: &config,
+            store: None,
+            platform: "test",
+            chat_id: "chat_1",
+            user_id: "user_1",
+            resolved_cli: &cli,
+            resolved_provider: None,
+            durable_store: None,
+            trace_repo: None,
+            project_dirs: &config.project_dirs,
+            cli_availability: &[],
+            auth_status: None,
+            active_tasks: None,
+            gateway_start: chrono::Utc::now(),
+        };
+        let r = handle_command(&ctx, "/model").await;
         let s = r.unwrap();
         assert!(s.contains("当前"));
         assert!(s.contains("Haiku"));
         assert!(s.contains("Opus"));
         assert!(s.contains("默认"));
         assert!(s.contains("切换"));
-    });
+    }
 
     #[test]
     fn resolve_model_input_variants() {
@@ -2740,7 +2773,11 @@ mod tests {
 
         // codex CLI without TAAS provider → only default
         let entries = all_model_entries(&config, "codex");
-        assert!(entries.iter().all(|e| e.provider.as_deref() != Some("bedrock")));
+        assert!(
+            entries
+                .iter()
+                .all(|e| e.provider.as_deref() != Some("bedrock"))
+        );
         assert_eq!(entries.len(), 1); // just "默认"
 
         // Add dashscope provider → DashScope models appear for claude CLI
@@ -2754,9 +2791,7 @@ mod tests {
         assert!(entries.iter().any(|e| e.label == "Kimi K2.6"));
 
         // Add TAAS provider → TAAS models appear for codex CLI
-        config
-            .providers
-            .insert("taas".into(), Default::default());
+        config.providers.insert("taas".into(), Default::default());
         let entries = all_model_entries(&config, "codex");
         assert!(entries.iter().any(|e| e.label == "DeepSeek V4 Pro (TAAS)"));
         assert!(entries.iter().any(|e| e.label == "Kimi K2.6 (TAAS)"));

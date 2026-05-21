@@ -63,6 +63,7 @@ impl CliProcessPool {
         key: &str,
         message: &str,
         profile: &CliProfile,
+        session_id: Option<&str>,
         working_dir: Option<&Path>,
         system_prompt: Option<&str>,
         access_token: Option<&str>,
@@ -74,6 +75,7 @@ impl CliProcessPool {
             self.spawn(
                 key,
                 profile,
+                session_id,
                 working_dir,
                 system_prompt,
                 access_token,
@@ -155,14 +157,16 @@ impl CliProcessPool {
         &mut self,
         key: &str,
         profile: &CliProfile,
+        session_id: Option<&str>,
         working_dir: Option<&Path>,
         system_prompt: Option<&str>,
         access_token: Option<&str>,
         mcp_config: Option<&Path>,
         provider_config: Option<&crate::config::ProviderConfig>,
     ) -> Result<(), String> {
-        let mut cmd = build_persistent_command(profile, working_dir, system_prompt, mcp_config)
-            .ok_or("profile does not support persistent mode")?;
+        let mut cmd =
+            build_persistent_command(profile, session_id, working_dir, system_prompt, mcp_config)
+                .ok_or("profile does not support persistent mode")?;
 
         if let Some(token) = access_token {
             cmd.env("ASTRA_ACCESS_TOKEN", token);
@@ -246,6 +250,7 @@ impl CliProcessPool {
 
 fn build_persistent_command(
     profile: &CliProfile,
+    session_id: Option<&str>,
     working_dir: Option<&Path>,
     system_prompt: Option<&str>,
     mcp_config: Option<&Path>,
@@ -273,6 +278,10 @@ fn build_persistent_command(
                     continue;
                 }
                 cmd.arg(arg);
+            }
+            // Resume previous session if available — preserves context across pool restarts
+            if let Some(sid) = session_id.filter(|s| !s.is_empty()) {
+                cmd.arg("--resume").arg(sid);
             }
             cmd.arg("--input-format").arg("stream-json");
             cmd.arg("--output-format").arg("stream-json");
