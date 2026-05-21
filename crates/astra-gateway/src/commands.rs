@@ -2,6 +2,7 @@
 
 use crate::access_control::{ActionCapability, ActionSource};
 use crate::cli_bridge::{REASONING_PREF_KEY, ReasoningDisplay};
+use crate::codex_app_pool::{ApprovalDecision, CodexAppPool};
 use crate::config::GatewayConfig;
 use crate::store::{self, GatewayStore};
 use crate::trace_model::{
@@ -11,6 +12,9 @@ use crate::trace_model::{
 use astra_task_store::{
     DurableTask, DurableTaskStatus, DurableTaskStore, TaskFilter, resolve_task_for_owner,
 };
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::Mutex;
 
 pub struct CommandContext<'a> {
     pub astra: &'a astra::Client,
@@ -29,11 +33,15 @@ pub struct CommandContext<'a> {
     pub auth_status: Option<String>,
     /// Active task registry — allows /esc to interrupt live CLI turns.
     pub active_tasks: Option<&'a dashmap::DashMap<String, tokio_util::sync::CancellationToken>>,
+    /// Long-lived Codex/Astra app-server pool, used by approval slash commands.
+    pub(crate) codex_app_pool: Option<&'a Arc<Mutex<CodexAppPool>>>,
     /// Gateway process start time. Used by /running to flag zombie
     /// requests whose created_at predates this process (i.e. leftovers
     /// from the previous gateway lifecycle whose cancel tokens died).
     pub gateway_start: chrono::DateTime<chrono::Utc>,
 }
+
+const APPROVAL_COMMAND_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Helper: get store or return error message for storage-dependent commands.
 macro_rules! require_store {
@@ -678,15 +686,11 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
             }
         }
 
-        "/approve" => Some(
-            "🔐 **工具权限说明**\n\n\
-             Gateway 模式下工具自动执行（`--auto-approve`）。\n\
-             安全由 Harness 保障：\n\
-             - 🛡 BudgetVerifier 限制轮次/token\n\
-             - 🛡 TurnGuard 检测工具循环\n\
-             - 🛡 CostVerifier 限制成本"
-                .into(),
-        ),
+        "/approvals" => Some(handle_approvals_command(ctx).await),
+
+        "/approve" => Some(handle_approval_response_command(ctx, arg, false).await),
+
+        "/deny" => Some(handle_approval_response_command(ctx, arg, true).await),
 
         "/help" => Some(
             "💡 **命令列表**\n\n\
@@ -709,6 +713,10 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
              `/running` — 查看正在执行的任务 (带编号)\n\
              `/cancel [N|text]` — 取消排队请求 (序号/文本/ID)\n\
              `/esc [N|text]` — 中断当前运行 turn (序号/文本/ID；`/kill` 兼容别名)\n\
+             `/approvals` — 查看待审批工具请求\n\
+             `/approve [N|id]` — 允许一次待审批请求\n\
+             `/approve always [N|id]` — 允许并记住\n\
+             `/deny [N|id]` — 拒绝待审批请求\n\
              `/retry` — 查看发送失败的消息\n\
              `/retry dismiss` — 清除所有失败消息\n\
              `/manage [指令]` — AI 辅助任务管理\n\
@@ -730,7 +738,7 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
              **其他**\n\
              `/auth` — 认证状态 + 重置 + 自动重登录\n\
              `/gateway` — 完整能力概览\n\
-             `/approve` — 权限说明"
+             `/approve` — 审批或权限说明"
                 .into(),
         ),
 
@@ -1481,6 +1489,147 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
 
         _ => None,
     }
+}
+
+async fn handle_approvals_command(ctx: &CommandContext<'_>) -> String {
+    let Some(pool) = ctx.codex_app_pool else {
+        return approval_info_text();
+    };
+    let approvals = pool.lock().await.pending_approvals(ctx.chat_id).await;
+    if approvals.is_empty() {
+        return "✅ 当前没有待审批工具请求。".to_string();
+    }
+
+    let mut lines = vec!["🔐 **待审批工具请求**".to_string()];
+    for (idx, approval) in approvals.iter().enumerate() {
+        let detail = approval
+            .detail
+            .as_deref()
+            .map(|s| format!(" — {}", truncate_for_command(s, 120)))
+            .unwrap_or_default();
+        lines.push(format!(
+            "{}. `{}` `{}` — {}{}",
+            idx + 1,
+            short_id(&approval.id),
+            approval.tool,
+            approval.header,
+            detail
+        ));
+    }
+    lines.push(String::new());
+    lines.push(
+        "回复 `/approve 1` 允许一次，`/approve always 1` 允许并记住，`/deny 1` 拒绝。".to_string(),
+    );
+    lines.join("\n")
+}
+
+async fn handle_approval_response_command(
+    ctx: &CommandContext<'_>,
+    arg: &str,
+    is_deny: bool,
+) -> String {
+    let Some(pool) = ctx.codex_app_pool else {
+        if is_deny {
+            return "⚠️ 当前 CLI 不支持 gateway 审批。".to_string();
+        }
+        return approval_info_text();
+    };
+
+    let (decision, selector) = match parse_approval_response_args(arg, is_deny) {
+        Ok(parsed) => parsed,
+        Err(usage) => return usage,
+    };
+
+    let result = match tokio::time::timeout(APPROVAL_COMMAND_TIMEOUT, async {
+        let pool_guard = pool.lock().await;
+        if pool_guard.pending_approvals(ctx.chat_id).await.is_empty() {
+            return Ok(None);
+        }
+        pool_guard
+            .respond_approval(ctx.chat_id, selector.as_deref(), decision)
+            .await
+            .map(Some)
+    })
+    .await
+    {
+        Ok(Ok(Some(approval))) => Ok(approval),
+        Ok(Ok(None)) => return "✅ 当前没有待审批工具请求。".to_string(),
+        Ok(Err(e)) => Err(e),
+        Err(_) => {
+            return "⚠️ 审批处理超时，请稍后用 `/approvals` 确认状态。".to_string();
+        }
+    };
+    match result {
+        Ok(approval) => {
+            let label = match decision {
+                ApprovalDecision::AllowOnce => "已批准",
+                ApprovalDecision::AlwaysAllow => "已批准并记住",
+                ApprovalDecision::Deny => "已拒绝",
+            };
+            format!(
+                "{icon} {label} `{}` (`{}`)",
+                approval.tool,
+                short_id(&approval.id),
+                icon = if decision == ApprovalDecision::Deny {
+                    "🚫"
+                } else {
+                    "✅"
+                }
+            )
+        }
+        Err(e) => format!("⚠️ 审批处理失败: {e}"),
+    }
+}
+
+fn parse_approval_response_args(
+    arg: &str,
+    is_deny: bool,
+) -> Result<(ApprovalDecision, Option<String>), String> {
+    let parts: Vec<&str> = arg.split_whitespace().collect();
+    if is_deny {
+        return match parts.as_slice() {
+            [] => Ok((ApprovalDecision::Deny, None)),
+            [selector] => Ok((ApprovalDecision::Deny, Some((*selector).to_string()))),
+            _ => Err("用法: `/deny [N|approval_id]`".to_string()),
+        };
+    }
+
+    match parts.as_slice() {
+        [] => Ok((ApprovalDecision::AllowOnce, None)),
+        ["always" | "remember" | "permanent" | "永久" | "总是"] => {
+            Ok((ApprovalDecision::AlwaysAllow, None))
+        }
+        [
+            "always" | "remember" | "permanent" | "永久" | "总是",
+            selector,
+        ] => Ok((ApprovalDecision::AlwaysAllow, Some((*selector).to_string()))),
+        ["once", selector] => Ok((ApprovalDecision::AllowOnce, Some((*selector).to_string()))),
+        [selector] => Ok((ApprovalDecision::AllowOnce, Some((*selector).to_string()))),
+        _ => {
+            Err("用法: `/approve [N|approval_id]` 或 `/approve always [N|approval_id]`".to_string())
+        }
+    }
+}
+
+fn approval_info_text() -> String {
+    "🔐 **工具权限说明**\n\n\
+     Gateway 会尽量使用自动模式执行工具；遇到模型或运行时仍要求确认的高风险节点时，\
+     会发送待审批提示。\n\n\
+     可用命令：\n\
+     - `/approvals` 查看待审批请求\n\
+     - `/approve [N|id]` 允许一次\n\
+     - `/approve always [N|id]` 允许并记住\n\
+     - `/deny [N|id]` 拒绝"
+        .to_string()
+}
+
+fn truncate_for_command(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max_chars).collect();
+    out.push_str("...");
+    out
 }
 
 fn parse_cron_add(input: &str) -> Option<(String, String)> {
@@ -2496,6 +2645,7 @@ mod tests {
                     cli_availability: &[],
                     auth_status: None,
                     active_tasks: None,
+                    codex_app_pool: None,
                     gateway_start: chrono::Utc::now(),
                 };
                 let result = handle_command(&ctx, $input).await;
@@ -2815,6 +2965,7 @@ mod tests {
             cli_availability: &[],
             auth_status: Some("⚠️ 暂停 (剩余 3m 42s)".to_string()),
             active_tasks: None,
+            codex_app_pool: None,
             gateway_start: chrono::Utc::now(),
         };
 
@@ -3318,6 +3469,7 @@ mod tests {
             cli_availability: &[],
             auth_status: None,
             active_tasks,
+            codex_app_pool: None,
             gateway_start: chrono::Utc::now(),
         }
     }

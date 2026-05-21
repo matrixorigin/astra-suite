@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::{Mutex, mpsc, oneshot};
@@ -18,6 +19,8 @@ type ConversationKey = String;
 type PendingResponses = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, String>>>>>;
 const TOOL_PARAM_MAX_CHARS: usize = 160;
 const TOOL_NAME_MAX_CHARS: usize = 80;
+const APP_SERVER_RPC_TIMEOUT: Duration = Duration::from_secs(30);
+const APPROVAL_RESPONSE_TIMEOUT: Duration = Duration::from_secs(15);
 
 pub(crate) struct CodexAppPool {
     processes: HashMap<ConversationKey, ProcessHandle>,
@@ -36,6 +39,35 @@ struct ProcessHandle {
     tokens_completion: Arc<Mutex<Option<u64>>>,
     tool_calls_count: Arc<Mutex<u32>>,
     tools_used: Arc<Mutex<Vec<String>>>,
+    last_error: Arc<Mutex<Option<String>>>,
+    turn_failed: Arc<Mutex<bool>>,
+    pending_approvals: Arc<Mutex<Vec<ApprovalSummary>>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ApprovalSummary {
+    pub id: String,
+    pub tool: String,
+    pub header: String,
+    pub detail: Option<String>,
+    pub reason: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ApprovalDecision {
+    AllowOnce,
+    AlwaysAllow,
+    Deny,
+}
+
+impl ApprovalDecision {
+    fn as_protocol(self) -> &'static str {
+        match self {
+            Self::AllowOnce => "allow_once",
+            Self::AlwaysAllow => "always_allow",
+            Self::Deny => "deny",
+        }
+    }
 }
 
 impl CodexAppPool {
@@ -51,7 +83,7 @@ impl CodexAppPool {
             CliProfile::Codex {
                 stream_json: true,
                 ..
-            }
+            } | CliProfile::Astra { .. }
         )
     }
 
@@ -79,6 +111,9 @@ impl CodexAppPool {
         *handle.tokens_completion.lock().await = None;
         *handle.tool_calls_count.lock().await = 0;
         *handle.tools_used.lock().await = Vec::new();
+        *handle.last_error.lock().await = None;
+        *handle.turn_failed.lock().await = false;
+        *handle.pending_approvals.lock().await = Vec::new();
         *handle.active_turn_id.lock().await = None;
 
         let thread_id = handle
@@ -102,11 +137,24 @@ impl CodexAppPool {
             params["cwd"] = Value::String(dir.to_string_lossy().to_string());
         }
 
-        if let CliProfile::Codex { model, sandbox, .. } = profile {
-            if let Some(model) = model {
-                params["model"] = Value::String(model.clone());
+        match profile {
+            CliProfile::Codex { model, sandbox, .. } => {
+                if let Some(model) = model {
+                    params["model"] = Value::String(model.clone());
+                }
+                params["sandboxPolicy"] = sandbox_policy_json(sandbox, working_dir);
             }
-            params["sandboxPolicy"] = sandbox_policy_json(sandbox, working_dir);
+            CliProfile::Astra {
+                model,
+                permission_mode,
+                ..
+            } => {
+                if let Some(model) = model {
+                    params["model"] = Value::String(model.clone());
+                }
+                params["permissionMode"] = Value::String(permission_mode.clone());
+            }
+            _ => {}
         }
 
         let response = handle.request("turn/start", params).await?;
@@ -152,22 +200,64 @@ impl CodexAppPool {
         }
     }
 
+    pub async fn pending_approvals(&self, key: &str) -> Vec<ApprovalSummary> {
+        let Some(handle) = self.processes.get(key) else {
+            return Vec::new();
+        };
+        handle.pending_approvals.lock().await.clone()
+    }
+
+    pub async fn respond_approval(
+        &self,
+        key: &str,
+        selector: Option<&str>,
+        decision: ApprovalDecision,
+    ) -> Result<ApprovalSummary, String> {
+        let handle = self
+            .processes
+            .get(key)
+            .ok_or("no app-server process for conversation")?;
+        let approval = resolve_approval_selector(&handle.pending_approvals.lock().await, selector)?;
+        handle
+            .request_with_timeout(
+                "approval/respond",
+                serde_json::json!({
+                    "approvalId": approval.id.clone(),
+                    "decision": decision.as_protocol(),
+                }),
+                APPROVAL_RESPONSE_TIMEOUT,
+            )
+            .await?;
+        handle
+            .pending_approvals
+            .lock()
+            .await
+            .retain(|item| item.id != approval.id);
+        Ok(approval)
+    }
+
     pub async fn result(&self, key: &str) -> Option<CliResult> {
         let handle = self.processes.get(key)?;
         let text = handle.last_text.lock().await.clone();
         let tools_used = handle.tools_used.lock().await.clone();
         let tool_count = *handle.tool_calls_count.lock().await;
+        let turn_failed = *handle.turn_failed.lock().await;
+        let error = handle.last_error.lock().await.clone();
         Some(CliResult {
             stdout: String::new(),
-            stderr: String::new(),
-            exit_code: 0,
-            success: true,
+            stderr: error.unwrap_or_default(),
+            exit_code: if turn_failed { 1 } else { 0 },
+            success: !turn_failed,
             error_kind: None,
             trace_id: None,
             request_id: None,
             run_id: None,
             session_id: handle.thread_id.lock().await.clone(),
-            text: if text.is_empty() { None } else { Some(text) },
+            text: if turn_failed || text.is_empty() {
+                None
+            } else {
+                Some(text)
+            },
             tool_calls_count: if tool_count == 0 {
                 None
             } else {
@@ -220,6 +310,9 @@ impl CodexAppPool {
         let tokens_completion = Arc::new(Mutex::new(None));
         let tool_calls_count = Arc::new(Mutex::new(0));
         let tools_used = Arc::new(Mutex::new(Vec::new()));
+        let last_error = Arc::new(Mutex::new(None));
+        let turn_failed = Arc::new(Mutex::new(false));
+        let pending_approvals = Arc::new(Mutex::new(Vec::new()));
 
         tokio::spawn(stdin_writer_task(stdin, request_rx, cancel.clone()));
         tokio::spawn(stderr_drainer_task(stderr, cancel.clone()));
@@ -234,6 +327,9 @@ impl CodexAppPool {
             tokens_completion.clone(),
             tool_calls_count.clone(),
             tools_used.clone(),
+            last_error.clone(),
+            turn_failed.clone(),
+            pending_approvals.clone(),
             cancel.clone(),
         ));
 
@@ -263,6 +359,9 @@ impl CodexAppPool {
             tokens_completion,
             tool_calls_count,
             tools_used,
+            last_error,
+            turn_failed,
+            pending_approvals,
         };
 
         handle
@@ -319,6 +418,16 @@ impl CodexAppPool {
 
 impl ProcessHandle {
     async fn request(&self, method: &str, params: Value) -> Result<Value, String> {
+        self.request_with_timeout(method, params, APP_SERVER_RPC_TIMEOUT)
+            .await
+    }
+
+    async fn request_with_timeout(
+        &self,
+        method: &str,
+        params: Value,
+        timeout_duration: Duration,
+    ) -> Result<Value, String> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
         self.pending.lock().await.insert(id, tx);
@@ -331,23 +440,41 @@ impl ProcessHandle {
             let _ = self.pending.lock().await.remove(&id);
             return Err("codex app-server stdin closed".to_string());
         }
-        rx.await
-            .map_err(|_| "codex app-server response channel closed".to_string())?
+        match tokio::time::timeout(timeout_duration, rx).await {
+            Ok(response) => {
+                response.map_err(|_| "codex app-server response channel closed".to_string())?
+            }
+            Err(_) => {
+                let _ = self.pending.lock().await.remove(&id);
+                Err(format!(
+                    "codex app-server `{method}` timed out after {}s",
+                    timeout_duration.as_secs()
+                ))
+            }
+        }
     }
 }
 
 fn build_app_server_command(profile: &CliProfile, working_dir: Option<&Path>) -> Option<Command> {
-    let CliProfile::Codex {
-        bin, extra_args, ..
-    } = profile
-    else {
-        return None;
+    let mut cmd = match profile {
+        CliProfile::Codex {
+            bin, extra_args, ..
+        } => {
+            let mut cmd = Command::new(bin);
+            cmd.arg("app-server").arg("--listen").arg("stdio://");
+            for arg in extra_args {
+                cmd.arg(arg);
+            }
+            cmd
+        }
+        CliProfile::Astra { bin, .. } => {
+            let mut cmd = Command::new(bin);
+            cmd.env("no_proxy", "127.0.0.1,localhost");
+            cmd.arg("serve").arg("stdio");
+            cmd
+        }
+        _ => return None,
     };
-    let mut cmd = Command::new(bin);
-    cmd.arg("app-server").arg("--listen").arg("stdio://");
-    for arg in extra_args {
-        cmd.arg(arg);
-    }
     if let Some(dir) = working_dir {
         cmd.current_dir(dir);
     }
@@ -374,18 +501,30 @@ fn thread_start_params(
         params["developerInstructions"] = Value::String(sp.to_string());
     }
 
-    if let CliProfile::Codex {
-        model,
-        sandbox,
-        ephemeral,
-        ..
-    } = profile
-    {
-        if let Some(model) = model {
-            params["model"] = Value::String(model.clone());
+    match profile {
+        CliProfile::Codex {
+            model,
+            sandbox,
+            ephemeral,
+            ..
+        } => {
+            if let Some(model) = model {
+                params["model"] = Value::String(model.clone());
+            }
+            params["sandbox"] = Value::String(sandbox.clone());
+            params["ephemeral"] = Value::Bool(*ephemeral);
         }
-        params["sandbox"] = Value::String(sandbox.clone());
-        params["ephemeral"] = Value::Bool(*ephemeral);
+        CliProfile::Astra {
+            model,
+            permission_mode,
+            ..
+        } => {
+            if let Some(model) = model {
+                params["model"] = Value::String(model.clone());
+            }
+            params["permissionMode"] = Value::String(permission_mode.clone());
+        }
+        _ => {}
     }
 
     params
@@ -412,11 +551,24 @@ fn thread_resume_params(
         params["developerInstructions"] = Value::String(sp.to_string());
     }
 
-    if let CliProfile::Codex { model, sandbox, .. } = profile {
-        if let Some(model) = model {
-            params["model"] = Value::String(model.clone());
+    match profile {
+        CliProfile::Codex { model, sandbox, .. } => {
+            if let Some(model) = model {
+                params["model"] = Value::String(model.clone());
+            }
+            params["sandbox"] = Value::String(sandbox.clone());
         }
-        params["sandbox"] = Value::String(sandbox.clone());
+        CliProfile::Astra {
+            model,
+            permission_mode,
+            ..
+        } => {
+            if let Some(model) = model {
+                params["model"] = Value::String(model.clone());
+            }
+            params["permissionMode"] = Value::String(permission_mode.clone());
+        }
+        _ => {}
     }
 
     params
@@ -479,6 +631,9 @@ async fn stdout_reader_task(
     tokens_completion: Arc<Mutex<Option<u64>>>,
     tool_calls_count: Arc<Mutex<u32>>,
     tools_used: Arc<Mutex<Vec<String>>>,
+    last_error: Arc<Mutex<Option<String>>>,
+    turn_failed: Arc<Mutex<bool>>,
+    pending_approvals: Arc<Mutex<Vec<ApprovalSummary>>>,
     cancel: CancellationToken,
 ) {
     let reader = BufReader::new(stdout);
@@ -518,26 +673,56 @@ async fn stdout_reader_task(
                             &tokens_completion,
                             &tool_calls_count,
                             &tools_used,
+                            &last_error,
+                            &turn_failed,
+                            &pending_approvals,
                         )
                         .await;
                     }
                     Ok(None) => {
-                        *progress_slot.lock().await = None;
-                        fail_pending(&pending, "codex app-server stdout closed").await;
+                        let error = "codex app-server stdout closed";
+                        mark_process_failed(
+                            &progress_slot,
+                            &active_turn_id,
+                            &last_error,
+                            &turn_failed,
+                            &pending_approvals,
+                            error,
+                        )
+                        .await;
+                        fail_pending(&pending, error).await;
                         cancel.cancel();
                         break;
                     }
                     Err(e) => {
-                        *progress_slot.lock().await = None;
-                        fail_pending(&pending, &format!("codex app-server stdout error: {e}")).await;
+                        let error = format!("codex app-server stdout error: {e}");
+                        mark_process_failed(
+                            &progress_slot,
+                            &active_turn_id,
+                            &last_error,
+                            &turn_failed,
+                            &pending_approvals,
+                            &error,
+                        )
+                        .await;
+                        fail_pending(&pending, &error).await;
                         cancel.cancel();
                         break;
                     }
                 }
             }
             _ = cancel.cancelled() => {
-                *progress_slot.lock().await = None;
-                fail_pending(&pending, "codex app-server cancelled").await;
+                let error = "codex app-server cancelled";
+                mark_process_failed(
+                    &progress_slot,
+                    &active_turn_id,
+                    &last_error,
+                    &turn_failed,
+                    &pending_approvals,
+                    error,
+                )
+                .await;
+                fail_pending(&pending, error).await;
                 break;
             }
         }
@@ -555,6 +740,9 @@ async fn handle_notification(
     tokens_completion: &Arc<Mutex<Option<u64>>>,
     tool_calls_count: &Arc<Mutex<u32>>,
     tools_used: &Arc<Mutex<Vec<String>>>,
+    last_error: &Arc<Mutex<Option<String>>>,
+    turn_failed: &Arc<Mutex<bool>>,
+    pending_approvals: &Arc<Mutex<Vec<ApprovalSummary>>>,
 ) {
     let Some(method) = v["method"].as_str() else {
         return;
@@ -632,8 +820,32 @@ async fn handle_notification(
             *tokens_completion.lock().await = usage["outputTokens"].as_u64();
         }
         "turn/completed" => {
+            if params["status"].as_str() == Some("failed") {
+                *turn_failed.lock().await = true;
+            }
             *active_turn_id.lock().await = None;
             *progress_slot.lock().await = None;
+            pending_approvals.lock().await.clear();
+        }
+        "approval/requested" => {
+            if let Some(summary) = parse_approval_summary(params) {
+                let mut approvals = pending_approvals.lock().await;
+                if !approvals.iter().any(|item| item.id == summary.id) {
+                    approvals.push(summary.clone());
+                }
+                drop(approvals);
+                send_progress(
+                    progress_slot,
+                    CliProgress::ApprovalRequested {
+                        id: summary.id,
+                        tool: summary.tool,
+                        header: summary.header,
+                        detail: summary.detail,
+                        reason: summary.reason,
+                    },
+                )
+                .await;
+            }
         }
         "error" => {
             let msg = params["message"]
@@ -641,9 +853,97 @@ async fn handle_notification(
                 .or_else(|| params["error"].as_str())
                 .unwrap_or("codex app-server error")
                 .to_string();
+            *last_error.lock().await = Some(msg.clone());
             send_progress(progress_slot, CliProgress::Status(format!("[error] {msg}"))).await;
         }
         _ => {}
+    }
+}
+
+fn parse_approval_summary(params: &Value) -> Option<ApprovalSummary> {
+    let approval = params.get("approval")?;
+    let id = approval.get("id")?.as_str()?.trim();
+    if id.is_empty() {
+        return None;
+    }
+    let tool = approval
+        .get("tool")
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or("tool")
+        .trim()
+        .to_string();
+    let header = approval
+        .get("header")
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or("工具需要确认")
+        .trim()
+        .to_string();
+    let detail = approval
+        .get("detail")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToOwned::to_owned);
+    let reason = approval
+        .get("reason")
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or("需要用户确认")
+        .trim()
+        .to_string();
+
+    Some(ApprovalSummary {
+        id: id.to_string(),
+        tool,
+        header,
+        detail,
+        reason,
+    })
+}
+
+fn resolve_approval_selector(
+    approvals: &[ApprovalSummary],
+    selector: Option<&str>,
+) -> Result<ApprovalSummary, String> {
+    if approvals.is_empty() {
+        return Err("当前没有待审批请求".to_string());
+    }
+
+    let selector = selector.map(str::trim).filter(|s| !s.is_empty());
+    let Some(selector) = selector else {
+        if approvals.len() == 1 {
+            return Ok(approvals[0].clone());
+        }
+        return Err(format!(
+            "当前有 {} 个待审批请求，请指定序号或 approval id",
+            approvals.len()
+        ));
+    };
+
+    if let Ok(index) = selector.parse::<usize>() {
+        if (1..=approvals.len()).contains(&index) {
+            return Ok(approvals[index - 1].clone());
+        }
+        return Err(format!(
+            "审批序号超出范围：{index}，当前共有 {} 个",
+            approvals.len()
+        ));
+    }
+
+    if let Some(approval) = approvals.iter().find(|item| item.id == selector) {
+        return Ok(approval.clone());
+    }
+
+    let matches: Vec<_> = approvals
+        .iter()
+        .filter(|item| item.id.starts_with(selector))
+        .collect();
+    match matches.as_slice() {
+        [approval] => Ok((*approval).clone()),
+        [] => Err(format!("未找到审批请求 `{selector}`")),
+        _ => Err(format!("审批请求 `{selector}` 匹配多个 id，请输入更长前缀")),
     }
 }
 
@@ -883,6 +1183,21 @@ async fn fail_pending(pending: &PendingResponses, error: &str) {
     }
 }
 
+async fn mark_process_failed(
+    progress_slot: &Arc<Mutex<Option<mpsc::Sender<CliProgress>>>>,
+    active_turn_id: &Arc<Mutex<Option<String>>>,
+    last_error: &Arc<Mutex<Option<String>>>,
+    turn_failed: &Arc<Mutex<bool>>,
+    pending_approvals: &Arc<Mutex<Vec<ApprovalSummary>>>,
+    error: &str,
+) {
+    *last_error.lock().await = Some(error.to_string());
+    *turn_failed.lock().await = true;
+    *active_turn_id.lock().await = None;
+    pending_approvals.lock().await.clear();
+    *progress_slot.lock().await = None;
+}
+
 async fn stderr_drainer_task(stderr: tokio::process::ChildStderr, cancel: CancellationToken) {
     let reader = BufReader::new(stderr);
     let mut lines = reader.lines();
@@ -928,6 +1243,306 @@ mod tests {
         assert_eq!(params["ephemeral"], true);
         assert_eq!(params["developerInstructions"], "system prompt");
         assert_eq!(params["approvalPolicy"], "never");
+    }
+
+    #[test]
+    fn astra_profile_uses_app_server_pool() {
+        let profile = CliProfile::Astra {
+            bin: "astra".into(),
+            model: Some("gpt-5.5".into()),
+            permission_mode: "auto".into(),
+        };
+        assert!(CodexAppPool::supports_persistent(&profile));
+
+        let params = thread_start_params(&profile, Some(Path::new("/tmp/project")), Some("system"));
+        assert_eq!(params["cwd"], "/tmp/project");
+        assert_eq!(params["model"], "gpt-5.5");
+        assert_eq!(params["permissionMode"], "auto");
+        assert_eq!(params["developerInstructions"], "system");
+    }
+
+    #[test]
+    fn astra_app_server_command_uses_serve_stdio() {
+        let profile = CliProfile::Astra {
+            bin: "astra".into(),
+            model: None,
+            permission_mode: "auto".into(),
+        };
+        let cmd = build_app_server_command(&profile, Some(Path::new("/tmp/project")))
+            .expect("astra should support app-server command");
+        assert_eq!(cmd.as_std().get_program(), "astra");
+        let args: Vec<_> = cmd.as_std().get_args().collect();
+        assert_eq!(args, ["serve", "stdio"]);
+        assert_eq!(
+            cmd.as_std().get_current_dir(),
+            Some(Path::new("/tmp/project"))
+        );
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn live_astra_app_server_pool_streams_turn() {
+        let astra_bin =
+            std::env::var("ASTRA_BIN").unwrap_or_else(|_| "target/debug/astra".to_string());
+        let profile = CliProfile::Astra {
+            bin: astra_bin,
+            model: std::env::var("ASTRA_MODEL").ok(),
+            permission_mode: "auto".into(),
+        };
+        let workspace = tempfile::tempdir().unwrap();
+        let mut pool = CodexAppPool::new();
+        let mut progress = pool
+            .begin_turn(
+                "live-astra-app-server-e2e",
+                "只回复 ok 两个字母，不要调用工具。",
+                &profile,
+                None,
+                Some(workspace.path()),
+                Some("你是一个端到端验证助手，回答必须尽量简短。"),
+            )
+            .await
+            .expect("astra app-server turn should start");
+
+        let deadline = tokio::time::sleep(std::time::Duration::from_secs(180));
+        tokio::pin!(deadline);
+        let mut saw_progress = false;
+        loop {
+            tokio::select! {
+                event = progress.recv() => {
+                    match event {
+                        Some(CliProgress::Token(delta)) => {
+                            saw_progress |= !delta.is_empty();
+                        }
+                        Some(CliProgress::ReasoningBlock { text, .. }) => {
+                            saw_progress |= !text.is_empty();
+                        }
+                        Some(_) => {
+                            saw_progress = true;
+                        }
+                        None => break,
+                    }
+                }
+                _ = &mut deadline => {
+                    pool.kill("live-astra-app-server-e2e");
+                    panic!("timed out waiting for astra app-server turn");
+                }
+            }
+        }
+
+        let result = pool
+            .result("live-astra-app-server-e2e")
+            .await
+            .expect("pool result should exist");
+        pool.kill("live-astra-app-server-e2e");
+
+        assert!(saw_progress, "should receive streaming progress");
+        assert!(result.success, "turn should succeed");
+        assert!(result.session_id.is_some(), "session id should be captured");
+        assert!(
+            result.text.as_deref().is_some_and(|text| !text.is_empty()),
+            "final text should be captured"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_turn_notification_sets_error_state() {
+        let (progress_tx, mut progress_rx) = mpsc::channel(4);
+        let progress_slot = Arc::new(Mutex::new(Some(progress_tx)));
+        let thread_id = Arc::new(Mutex::new(None));
+        let active_turn_id = Arc::new(Mutex::new(Some("turn-1".to_string())));
+        let last_text = Arc::new(Mutex::new("partial text".to_string()));
+        let tokens_prompt = Arc::new(Mutex::new(None));
+        let tokens_completion = Arc::new(Mutex::new(None));
+        let tool_calls_count = Arc::new(Mutex::new(0));
+        let tools_used = Arc::new(Mutex::new(Vec::new()));
+        let last_error = Arc::new(Mutex::new(None));
+        let turn_failed = Arc::new(Mutex::new(false));
+        let pending_approvals = Arc::new(Mutex::new(Vec::new()));
+
+        handle_notification(
+            serde_json::json!({
+                "method": "error",
+                "params": {"message": "model failed"}
+            }),
+            &progress_slot,
+            &thread_id,
+            &active_turn_id,
+            &last_text,
+            &tokens_prompt,
+            &tokens_completion,
+            &tool_calls_count,
+            &tools_used,
+            &last_error,
+            &turn_failed,
+            &pending_approvals,
+        )
+        .await;
+        handle_notification(
+            serde_json::json!({
+                "method": "turn/completed",
+                "params": {"turn": {"id": "turn-1"}, "status": "failed"}
+            }),
+            &progress_slot,
+            &thread_id,
+            &active_turn_id,
+            &last_text,
+            &tokens_prompt,
+            &tokens_completion,
+            &tool_calls_count,
+            &tools_used,
+            &last_error,
+            &turn_failed,
+            &pending_approvals,
+        )
+        .await;
+
+        assert_eq!(last_error.lock().await.as_deref(), Some("model failed"));
+        assert!(*turn_failed.lock().await);
+        assert!(active_turn_id.lock().await.is_none());
+        assert!(progress_slot.lock().await.is_none());
+        assert!(matches!(
+            progress_rx.recv().await,
+            Some(CliProgress::Status(status)) if status.contains("model failed")
+        ));
+    }
+
+    #[tokio::test]
+    async fn process_failure_marks_turn_failed_and_clears_pending_state() {
+        let (progress_tx, _progress_rx) = mpsc::channel(4);
+        let progress_slot = Arc::new(Mutex::new(Some(progress_tx)));
+        let active_turn_id = Arc::new(Mutex::new(Some("turn-1".to_string())));
+        let last_error = Arc::new(Mutex::new(None));
+        let turn_failed = Arc::new(Mutex::new(false));
+        let pending_approvals = Arc::new(Mutex::new(vec![ApprovalSummary {
+            id: "approval-1".to_string(),
+            tool: "shell".to_string(),
+            header: "Run?".to_string(),
+            detail: None,
+            reason: "confirm".to_string(),
+        }]));
+
+        mark_process_failed(
+            &progress_slot,
+            &active_turn_id,
+            &last_error,
+            &turn_failed,
+            &pending_approvals,
+            "codex app-server stdout closed",
+        )
+        .await;
+
+        assert_eq!(
+            last_error.lock().await.as_deref(),
+            Some("codex app-server stdout closed")
+        );
+        assert!(*turn_failed.lock().await);
+        assert!(active_turn_id.lock().await.is_none());
+        assert!(progress_slot.lock().await.is_none());
+        assert!(pending_approvals.lock().await.is_empty());
+    }
+
+    #[test]
+    fn parse_approval_summary_reads_app_server_shape() {
+        let summary = parse_approval_summary(&serde_json::json!({
+            "approval": {
+                "id": "approval-123",
+                "tool": "shell",
+                "header": "Run command?",
+                "detail": "cargo build",
+                "reason": "requires confirmation"
+            }
+        }))
+        .expect("approval summary");
+
+        assert_eq!(summary.id, "approval-123");
+        assert_eq!(summary.tool, "shell");
+        assert_eq!(summary.header, "Run command?");
+        assert_eq!(summary.detail.as_deref(), Some("cargo build"));
+        assert_eq!(summary.reason, "requires confirmation");
+    }
+
+    #[test]
+    fn resolve_approval_selector_accepts_index_and_prefix() {
+        let approvals = vec![
+            ApprovalSummary {
+                id: "abc123".to_string(),
+                tool: "shell".to_string(),
+                header: "one".to_string(),
+                detail: None,
+                reason: "reason".to_string(),
+            },
+            ApprovalSummary {
+                id: "def456".to_string(),
+                tool: "file".to_string(),
+                header: "two".to_string(),
+                detail: None,
+                reason: "reason".to_string(),
+            },
+        ];
+
+        assert_eq!(
+            resolve_approval_selector(&approvals, Some("2")).unwrap().id,
+            "def456"
+        );
+        assert_eq!(
+            resolve_approval_selector(&approvals, Some("abc"))
+                .unwrap()
+                .id,
+            "abc123"
+        );
+        assert!(resolve_approval_selector(&approvals, None).is_err());
+    }
+
+    #[tokio::test]
+    async fn approval_requested_notification_records_and_forwards_progress() {
+        let (progress_tx, mut progress_rx) = mpsc::channel(4);
+        let progress_slot = Arc::new(Mutex::new(Some(progress_tx)));
+        let thread_id = Arc::new(Mutex::new(None));
+        let active_turn_id = Arc::new(Mutex::new(None));
+        let last_text = Arc::new(Mutex::new(String::new()));
+        let tokens_prompt = Arc::new(Mutex::new(None));
+        let tokens_completion = Arc::new(Mutex::new(None));
+        let tool_calls_count = Arc::new(Mutex::new(0));
+        let tools_used = Arc::new(Mutex::new(Vec::new()));
+        let last_error = Arc::new(Mutex::new(None));
+        let turn_failed = Arc::new(Mutex::new(false));
+        let pending_approvals = Arc::new(Mutex::new(Vec::new()));
+
+        handle_notification(
+            serde_json::json!({
+                "method": "approval/requested",
+                "params": {
+                    "approval": {
+                        "id": "approval-123456",
+                        "tool": "shell",
+                        "header": "Run command?",
+                        "detail": "make build-debug",
+                        "reason": "requires confirmation"
+                    }
+                }
+            }),
+            &progress_slot,
+            &thread_id,
+            &active_turn_id,
+            &last_text,
+            &tokens_prompt,
+            &tokens_completion,
+            &tool_calls_count,
+            &tools_used,
+            &last_error,
+            &turn_failed,
+            &pending_approvals,
+        )
+        .await;
+
+        assert_eq!(pending_approvals.lock().await.len(), 1);
+        assert!(matches!(
+            progress_rx.recv().await,
+            Some(CliProgress::ApprovalRequested { id, tool, detail, .. })
+                if id == "approval-123456"
+                    && tool == "shell"
+                    && detail.as_deref() == Some("make build-debug")
+        ));
     }
 
     #[test]
