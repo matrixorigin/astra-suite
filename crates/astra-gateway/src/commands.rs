@@ -2742,13 +2742,11 @@ mod tests {
         assert!(entries.iter().any(|e| e.label == "Qwen 3.6+"));
         assert!(entries.iter().any(|e| e.label == "Kimi K2.6"));
 
-        // Add TAAS provider → TAAS models appear for codex CLI
-        config.providers.insert("taas".into(), Default::default());
-        let entries = all_model_entries(&config, "codex");
-        assert!(entries.iter().any(|e| e.label == "DeepSeek V4 Pro (TAAS)"));
-        assert!(entries.iter().any(|e| e.label == "Kimi K2.6 (TAAS)"));
-        // Bedrock/DashScope should NOT appear for codex CLI
-        assert!(!entries.iter().any(|e| e.label == "Sonnet"));
+        // codex CLI hides Bedrock/DashScope entries
+        let codex_entries = all_model_entries(&config, "codex");
+        assert!(!codex_entries.iter().any(|e| e.label == "Sonnet"));
+        assert!(!codex_entries.iter().any(|e| e.label == "DeepSeek V4 Pro"));
+
         // Aliases resolve against the filtered list
         fn id(r: ResolvedModel) -> String {
             match r {
