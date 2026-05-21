@@ -1228,15 +1228,31 @@ impl GatewayRunner {
                 // until the turn ends (channel closes), cancel, or timeout.
                 let deadline = tokio::time::sleep(cli_timeout);
                 tokio::pin!(deadline);
+                // Silence heartbeat: every 60s without progress, reassure the user
+                let heartbeat = tokio::time::sleep(Duration::from_secs(60));
+                tokio::pin!(heartbeat);
                 loop {
                     tokio::select! {
                         ev = pool_progress_rx.recv() => {
                             match ev {
                                 Some(event) => {
+                                    heartbeat.as_mut().reset(
+                                        tokio::time::Instant::now() + Duration::from_secs(60),
+                                    );
                                     let _ = progress_tx.send(event).await;
                                 }
                                 None => break, // turn complete
                             }
+                        }
+                        _ = &mut heartbeat => {
+                            let _ = progress_tx
+                                .send(CliProgress::Status(
+                                    "⏳ 模型正在深入分析，请稍候…".into(),
+                                ))
+                                .await;
+                            heartbeat.as_mut().reset(
+                                tokio::time::Instant::now() + Duration::from_secs(60),
+                            );
                         }
                         _ = kill_token.cancelled() => {
                             let pool = pool.lock().await;
