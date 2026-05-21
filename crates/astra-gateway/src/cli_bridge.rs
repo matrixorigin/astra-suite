@@ -78,6 +78,14 @@ pub enum CliProgress {
         kind: ReasoningKind,
         text: String,
     },
+    /// Tool approval requested by a persistent app-server backend.
+    ApprovalRequested {
+        id: String,
+        tool: String,
+        header: String,
+        detail: Option<String>,
+        reason: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
