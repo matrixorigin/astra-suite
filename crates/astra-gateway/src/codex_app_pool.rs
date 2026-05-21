@@ -41,33 +41,7 @@ struct ProcessHandle {
     tools_used: Arc<Mutex<Vec<String>>>,
     last_error: Arc<Mutex<Option<String>>>,
     turn_failed: Arc<Mutex<bool>>,
-    pending_approvals: Arc<Mutex<Vec<ApprovalSummary>>>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct ApprovalSummary {
-    pub id: String,
-    pub tool: String,
-    pub header: String,
-    pub detail: Option<String>,
-    pub reason: String,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ApprovalDecision {
-    AllowOnce,
-    AlwaysAllow,
-    Deny,
-}
-
-impl ApprovalDecision {
-    fn as_protocol(self) -> &'static str {
-        match self {
-            Self::AllowOnce => "allow_once",
-            Self::AlwaysAllow => "always_allow",
-            Self::Deny => "deny",
-        }
-    }
+    approval_id: Arc<Mutex<Option<String>>>,
 }
 
 impl CodexAppPool {
@@ -113,7 +87,7 @@ impl CodexAppPool {
         *handle.tools_used.lock().await = Vec::new();
         *handle.last_error.lock().await = None;
         *handle.turn_failed.lock().await = false;
-        *handle.pending_approvals.lock().await = Vec::new();
+        *handle.approval_id.lock().await = None;
         *handle.active_turn_id.lock().await = None;
 
         let thread_id = handle
@@ -200,40 +174,29 @@ impl CodexAppPool {
         }
     }
 
-    pub async fn pending_approvals(&self, key: &str) -> Vec<ApprovalSummary> {
-        let Some(handle) = self.processes.get(key) else {
-            return Vec::new();
-        };
-        handle.pending_approvals.lock().await.clone()
-    }
-
-    pub async fn respond_approval(
-        &self,
-        key: &str,
-        selector: Option<&str>,
-        decision: ApprovalDecision,
-    ) -> Result<ApprovalSummary, String> {
+    pub async fn respond_current_approval(&self, key: &str, decision: &str) -> Result<(), String> {
         let handle = self
             .processes
             .get(key)
             .ok_or("no app-server process for conversation")?;
-        let approval = resolve_approval_selector(&handle.pending_approvals.lock().await, selector)?;
+        let approval_id = handle
+            .approval_id
+            .lock()
+            .await
+            .clone()
+            .ok_or("当前没有待确认操作")?;
         handle
             .request_with_timeout(
                 "approval/respond",
                 serde_json::json!({
-                    "approvalId": approval.id.clone(),
-                    "decision": decision.as_protocol(),
+                    "approvalId": approval_id,
+                    "decision": decision,
                 }),
                 APPROVAL_RESPONSE_TIMEOUT,
             )
             .await?;
-        handle
-            .pending_approvals
-            .lock()
-            .await
-            .retain(|item| item.id != approval.id);
-        Ok(approval)
+        *handle.approval_id.lock().await = None;
+        Ok(())
     }
 
     pub async fn result(&self, key: &str) -> Option<CliResult> {
@@ -312,7 +275,7 @@ impl CodexAppPool {
         let tools_used = Arc::new(Mutex::new(Vec::new()));
         let last_error = Arc::new(Mutex::new(None));
         let turn_failed = Arc::new(Mutex::new(false));
-        let pending_approvals = Arc::new(Mutex::new(Vec::new()));
+        let approval_id = Arc::new(Mutex::new(None));
 
         tokio::spawn(stdin_writer_task(stdin, request_rx, cancel.clone()));
         tokio::spawn(stderr_drainer_task(stderr, cancel.clone()));
@@ -329,7 +292,7 @@ impl CodexAppPool {
             tools_used.clone(),
             last_error.clone(),
             turn_failed.clone(),
-            pending_approvals.clone(),
+            approval_id.clone(),
             cancel.clone(),
         ));
 
@@ -361,7 +324,7 @@ impl CodexAppPool {
             tools_used,
             last_error,
             turn_failed,
-            pending_approvals,
+            approval_id,
         };
 
         handle
@@ -633,7 +596,7 @@ async fn stdout_reader_task(
     tools_used: Arc<Mutex<Vec<String>>>,
     last_error: Arc<Mutex<Option<String>>>,
     turn_failed: Arc<Mutex<bool>>,
-    pending_approvals: Arc<Mutex<Vec<ApprovalSummary>>>,
+    approval_id: Arc<Mutex<Option<String>>>,
     cancel: CancellationToken,
 ) {
     let reader = BufReader::new(stdout);
@@ -675,7 +638,7 @@ async fn stdout_reader_task(
                             &tools_used,
                             &last_error,
                             &turn_failed,
-                            &pending_approvals,
+                            &approval_id,
                         )
                         .await;
                     }
@@ -686,7 +649,7 @@ async fn stdout_reader_task(
                             &active_turn_id,
                             &last_error,
                             &turn_failed,
-                            &pending_approvals,
+                            &approval_id,
                             error,
                         )
                         .await;
@@ -701,7 +664,7 @@ async fn stdout_reader_task(
                             &active_turn_id,
                             &last_error,
                             &turn_failed,
-                            &pending_approvals,
+                            &approval_id,
                             &error,
                         )
                         .await;
@@ -718,7 +681,7 @@ async fn stdout_reader_task(
                     &active_turn_id,
                     &last_error,
                     &turn_failed,
-                    &pending_approvals,
+                    &approval_id,
                     error,
                 )
                 .await;
@@ -742,7 +705,7 @@ async fn handle_notification(
     tools_used: &Arc<Mutex<Vec<String>>>,
     last_error: &Arc<Mutex<Option<String>>>,
     turn_failed: &Arc<Mutex<bool>>,
-    pending_approvals: &Arc<Mutex<Vec<ApprovalSummary>>>,
+    approval_id: &Arc<Mutex<Option<String>>>,
 ) {
     let Some(method) = v["method"].as_str() else {
         return;
@@ -825,27 +788,17 @@ async fn handle_notification(
             }
             *active_turn_id.lock().await = None;
             *progress_slot.lock().await = None;
-            pending_approvals.lock().await.clear();
+            *approval_id.lock().await = None;
         }
         "approval/requested" => {
-            if let Some(summary) = parse_approval_summary(params) {
-                let mut approvals = pending_approvals.lock().await;
-                if !approvals.iter().any(|item| item.id == summary.id) {
-                    approvals.push(summary.clone());
-                }
-                drop(approvals);
-                send_progress(
-                    progress_slot,
-                    CliProgress::ApprovalRequested {
-                        id: summary.id,
-                        tool: summary.tool,
-                        header: summary.header,
-                        detail: summary.detail,
-                        reason: summary.reason,
-                    },
-                )
-                .await;
-            }
+            let Some(progress) = approval_requested_progress(params) else {
+                return;
+            };
+            let CliProgress::ApprovalRequested { id, .. } = &progress else {
+                return;
+            };
+            *approval_id.lock().await = Some(id.clone());
+            send_progress(progress_slot, progress).await;
         }
         "error" => {
             let msg = params["message"]
@@ -860,7 +813,7 @@ async fn handle_notification(
     }
 }
 
-fn parse_approval_summary(params: &Value) -> Option<ApprovalSummary> {
+fn approval_requested_progress(params: &Value) -> Option<CliProgress> {
     let approval = params.get("approval")?;
     let id = approval.get("id")?.as_str()?.trim();
     if id.is_empty() {
@@ -894,57 +847,13 @@ fn parse_approval_summary(params: &Value) -> Option<ApprovalSummary> {
         .trim()
         .to_string();
 
-    Some(ApprovalSummary {
+    Some(CliProgress::ApprovalRequested {
         id: id.to_string(),
         tool,
         header,
         detail,
         reason,
     })
-}
-
-fn resolve_approval_selector(
-    approvals: &[ApprovalSummary],
-    selector: Option<&str>,
-) -> Result<ApprovalSummary, String> {
-    if approvals.is_empty() {
-        return Err("当前没有待审批请求".to_string());
-    }
-
-    let selector = selector.map(str::trim).filter(|s| !s.is_empty());
-    let Some(selector) = selector else {
-        if approvals.len() == 1 {
-            return Ok(approvals[0].clone());
-        }
-        return Err(format!(
-            "当前有 {} 个待审批请求，请指定序号或 approval id",
-            approvals.len()
-        ));
-    };
-
-    if let Ok(index) = selector.parse::<usize>() {
-        if (1..=approvals.len()).contains(&index) {
-            return Ok(approvals[index - 1].clone());
-        }
-        return Err(format!(
-            "审批序号超出范围：{index}，当前共有 {} 个",
-            approvals.len()
-        ));
-    }
-
-    if let Some(approval) = approvals.iter().find(|item| item.id == selector) {
-        return Ok(approval.clone());
-    }
-
-    let matches: Vec<_> = approvals
-        .iter()
-        .filter(|item| item.id.starts_with(selector))
-        .collect();
-    match matches.as_slice() {
-        [approval] => Ok((*approval).clone()),
-        [] => Err(format!("未找到审批请求 `{selector}`")),
-        _ => Err(format!("审批请求 `{selector}` 匹配多个 id，请输入更长前缀")),
-    }
 }
 
 fn item_started_progress(item: &Value) -> Option<CliProgress> {
@@ -1188,13 +1097,13 @@ async fn mark_process_failed(
     active_turn_id: &Arc<Mutex<Option<String>>>,
     last_error: &Arc<Mutex<Option<String>>>,
     turn_failed: &Arc<Mutex<bool>>,
-    pending_approvals: &Arc<Mutex<Vec<ApprovalSummary>>>,
+    approval_id: &Arc<Mutex<Option<String>>>,
     error: &str,
 ) {
     *last_error.lock().await = Some(error.to_string());
     *turn_failed.lock().await = true;
     *active_turn_id.lock().await = None;
-    pending_approvals.lock().await.clear();
+    *approval_id.lock().await = None;
     *progress_slot.lock().await = None;
 }
 
@@ -1357,7 +1266,7 @@ mod tests {
         let tools_used = Arc::new(Mutex::new(Vec::new()));
         let last_error = Arc::new(Mutex::new(None));
         let turn_failed = Arc::new(Mutex::new(false));
-        let pending_approvals = Arc::new(Mutex::new(Vec::new()));
+        let approval_id = Arc::new(Mutex::new(None));
 
         handle_notification(
             serde_json::json!({
@@ -1374,7 +1283,7 @@ mod tests {
             &tools_used,
             &last_error,
             &turn_failed,
-            &pending_approvals,
+            &approval_id,
         )
         .await;
         handle_notification(
@@ -1392,7 +1301,7 @@ mod tests {
             &tools_used,
             &last_error,
             &turn_failed,
-            &pending_approvals,
+            &approval_id,
         )
         .await;
 
@@ -1413,20 +1322,14 @@ mod tests {
         let active_turn_id = Arc::new(Mutex::new(Some("turn-1".to_string())));
         let last_error = Arc::new(Mutex::new(None));
         let turn_failed = Arc::new(Mutex::new(false));
-        let pending_approvals = Arc::new(Mutex::new(vec![ApprovalSummary {
-            id: "approval-1".to_string(),
-            tool: "shell".to_string(),
-            header: "Run?".to_string(),
-            detail: None,
-            reason: "confirm".to_string(),
-        }]));
+        let approval_id = Arc::new(Mutex::new(Some("approval-1".to_string())));
 
         mark_process_failed(
             &progress_slot,
             &active_turn_id,
             &last_error,
             &turn_failed,
-            &pending_approvals,
+            &approval_id,
             "codex app-server stdout closed",
         )
         .await;
@@ -1438,59 +1341,7 @@ mod tests {
         assert!(*turn_failed.lock().await);
         assert!(active_turn_id.lock().await.is_none());
         assert!(progress_slot.lock().await.is_none());
-        assert!(pending_approvals.lock().await.is_empty());
-    }
-
-    #[test]
-    fn parse_approval_summary_reads_app_server_shape() {
-        let summary = parse_approval_summary(&serde_json::json!({
-            "approval": {
-                "id": "approval-123",
-                "tool": "shell",
-                "header": "Run command?",
-                "detail": "cargo build",
-                "reason": "requires confirmation"
-            }
-        }))
-        .expect("approval summary");
-
-        assert_eq!(summary.id, "approval-123");
-        assert_eq!(summary.tool, "shell");
-        assert_eq!(summary.header, "Run command?");
-        assert_eq!(summary.detail.as_deref(), Some("cargo build"));
-        assert_eq!(summary.reason, "requires confirmation");
-    }
-
-    #[test]
-    fn resolve_approval_selector_accepts_index_and_prefix() {
-        let approvals = vec![
-            ApprovalSummary {
-                id: "abc123".to_string(),
-                tool: "shell".to_string(),
-                header: "one".to_string(),
-                detail: None,
-                reason: "reason".to_string(),
-            },
-            ApprovalSummary {
-                id: "def456".to_string(),
-                tool: "file".to_string(),
-                header: "two".to_string(),
-                detail: None,
-                reason: "reason".to_string(),
-            },
-        ];
-
-        assert_eq!(
-            resolve_approval_selector(&approvals, Some("2")).unwrap().id,
-            "def456"
-        );
-        assert_eq!(
-            resolve_approval_selector(&approvals, Some("abc"))
-                .unwrap()
-                .id,
-            "abc123"
-        );
-        assert!(resolve_approval_selector(&approvals, None).is_err());
+        assert!(approval_id.lock().await.is_none());
     }
 
     #[tokio::test]
@@ -1506,7 +1357,7 @@ mod tests {
         let tools_used = Arc::new(Mutex::new(Vec::new()));
         let last_error = Arc::new(Mutex::new(None));
         let turn_failed = Arc::new(Mutex::new(false));
-        let pending_approvals = Arc::new(Mutex::new(Vec::new()));
+        let approval_id = Arc::new(Mutex::new(None));
 
         handle_notification(
             serde_json::json!({
@@ -1531,11 +1382,11 @@ mod tests {
             &tools_used,
             &last_error,
             &turn_failed,
-            &pending_approvals,
+            &approval_id,
         )
         .await;
 
-        assert_eq!(pending_approvals.lock().await.len(), 1);
+        assert_eq!(approval_id.lock().await.as_deref(), Some("approval-123456"));
         assert!(matches!(
             progress_rx.recv().await,
             Some(CliProgress::ApprovalRequested { id, tool, detail, .. })
