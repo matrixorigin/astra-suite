@@ -30,6 +30,8 @@ struct ProcessHandle {
     last_result: Arc<Mutex<Option<serde_json::Value>>>,
     /// Current turn generation — incremented on each begin_turn.
     generation: Arc<std::sync::atomic::AtomicU64>,
+    /// Stderr hint: drainer stores notable errors (e.g. stale session) for the runner to check.
+    stderr_hint: Arc<Mutex<Option<String>>>,
 }
 
 enum StdinCommand {
@@ -145,6 +147,11 @@ impl CliProcessPool {
         self.processes.get(key)?.last_result.lock().await.take()
     }
 
+    /// Take a stderr hint (e.g. "No conversation found") stored by the drainer.
+    pub async fn take_stderr_hint(&self, key: &str) -> Option<String> {
+        self.processes.get(key)?.stderr_hint.lock().await.take()
+    }
+
     fn is_alive(&self, key: &str) -> bool {
         self.processes
             .get(key)
@@ -200,12 +207,17 @@ impl CliProcessPool {
         let session_id: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
         let last_result: Arc<Mutex<Option<serde_json::Value>>> = Arc::new(Mutex::new(None));
         let generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let stderr_hint: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
 
         // Spawn stdin writer
         tokio::spawn(stdin_writer_task(stdin, stdin_rx, cancel.clone()));
 
         // Spawn stderr drainer
-        tokio::spawn(stderr_drainer_task(stderr, cancel.clone()));
+        tokio::spawn(stderr_drainer_task(
+            stderr,
+            stderr_hint.clone(),
+            cancel.clone(),
+        ));
 
         // Spawn stdout reader — routes events to progress_slot
         tokio::spawn(stdout_reader_task(
@@ -240,6 +252,7 @@ impl CliProcessPool {
             session_id,
             last_result,
             generation,
+            stderr_hint,
         };
 
         self.processes.insert(key.to_string(), handle);
@@ -408,7 +421,11 @@ async fn stdout_reader_task(
     }
 }
 
-async fn stderr_drainer_task(stderr: tokio::process::ChildStderr, cancel: CancellationToken) {
+async fn stderr_drainer_task(
+    stderr: tokio::process::ChildStderr,
+    stderr_hint: Arc<Mutex<Option<String>>>,
+    cancel: CancellationToken,
+) {
     let reader = BufReader::new(stderr);
     let mut lines = reader.lines();
     loop {
@@ -417,6 +434,11 @@ async fn stderr_drainer_task(stderr: tokio::process::ChildStderr, cancel: Cancel
                 match line {
                     Ok(Some(line)) if !line.trim().is_empty() => {
                         tracing::debug!(line = %line, "persistent claude stderr");
+                        if line.contains("No conversation found")
+                            || line.contains("session not found")
+                        {
+                            *stderr_hint.lock().await = Some(line.clone());
+                        }
                     }
                     Ok(None) | Err(_) => break,
                     _ => {}

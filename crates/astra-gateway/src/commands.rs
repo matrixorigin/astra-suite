@@ -2143,21 +2143,21 @@ fn model_entries() -> Vec<ModelEntry> {
         ModelEntry {
             label: "GLM 5.1 (TAAS)".into(),
             desc: "智谱".into(),
-            full_id: Some("glm-5.1".into()),
+            full_id: Some("glm-5-1".into()),
             provider: Some("taas".into()),
             aliases: vec!["t-glm".into()],
         },
         ModelEntry {
             label: "Qwen 3.6 Plus (TAAS)".into(),
             desc: "通义旗舰 / thinking".into(),
-            full_id: Some("qwen3.6-plus".into()),
+            full_id: Some("qwen3-6-plus".into()),
             provider: Some("taas".into()),
             aliases: vec!["t-qwen".into()],
         },
         ModelEntry {
             label: "Qwen 3.6 Flash (TAAS)".into(),
             desc: "快 / 省".into(),
-            full_id: Some("qwen3.6-flash".into()),
+            full_id: Some("qwen3-6-flash".into()),
             provider: Some("taas".into()),
             aliases: vec![],
         },
@@ -2183,7 +2183,7 @@ fn model_entries() -> Vec<ModelEntry> {
 /// - "默认" (provider=None) always appears.
 /// - Bedrock/DashScope (Anthropic-compatible) only appear when using `claude` CLI.
 /// - TAAS (OpenAI-compatible) only appear when using `codex` CLI.
-/// - Other CLI types (astra, copilot, custom) see everything.
+/// - Other CLI types (copilot, custom) see everything.
 /// - A provider must also be present in `config.providers` (bedrock is exempt).
 pub(crate) fn all_model_entries(
     config: &crate::config::GatewayConfig,
@@ -2198,7 +2198,7 @@ pub(crate) fn all_model_entries(
         })
         .filter(|e| match e.provider.as_deref() {
             None => true,
-            Some("bedrock") | Some("dashscope") => cli_name != "codex",
+            Some("bedrock") | Some("dashscope") => cli_name != "codex" && cli_name != "astra",
             Some("taas") => cli_name != "claude",
             _ => true,
         })
@@ -2620,7 +2620,37 @@ mod tests {
         assert!(s.contains("/cancel"), "missing /cancel");
         assert!(s.contains("/ws"), "missing /ws alias");
     });
-    cmd_test!(cmd_model_no_arg_shows_current, "/model", |r| {
+    #[tokio::test]
+    async fn cmd_model_no_arg_shows_current() {
+        let config = test_config();
+        let cli = crate::cli_bridge::CliProfile::Claude {
+            bin: "claude".into(),
+            model: None,
+            stream_json: true,
+            extra_args: vec![],
+            env: Default::default(),
+            env_file: None,
+        };
+        let astra = astra::Client::new("http://localhost:8080", None).unwrap();
+        let ctx = CommandContext {
+            astra: &astra,
+            config: &config,
+            store: None,
+            platform: "test",
+            chat_id: "chat_1",
+            user_id: "user_1",
+            resolved_cli: &cli,
+            resolved_provider: None,
+            durable_store: None,
+            trace_repo: None,
+            project_dirs: &config.project_dirs,
+            cli_availability: &[],
+            auth_status: None,
+            active_tasks: None,
+            codex_app_pool: None,
+            gateway_start: chrono::Utc::now(),
+        };
+        let r = handle_command(&ctx, "/model").await;
         let s = r.unwrap();
         assert!(s.contains("当前"));
         assert!(s.contains("Haiku"));

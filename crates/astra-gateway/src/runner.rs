@@ -1206,6 +1206,9 @@ impl GatewayRunner {
             let mcp_cfg = mcp_config_path.clone();
             let pc = provider_config.clone();
             let sid = sid.clone();
+            let pool_store = self.store.clone();
+            let pool_platform = msg.platform.to_string();
+            let pool_cli_name = cli_name.clone();
 
             tokio::spawn(async move {
                 let mut pool_guard = pool.lock().await;
@@ -1286,7 +1289,23 @@ impl GatewayRunner {
                 let pool_guard = pool.lock().await;
                 let session_id = pool_guard.session_id(&pool_key).await;
                 let result_json = pool_guard.take_last_result(&pool_key).await;
+                let stderr_hint = pool_guard
+                    .take_stderr_hint(&pool_key)
+                    .await
+                    .unwrap_or_default();
                 drop(pool_guard);
+
+                // Clear stale session if the CLI reported it missing
+                if stderr_hint.contains("No conversation found")
+                    || stderr_hint.contains("session not found")
+                {
+                    if let Some(ref store) = pool_store {
+                        let _ = store
+                            .reset_session(&pool_platform, &pool_key, &pool_cli_name)
+                            .await;
+                    }
+                    tracing::info!(key = %pool_key, "pool: cleared stale session");
+                }
 
                 let (text, tokens_prompt, tokens_completion, tool_calls_count) =
                     if let Some(ref v) = result_json {
@@ -1301,6 +1320,15 @@ impl GatewayRunner {
                     } else {
                         (None, None, None, None)
                     };
+
+                // Process exited without producing a result event
+                if result_json.is_none() && text.is_none() {
+                    return Err(if stderr_hint.is_empty() {
+                        "pool process exited without result".to_string()
+                    } else {
+                        format!("pool process exited: {stderr_hint}")
+                    });
+                }
 
                 Ok(cli_bridge::CliResult {
                     stdout: String::new(),
