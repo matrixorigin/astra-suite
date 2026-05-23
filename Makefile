@@ -1,4 +1,4 @@
-.PHONY: help build release test test-live check format lint clean run stop restart log init setup login-weixin
+.PHONY: help build release test test-live check format lint prepare-release prepare-release-push clean run stop restart log init setup login-weixin
 
 GATEWAY_BIN = target/release/astra-gateway
 GATEWAY_PID = /tmp/astra-gateway.pid
@@ -38,6 +38,16 @@ format: ## Auto-format all code
 lint: ## Check formatting + clippy (CI gate)
 	cargo fmt --all -- --check
 	cargo clippy --workspace --all-targets -- -D warnings
+
+# ─── Release ─────────────────────────────────────────────────────────────────
+
+prepare-release: ## Prepare release commit and tag; usage: make prepare-release VERSION=0.3.1
+	@test -n "$(VERSION)" || (echo "usage: make prepare-release VERSION=0.3.1" >&2; exit 2)
+	scripts/prepare-release.sh $(VERSION)
+
+prepare-release-push: ## Prepare release commit/tag and push; usage: make prepare-release-push VERSION=0.3.1
+	@test -n "$(VERSION)" || (echo "usage: make prepare-release-push VERSION=0.3.1" >&2; exit 2)
+	scripts/prepare-release.sh $(VERSION) --push
 
 # ─── Run / Stop / Restart ────────────────────────────────────────────────────
 
