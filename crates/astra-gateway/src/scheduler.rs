@@ -230,14 +230,23 @@ impl CronScheduler {
             self.config.cli.clone()
         };
         let model_key = store::model_preference_key(profile.name(), None);
+        let entries = crate::commands::all_model_entries(&self.config, profile.name());
         if let Ok(Some(model_name)) = self
             .store
             .get_user_preference(platform, user_id, &model_key)
             .await
         {
-            profile.set_model_override(model_name);
+            let is_supported_codex_model = crate::commands::has_model_id(&model_name, &entries);
+            if profile.name() != "codex" || model_name.is_empty() || is_supported_codex_model {
+                profile.set_model_override(model_name);
+            } else {
+                tracing::warn!(
+                    cli = profile.name(),
+                    model = %model_name,
+                    "ignoring stale model override not supported by active CLI"
+                );
+            }
         }
-        let entries = crate::commands::all_model_entries(&self.config, profile.name());
         let provider = profile
             .model_name()
             .and_then(|mid| crate::commands::model_provider(mid, &entries))

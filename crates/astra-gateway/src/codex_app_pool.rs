@@ -3,7 +3,9 @@
 //! Codex persistent mode uses the app-server JSON-RPC protocol over stdio:
 //! create/resume a thread once, then start turns on that thread.
 
-use crate::cli_bridge::{CliProfile, CliProgress, CliResult, ReasoningKind};
+use crate::cli_bridge::{
+    CliProfile, CliProgress, CliResult, ReasoningKind, apply_provider_environment,
+};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::path::Path;
@@ -70,11 +72,19 @@ impl CodexAppPool {
         session_id: Option<&str>,
         working_dir: Option<&Path>,
         system_prompt: Option<&str>,
+        provider_config: Option<&crate::config::ProviderConfig>,
     ) -> Result<mpsc::Receiver<CliProgress>, String> {
         if !self.processes.contains_key(key) || !self.is_alive(key) {
             self.processes.remove(key);
-            self.spawn(key, profile, session_id, working_dir, system_prompt)
-                .await?;
+            self.spawn(
+                key,
+                profile,
+                session_id,
+                working_dir,
+                system_prompt,
+                provider_config,
+            )
+            .await?;
         }
 
         let handle = self.processes.get(key).ok_or("codex app-server missing")?;
@@ -246,8 +256,9 @@ impl CodexAppPool {
         session_id: Option<&str>,
         working_dir: Option<&Path>,
         system_prompt: Option<&str>,
+        provider_config: Option<&crate::config::ProviderConfig>,
     ) -> Result<(), String> {
-        let mut cmd = build_app_server_command(profile, working_dir)
+        let mut cmd = build_app_server_command(profile, working_dir, provider_config)
             .ok_or("profile does not support codex app-server mode")?;
         cmd.stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
@@ -418,7 +429,11 @@ impl ProcessHandle {
     }
 }
 
-fn build_app_server_command(profile: &CliProfile, working_dir: Option<&Path>) -> Option<Command> {
+fn build_app_server_command(
+    profile: &CliProfile,
+    working_dir: Option<&Path>,
+    provider_config: Option<&crate::config::ProviderConfig>,
+) -> Option<Command> {
     let mut cmd = match profile {
         CliProfile::Codex {
             bin, extra_args, ..
@@ -438,6 +453,11 @@ fn build_app_server_command(profile: &CliProfile, working_dir: Option<&Path>) ->
         }
         _ => return None,
     };
+    if let Some(provider_config) = provider_config
+        && let Err(e) = apply_provider_environment(&mut cmd, provider_config)
+    {
+        tracing::warn!(error = %e, "failed to apply provider environment to app-server command");
+    }
     if let Some(dir) = working_dir {
         cmd.current_dir(dir);
     }
@@ -1177,7 +1197,7 @@ mod tests {
             model: None,
             permission_mode: "auto".into(),
         };
-        let cmd = build_app_server_command(&profile, Some(Path::new("/tmp/project")))
+        let cmd = build_app_server_command(&profile, Some(Path::new("/tmp/project")), None)
             .expect("astra should support app-server command");
         assert_eq!(cmd.as_std().get_program(), "astra");
         let args: Vec<_> = cmd.as_std().get_args().collect();
@@ -1208,6 +1228,7 @@ mod tests {
                 None,
                 Some(workspace.path()),
                 Some("你是一个端到端验证助手，回答必须尽量简短。"),
+                None,
             )
             .await
             .expect("astra app-server turn should start");
