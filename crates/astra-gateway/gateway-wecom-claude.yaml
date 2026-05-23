@@ -17,16 +17,25 @@ cli:
   type: claude
   bin: claude          # must be on PATH; or absolute path e.g. /home/you/.npm-global/bin/claude
   model: opus          # override per-session in chat with /model
+  # Optional: env vars injected into every Claude CLI process.
+  # Use this for Claude Code OAuth/session tokens, custom HOME, proxy, etc.
+  # env_file is dotenv-style KEY=VALUE; inline env overrides env_file.
+  # env_file: ~/.astra-gateway/claude.env
+  # env:
+  #   CLAUDE_CODE_OAUTH_TOKEN: ""       # optional; prefer env_file for real secrets
+  #   HTTPS_PROXY: ""
 
 # Model providers — env vars injected when /model selects a model from that provider.
 providers:
   bedrock:
+    enabled: false
     env:
       CLAUDE_CODE_USE_BEDROCK: "1"
       AWS_REGION: "us-east-1"
       AWS_BEARER_TOKEN_BEDROCK: ""    # ← FILL ME (Bedrock bearer token)
-    dashscope:
-     env:
+  dashscope:
+    enabled: false
+    env:
       ANTHROPIC_API_KEY: ""           # ← FILL ME (DashScope API key)
       ANTHROPIC_BASE_URL: "https://dashscope.aliyuncs.com/apps/anthropic"
 

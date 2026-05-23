@@ -1,69 +1,148 @@
 use std::path::Path;
 
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone)]
 pub struct GatewayConfig {
-    #[serde(default)]
     pub astra: AstraServerConfig,
     /// New multi-backend storage configuration.
-    #[serde(default)]
     pub storage: crate::store::StorageConfig,
     /// Legacy database config. Parsed only to produce clear diagnostics; storage
     /// must be configured through `storage:`.
-    #[serde(default)]
     pub database: Option<DatabaseConfig>,
     /// Default CLI profile (used when no /cli switch active).
-    #[serde(default)]
     pub cli: crate::cli_bridge::CliProfile,
     /// Named CLI profiles available for /cli switch.
-    #[serde(default)]
     pub cli_profiles: std::collections::HashMap<String, crate::cli_bridge::CliProfile>,
     /// Model provider configurations. Maps provider name (e.g. "bedrock",
     /// "dashscope") to the env vars injected at CLI spawn when a model
     /// belonging to that provider is selected via /model.
-    #[serde(default)]
     pub providers: std::collections::HashMap<String, ProviderConfig>,
     /// Maximum seconds a spawned CLI may run for one gateway message.
-    #[serde(default = "default_cli_timeout_secs")]
     pub cli_timeout_secs: u64,
-    #[serde(default)]
     pub platforms: PlatformConfigs,
     /// Directory containing user-defined skill markdown files.
-    #[serde(default)]
     pub skills_dir: Option<String>,
     /// Session auto-reset policy.
-    #[serde(default)]
     pub session_reset: crate::session_policy::ResetPolicy,
     /// Access control policy (who can send messages).
-    #[serde(default)]
     pub access: crate::access_control::AccessPolicy,
     /// Action policy (which gateway mutations are allowed from slash/model sources).
-    #[serde(default)]
     pub action_policy: crate::access_control::ActionPolicy,
     /// Maximum concurrent CLI runs across all conversations.
-    #[serde(default = "default_max_concurrent_runs")]
     pub max_concurrent_runs: usize,
     /// Group chat: isolate sessions per user (true) or share per group (false).
-    #[serde(default)]
     pub group_sessions_per_user: bool,
     /// Group chat: require @mention to activate (reduces noise).
-    #[serde(default)]
     pub group_require_mention: bool,
     /// Bot display name for @mention matching in group chats (e.g. "Astra").
     /// When empty, any @mention triggers the bot.
-    #[serde(default)]
     pub bot_name: String,
     /// Timezone for cron scheduling (e.g. "Asia/Shanghai"). Defaults to UTC.
-    #[serde(default)]
     pub timezone: Option<String>,
     /// Directories to scan for git projects (e.g. ["~/github", "~/work"]).
-    #[serde(default)]
     pub project_dirs: Vec<String>,
     /// Extra text appended to the system prompt (user-customizable).
-    #[serde(default)]
     pub system_prompt_extra: Option<String>,
     /// HTTP API port for message injection (e.g. 9090). Disabled when absent.
-    #[serde(default)]
     pub api_port: Option<u16>,
+}
+
+#[derive(serde::Deserialize)]
+struct RawGatewayConfig {
+    #[serde(default)]
+    astra: AstraServerConfig,
+    #[serde(default)]
+    storage: crate::store::StorageConfig,
+    #[serde(default)]
+    database: Option<DatabaseConfig>,
+    #[serde(default)]
+    cli: CliConfig,
+    #[serde(default)]
+    cli_profiles: std::collections::HashMap<String, crate::cli_bridge::CliProfile>,
+    #[serde(default)]
+    providers: std::collections::HashMap<String, ProviderConfig>,
+    #[serde(default = "default_cli_timeout_secs")]
+    cli_timeout_secs: u64,
+    #[serde(default)]
+    platforms: PlatformConfigs,
+    #[serde(default)]
+    skills_dir: Option<String>,
+    #[serde(default)]
+    session_reset: crate::session_policy::ResetPolicy,
+    #[serde(default)]
+    access: crate::access_control::AccessPolicy,
+    #[serde(default)]
+    action_policy: crate::access_control::ActionPolicy,
+    #[serde(default = "default_max_concurrent_runs")]
+    max_concurrent_runs: usize,
+    #[serde(default)]
+    group_sessions_per_user: bool,
+    #[serde(default)]
+    group_require_mention: bool,
+    #[serde(default)]
+    bot_name: String,
+    #[serde(default)]
+    timezone: Option<String>,
+    #[serde(default)]
+    project_dirs: Vec<String>,
+    #[serde(default)]
+    system_prompt_extra: Option<String>,
+    #[serde(default)]
+    api_port: Option<u16>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(untagged)]
+enum CliConfig {
+    Profile(crate::cli_bridge::CliProfile),
+    ProfileName(String),
+}
+
+impl Default for CliConfig {
+    fn default() -> Self {
+        Self::Profile(crate::cli_bridge::CliProfile::default())
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for GatewayConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = RawGatewayConfig::deserialize(deserializer)?;
+        let cli = match raw.cli {
+            CliConfig::Profile(profile) => profile,
+            CliConfig::ProfileName(name) => {
+                raw.cli_profiles.get(&name).cloned().ok_or_else(|| {
+                    serde::de::Error::custom(format!(
+                        "cli references unknown profile `{name}`; define it under cli_profiles"
+                    ))
+                })?
+            }
+        };
+
+        Ok(Self {
+            astra: raw.astra,
+            storage: raw.storage,
+            database: raw.database,
+            cli,
+            cli_profiles: raw.cli_profiles,
+            providers: raw.providers,
+            cli_timeout_secs: raw.cli_timeout_secs,
+            platforms: raw.platforms,
+            skills_dir: raw.skills_dir,
+            session_reset: raw.session_reset,
+            access: raw.access,
+            action_policy: raw.action_policy,
+            max_concurrent_runs: raw.max_concurrent_runs,
+            group_sessions_per_user: raw.group_sessions_per_user,
+            group_require_mention: raw.group_require_mention,
+            bot_name: raw.bot_name,
+            timezone: raw.timezone,
+            project_dirs: raw.project_dirs,
+            system_prompt_extra: raw.system_prompt_extra,
+            api_port: raw.api_port,
+        })
+    }
 }
 
 #[derive(Clone, Default, serde::Deserialize)]
@@ -142,6 +221,11 @@ fn default_base_url() -> String {
 /// cli.env (provider wins on key conflict).
 #[derive(Clone, Default, serde::Deserialize)]
 pub struct ProviderConfig {
+    /// Whether this provider participates in /model lists and runtime env
+    /// injection. Defaults to false so starter configs with empty secrets do
+    /// not accidentally expose non-working model options.
+    #[serde(default)]
+    pub enabled: bool,
     #[serde(default)]
     pub env: std::collections::BTreeMap<String, String>,
     #[serde(default)]
@@ -163,6 +247,7 @@ impl std::fmt::Debug for ProviderConfig {
             })
             .collect();
         f.debug_struct("ProviderConfig")
+            .field("enabled", &self.enabled)
             .field("env", &redacted)
             .field("env_file", &self.env_file)
             .finish()
@@ -310,6 +395,41 @@ platforms:
         assert!(wecom.enabled);
         assert_eq!(wecom.bot_id, "bot-123");
         assert_eq!(cfg.astra.default_model.as_deref(), Some("MiniMax-M2.7"));
+    }
+
+    #[test]
+    fn parse_cli_from_profile_name() {
+        let yaml = r#"
+cli: astra
+cli_profiles:
+  astra:
+    type: astra
+    bin: /opt/astra
+    permission_mode: auto
+  claude:
+    type: claude
+    bin: claude
+"#;
+        let cfg: GatewayConfig = serde_yaml_ng::from_str(yaml).unwrap();
+        assert!(matches!(
+            cfg.cli,
+            crate::cli_bridge::CliProfile::Astra { .. }
+        ));
+        assert_eq!(cfg.cli.name(), "astra");
+        assert_eq!(cfg.cli_profiles.len(), 2);
+    }
+
+    #[test]
+    fn parse_cli_profile_name_requires_existing_profile() {
+        let yaml = r#"
+cli: astra
+cli_profiles:
+  claude:
+    type: claude
+    bin: claude
+"#;
+        let err = serde_yaml_ng::from_str::<GatewayConfig>(yaml).unwrap_err();
+        assert!(err.to_string().contains("unknown profile `astra`"));
     }
 
     #[test]

@@ -42,6 +42,8 @@ enum Command {
     Start,
     /// Stop the running gateway daemon (graceful SIGTERM, then SIGKILL after 15s)
     Stop,
+    /// Restart the gateway daemon (stop if running, then start)
+    Restart,
     /// Show whether the gateway daemon is running
     Status,
     /// Update astra-gateway in place to the latest release.
@@ -441,6 +443,11 @@ fn cmd_stop() -> Result<(), String> {
     Ok(())
 }
 
+fn cmd_restart(config: &Path) -> Result<(), String> {
+    cmd_stop()?;
+    cmd_start(config)
+}
+
 fn cmd_status(config: &Path) {
     match current_running_pid() {
         Some(pid) => {
@@ -517,6 +524,15 @@ async fn main() {
 
     if let Some(Command::Stop) = cli.command {
         if let Err(e) = cmd_stop() {
+            eprintln!("❌ {e}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
+    if let Some(Command::Restart) = cli.command {
+        let config = cli.effective_config();
+        if let Err(e) = cmd_restart(&config) {
             eprintln!("❌ {e}");
             std::process::exit(1);
         }

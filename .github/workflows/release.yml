@@ -119,4 +119,4 @@ jobs:
             artifacts/*.tar.gz
             artifacts/SHA256SUMS.txt
           generate_release_notes: true
-          prerelease: ${{ contains(github.ref_name, '-rc') || contains(github.ref_name, '-beta') || contains(github.ref_name, '-alpha') }}
+          prerelease: ${{ contains(github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name, '-rc') || contains(github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name, '-beta') || contains(github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name, '-alpha') }}

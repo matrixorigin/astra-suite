@@ -12,7 +12,7 @@ use crate::trace_model::{
 use astra_task_store::{
     DurableTask, DurableTaskStatus, DurableTaskStore, TaskFilter, resolve_task_for_owner,
 };
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 use tokio::sync::Mutex;
 
 pub struct CommandContext<'a> {
@@ -405,7 +405,10 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
             // user has no per-user override, resolve_cli_profile returns this
             // untouched, so current_model == config_default_model.
             let config_default_model = ctx.config.cli.model_name();
-            let entries = all_model_entries(ctx.config, ctx.resolved_cli.name());
+            let entries = match model_entries_for_context(ctx, arg).await {
+                Ok(entries) => entries,
+                Err(e) => return Some(format!("⚠️ 获取模型列表失败: {e}")),
+            };
 
             if arg.is_empty() {
                 let current_display = current_model
@@ -443,8 +446,16 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
                 }
                 lines.push(String::new());
                 lines.push("切换: `/model <编号|名称|完整id>`".into());
-                lines.push("例: `/model 2`  `/model opus`  `/model Opus 4.7`".into());
-                lines.push("    `/model us.anthropic.claude-opus-4-7`".into());
+                lines.push("例: `/model 2`  `/model opus`  `/model gpt-5.5`".into());
+                if let Some(example_id) = entries.iter().find_map(|e| {
+                    if e.label == "Opus 4.7" {
+                        e.full_id.as_deref()
+                    } else {
+                        None
+                    }
+                }) {
+                    lines.push(format!("    `/model {example_id}`"));
+                }
                 return Some(lines.join("\n"));
             }
 
@@ -2035,7 +2046,7 @@ pub(crate) struct ModelEntry {
     desc: String,
     /// Full model identifier, or `None` to mean "follow default".
     full_id: Option<String>,
-    /// Which provider this model uses (e.g. "bedrock", "dashscope").
+    /// Which provider this model uses (e.g. "anthropic", "bedrock", "dashscope").
     provider: Option<String>,
     /// Extra shorthand aliases for resolution (e.g. ["deepseek", "ds"]).
     aliases: Vec<String>,
@@ -2058,6 +2069,36 @@ fn model_entries() -> Vec<ModelEntry> {
             desc: "跟随配置".into(),
             full_id: None,
             provider: None,
+            aliases: vec![],
+        },
+        // Claude official API / Claude Code defaults. These do not need
+        // gateway provider env; the Claude CLI owns its own auth.
+        ModelEntry {
+            label: "Sonnet".into(),
+            desc: "日常任务".into(),
+            full_id: Some("claude-sonnet-4-6".into()),
+            provider: Some("anthropic".into()),
+            aliases: vec![],
+        },
+        ModelEntry {
+            label: "Haiku".into(),
+            desc: "快 / 省".into(),
+            full_id: Some("claude-haiku-4-5".into()),
+            provider: Some("anthropic".into()),
+            aliases: vec![],
+        },
+        ModelEntry {
+            label: "Opus 4.7".into(),
+            desc: "最强 / 复杂任务".into(),
+            full_id: Some("claude-opus-4-7".into()),
+            provider: Some("anthropic".into()),
+            aliases: vec![],
+        },
+        ModelEntry {
+            label: "Opus 4.6".into(),
+            desc: "上一代 Opus".into(),
+            full_id: Some("claude-opus-4-6".into()),
+            provider: Some("anthropic".into()),
             aliases: vec![],
         },
         // Bedrock
@@ -2125,84 +2166,172 @@ fn model_entries() -> Vec<ModelEntry> {
             provider: Some("dashscope".into()),
             aliases: vec!["glm".into()],
         },
-        // TAAS (via astra / codex CLI)
+        // Codex official defaults. Codex owns its own OpenAI auth; these do not
+        // require gateway provider env.
         ModelEntry {
-            label: "DeepSeek V4 Pro (TAAS)".into(),
-            desc: "最强 / 代码".into(),
-            full_id: Some("deepseek-v4-pro".into()),
-            provider: Some("taas".into()),
-            aliases: vec!["t-deepseek".into(), "t-ds".into()],
+            label: "GPT-5.5".into(),
+            desc: "OpenAI flagship".into(),
+            full_id: Some("gpt-5.5".into()),
+            provider: Some("openai-codex".into()),
+            aliases: vec!["gpt55".into()],
         },
         ModelEntry {
-            label: "Kimi K2.6 (TAAS)".into(),
-            desc: "Moonshot".into(),
-            full_id: Some("kimi-k2.6".into()),
-            provider: Some("taas".into()),
-            aliases: vec!["t-kimi".into()],
-        },
-        ModelEntry {
-            label: "GLM 5.1 (TAAS)".into(),
-            desc: "智谱".into(),
-            full_id: Some("glm-5-1".into()),
-            provider: Some("taas".into()),
-            aliases: vec!["t-glm".into()],
-        },
-        ModelEntry {
-            label: "Qwen 3.6 Plus (TAAS)".into(),
-            desc: "通义旗舰 / thinking".into(),
-            full_id: Some("qwen3-6-plus".into()),
-            provider: Some("taas".into()),
-            aliases: vec!["t-qwen".into()],
-        },
-        ModelEntry {
-            label: "Qwen 3.6 Flash (TAAS)".into(),
-            desc: "快 / 省".into(),
-            full_id: Some("qwen3-6-flash".into()),
-            provider: Some("taas".into()),
-            aliases: vec![],
-        },
-        ModelEntry {
-            label: "Opus 4.7 (TAAS)".into(),
-            desc: "最强 / 复杂任务".into(),
-            full_id: Some("claude-opus-4-7".into()),
-            provider: Some("taas".into()),
-            aliases: vec![],
-        },
-        ModelEntry {
-            label: "Sonnet 4.6 (TAAS)".into(),
-            desc: "日常任务".into(),
-            full_id: Some("claude-sonnet-4-6".into()),
-            provider: Some("taas".into()),
-            aliases: vec![],
+            label: "GPT-5.4".into(),
+            desc: "OpenAI coding".into(),
+            full_id: Some("gpt-5.4".into()),
+            provider: Some("openai-codex".into()),
+            aliases: vec!["gpt54".into()],
         },
     ]
+}
+
+async fn model_entries_for_context(
+    ctx: &CommandContext<'_>,
+    arg: &str,
+) -> Result<Vec<ModelEntry>, String> {
+    if matches!(
+        ctx.resolved_cli,
+        crate::cli_bridge::CliProfile::Astra { .. }
+    ) && arg.trim() != "默认"
+        && !arg.trim().eq_ignore_ascii_case("default")
+    {
+        astra_model_entries(ctx.resolved_cli).await
+    } else {
+        Ok(all_model_entries(ctx.config, ctx.resolved_cli.name()))
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct AstraModelListItem {
+    name: String,
+    provider: Option<String>,
+    description: Option<String>,
+    #[serde(default)]
+    is_active: bool,
+    context_window: Option<u64>,
+}
+
+async fn astra_model_entries(
+    profile: &crate::cli_bridge::CliProfile,
+) -> Result<Vec<ModelEntry>, String> {
+    let crate::cli_bridge::CliProfile::Astra { bin, .. } = profile else {
+        return Ok(Vec::new());
+    };
+
+    let output = tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::process::Command::new(bin)
+            .arg("model")
+            .arg("list")
+            .output(),
+    )
+    .await
+    .map_err(|_| format!("`{bin} model list` 超时"))?
+    .map_err(|e| format!("运行 `{bin} model list`: {e}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "`{bin} model list` 退出码 {}: {}",
+            output.status.code().unwrap_or(-1),
+            stderr.trim()
+        ));
+    }
+
+    let items: Vec<AstraModelListItem> = serde_json::from_slice(&output.stdout)
+        .map_err(|e| format!("解析 `{bin} model list` 输出: {e}"))?;
+
+    let mut entries = vec![ModelEntry {
+        label: "默认".into(),
+        desc: "跟随配置".into(),
+        full_id: None,
+        provider: None,
+        aliases: vec![],
+    }];
+    for item in items.into_iter().filter(|m| m.is_active) {
+        let provider = item.provider.unwrap_or_else(|| "unknown".into());
+        let mut desc = provider;
+        if let Some(window) = item.context_window {
+            desc.push_str(&format!(" · ctx {}", format_context_window(window)));
+        }
+        if let Some(description) = item.description.filter(|d| !d.trim().is_empty()) {
+            desc.push_str(" · ");
+            desc.push_str(description.trim());
+        }
+        let aliases = astra_model_aliases(&item.name);
+        entries.push(ModelEntry {
+            label: item.name.clone(),
+            desc,
+            full_id: Some(item.name),
+            provider: None,
+            aliases,
+        });
+    }
+
+    if entries.len() == 1 {
+        return Err("Astra 返回的 active 模型列表为空".into());
+    }
+    Ok(entries)
+}
+
+fn astra_model_aliases(name: &str) -> Vec<String> {
+    let mut aliases = Vec::new();
+    if let Some(prefix) = name.split('-').next()
+        && prefix != name
+        && !prefix.is_empty()
+    {
+        aliases.push(prefix.to_string());
+    }
+    if name.starts_with("deepseek") {
+        aliases.push("ds".into());
+    }
+    if name.starts_with("qwen") {
+        aliases.push("qwen".into());
+    }
+    aliases.sort();
+    aliases.dedup();
+    aliases
+}
+
+fn format_context_window(n: u64) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else if n >= 1_000 {
+        format!("{}k", n / 1_000)
+    } else {
+        n.to_string()
+    }
 }
 
 /// Return model entries filtered by configured providers and active CLI.
 ///
 /// - "默认" (provider=None) always appears.
-/// - Bedrock/DashScope (Anthropic-compatible) only appear when using `claude` CLI.
-/// - TAAS (OpenAI-compatible) only appear when using `codex` CLI.
+/// - Claude official IDs appear for `claude` when Bedrock is not configured.
+/// - Bedrock IDs replace official Claude IDs when `providers.bedrock` is configured.
+/// - DashScope (Anthropic-compatible) only appears when using `claude` CLI.
+/// - Codex official IDs always appear for `codex`.
 /// - Other CLI types (copilot, custom) see everything.
-/// - A provider must also be present in `config.providers` (bedrock is exempt).
+/// - External providers must be configured with `enabled: true`.
 pub(crate) fn all_model_entries(
     config: &crate::config::GatewayConfig,
     cli_name: &str,
 ) -> Vec<ModelEntry> {
+    let bedrock_configured = provider_enabled(config, "bedrock");
     model_entries()
         .into_iter()
-        .filter(|e| match &e.provider {
-            None => true,
-            Some(p) if p == "bedrock" => true,
-            Some(p) => config.providers.contains_key(p.as_str()),
-        })
         .filter(|e| match e.provider.as_deref() {
             None => true,
-            Some("bedrock") | Some("dashscope") => cli_name != "codex" && cli_name != "astra",
-            Some("taas") => cli_name != "claude",
-            _ => true,
+            Some("anthropic") => cli_name == "claude" && !bedrock_configured,
+            Some("bedrock") => cli_name == "claude" && bedrock_configured,
+            Some("dashscope") => cli_name == "claude" && provider_enabled(config, "dashscope"),
+            Some("openai-codex") => cli_name == "codex",
+            Some(p) => provider_enabled(config, p),
         })
         .collect()
+}
+
+fn provider_enabled(config: &crate::config::GatewayConfig, name: &str) -> bool {
+    config.providers.get(name).is_some_and(|p| p.enabled)
 }
 
 /// Result of resolving a user-provided `/model` argument.
@@ -2240,11 +2369,20 @@ pub(crate) fn resolve_model_input(input: &str, entries: &[ModelEntry]) -> Resolv
         return ResolvedModel::Default;
     }
 
-    // "opus" shorthand → latest Opus. Update this constant when a newer Opus
-    // ships (kept explicit rather than in the entries list so label display
-    // doesn't get confused between "Opus" and "Opus 4.7").
-    if trimmed.eq_ignore_ascii_case("opus") {
-        return ResolvedModel::Id("us.anthropic.claude-opus-4-7".to_string());
+    // "opus" shorthand → latest Opus in the active menu. This keeps the
+    // provider-specific ID aligned with the current config.
+    if trimmed.eq_ignore_ascii_case("opus")
+        && let Some(id) = entries
+            .iter()
+            .find(|e| e.label == "Opus 4.7")
+            .and_then(|e| e.full_id.clone())
+    {
+        return ResolvedModel::Id(id);
+    }
+    if entries.iter().all(|entry| entry.full_id.is_none())
+        && let Some(id) = legacy_model_shorthand(trimmed)
+    {
+        return ResolvedModel::Id(id.to_string());
     }
 
     // Label match with whitespace ignored, case-insensitive.
@@ -2287,6 +2425,18 @@ pub(crate) fn resolve_model_input(input: &str, entries: &[ModelEntry]) -> Resolv
     }
 
     ResolvedModel::Unrecognized
+}
+
+fn legacy_model_shorthand(input: &str) -> Option<&'static str> {
+    if input.eq_ignore_ascii_case("opus") {
+        Some("us.anthropic.claude-opus-4-7")
+    } else if input.eq_ignore_ascii_case("haiku") {
+        Some("us.anthropic.claude-haiku-4-5-20251001-v1:0")
+    } else if input.eq_ignore_ascii_case("sonnet") {
+        Some("us.anthropic.claude-sonnet-4-6")
+    } else {
+        None
+    }
 }
 
 /// All model identifiers the gateway accepts.
@@ -2332,6 +2482,13 @@ pub(crate) fn model_provider(model_id: &str, entries: &[ModelEntry]) -> Option<S
         }
     }
     None
+}
+
+/// Return whether a concrete model ID is present in the active model menu.
+pub(crate) fn has_model_id(model_id: &str, entries: &[ModelEntry]) -> bool {
+    entries
+        .iter()
+        .any(|entry| entry.full_id.as_deref() == Some(model_id))
 }
 
 fn strip_whitespace(s: &str) -> String {
@@ -2671,44 +2828,20 @@ mod tests {
         }
 
         // "opus" shorthand → latest Opus
-        assert_eq!(
-            id(resolve_model_input("opus", &e)),
-            "us.anthropic.claude-opus-4-7"
-        );
-        assert_eq!(
-            id(resolve_model_input("Opus", &e)),
-            "us.anthropic.claude-opus-4-7"
-        );
+        assert_eq!(id(resolve_model_input("opus", &e)), "claude-opus-4-7");
+        assert_eq!(id(resolve_model_input("Opus", &e)), "claude-opus-4-7");
         // Exact label match (case-insensitive)
-        assert_eq!(
-            id(resolve_model_input("Opus 4.7", &e)),
-            "us.anthropic.claude-opus-4-7"
-        );
-        assert_eq!(
-            id(resolve_model_input("opus 4.7", &e)),
-            "us.anthropic.claude-opus-4-7"
-        );
-        assert_eq!(
-            id(resolve_model_input("Opus 4.6", &e)),
-            "us.anthropic.claude-opus-4-6-v1"
-        );
-        assert_eq!(
-            id(resolve_model_input("sonnet", &e)),
-            "us.anthropic.claude-sonnet-4-6"
-        );
-        assert_eq!(
-            id(resolve_model_input("Haiku", &e)),
-            "us.anthropic.claude-haiku-4-5-20251001-v1:0"
-        );
+        assert_eq!(id(resolve_model_input("Opus 4.7", &e)), "claude-opus-4-7");
+        assert_eq!(id(resolve_model_input("opus 4.7", &e)), "claude-opus-4-7");
+        assert_eq!(id(resolve_model_input("Opus 4.6", &e)), "claude-opus-4-6");
+        assert_eq!(id(resolve_model_input("sonnet", &e)), "claude-sonnet-4-6");
+        assert_eq!(id(resolve_model_input("Haiku", &e)), "claude-haiku-4-5");
         // Numeric index: 1=默认, 2=Sonnet, 3=Haiku, 4=Opus 4.7, 5=Opus 4.6
         assert!(matches!(
             resolve_model_input("1", &e),
             ResolvedModel::Default
         ));
-        assert_eq!(
-            id(resolve_model_input("4", &e)),
-            "us.anthropic.claude-opus-4-7"
-        );
+        assert_eq!(id(resolve_model_input("4", &e)), "claude-opus-4-7");
         // Default
         assert!(matches!(
             resolve_model_input("默认", &e),
@@ -2726,16 +2859,10 @@ mod tests {
         // Whitespace collapsed inside labels
         assert_eq!(
             id(resolve_model_input("  opus  4.7  ", &e)),
-            "us.anthropic.claude-opus-4-7"
+            "claude-opus-4-7"
         );
-        assert_eq!(
-            id(resolve_model_input("opus4.7", &e)),
-            "us.anthropic.claude-opus-4-7"
-        );
-        assert_eq!(
-            id(resolve_model_input("OPUS4.7", &e)),
-            "us.anthropic.claude-opus-4-7"
-        );
+        assert_eq!(id(resolve_model_input("opus4.7", &e)), "claude-opus-4-7");
+        assert_eq!(id(resolve_model_input("OPUS4.7", &e)), "claude-opus-4-7");
         // Extended whitelist: CLI short name
         assert_eq!(
             id(resolve_model_input("claude-opus-4-7", &e)),
@@ -2789,43 +2916,112 @@ mod tests {
     #[test]
     fn all_model_entries_filters_by_provider() {
         let mut config = test_config();
-        // No providers configured → only bedrock + default
+        // No providers configured → Claude official IDs + default
         let entries = all_model_entries(&config, "claude");
         assert!(
             entries
                 .iter()
                 .all(|e| e.provider.as_deref() != Some("dashscope"))
         );
+        assert!(
+            entries
+                .iter()
+                .all(|e| e.provider.as_deref() != Some("bedrock"))
+        );
         assert!(entries.iter().any(|e| e.label == "Sonnet"));
+        assert_eq!(id(resolve_model_input("opus", &entries)), "claude-opus-4-7");
         assert!(matches!(
             resolve_model_input("deepseek-v4-pro", &entries),
             ResolvedModel::Unrecognized
         ));
-        let bedrock_only_count = entries.len();
+        let official_count = entries.len();
 
-        // codex CLI without TAAS provider → only default
+        // Disabled bedrock provider does not change Claude official IDs.
+        config
+            .providers
+            .insert("bedrock".into(), Default::default());
+        let entries = all_model_entries(&config, "claude");
+        assert_eq!(id(resolve_model_input("opus", &entries)), "claude-opus-4-7");
+
+        // Enable bedrock provider → Bedrock IDs replace official Claude IDs.
+        config.providers.get_mut("bedrock").unwrap().enabled = true;
+        let entries = all_model_entries(&config, "claude");
+        assert!(
+            entries
+                .iter()
+                .all(|e| e.provider.as_deref() != Some("anthropic"))
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.provider.as_deref() == Some("bedrock"))
+        );
+        assert_eq!(
+            id(resolve_model_input("opus", &entries)),
+            "us.anthropic.claude-opus-4-7"
+        );
+
+        // codex CLI without TAAS provider → default + official Codex models
         let entries = all_model_entries(&config, "codex");
         assert!(
             entries
                 .iter()
                 .all(|e| e.provider.as_deref() != Some("bedrock"))
         );
-        assert_eq!(entries.len(), 1); // just "默认"
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.full_id.as_deref() == Some("gpt-5.5"))
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.full_id.as_deref() == Some("gpt-5.4"))
+        );
+        assert_eq!(entries.len(), 3);
 
-        // Add dashscope provider → DashScope models appear for claude CLI
+        // Enable dashscope provider → DashScope models appear for claude CLI.
         config
             .providers
             .insert("dashscope".into(), Default::default());
+        config.providers.get_mut("dashscope").unwrap().enabled = true;
         let entries = all_model_entries(&config, "claude");
-        assert!(entries.len() > bedrock_only_count);
+        assert!(entries.len() > official_count);
         assert!(entries.iter().any(|e| e.label == "DeepSeek V4 Pro"));
         assert!(entries.iter().any(|e| e.label == "Qwen 3.6+"));
         assert!(entries.iter().any(|e| e.label == "Kimi K2.6"));
 
-        // codex CLI hides Bedrock/DashScope entries
+        // codex CLI hides Bedrock/DashScope entries and only exposes Codex models.
         let codex_entries = all_model_entries(&config, "codex");
         assert!(!codex_entries.iter().any(|e| e.label == "Sonnet"));
         assert!(!codex_entries.iter().any(|e| e.label == "DeepSeek V4 Pro"));
+        assert!(
+            codex_entries
+                .iter()
+                .any(|e| e.full_id.as_deref() == Some("gpt-5.5"))
+        );
+        assert!(
+            codex_entries
+                .iter()
+                .any(|e| e.full_id.as_deref() == Some("gpt-5.4"))
+        );
+        assert_eq!(codex_entries.len(), 3);
+
+        // Even if TAAS is configured, codex does not consume it.
+        config.providers.insert("taas".into(), Default::default());
+        config.providers.get_mut("taas").unwrap().enabled = true;
+        let codex_entries = all_model_entries(&config, "codex");
+        assert!(
+            codex_entries
+                .iter()
+                .any(|e| e.full_id.as_deref() == Some("gpt-5.5"))
+        );
+        assert!(
+            codex_entries
+                .iter()
+                .all(|e| e.provider.as_deref() != Some("taas"))
+        );
+        assert_eq!(codex_entries.len(), 3);
 
         // Aliases resolve against the filtered list
         fn id(r: ResolvedModel) -> String {
@@ -2874,7 +3070,7 @@ mod tests {
     }
     cmd_test!(
         cmd_model_set_without_db_still_succeeds,
-        "/model opus",
+        "/model default",
         |r| {
             assert!(r.unwrap().contains("模型已切换"));
         }

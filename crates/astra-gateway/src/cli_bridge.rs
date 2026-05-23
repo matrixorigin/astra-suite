@@ -2460,6 +2460,39 @@ Your Copilot CLI policy setting may be preventing access."#;
     }
 
     #[test]
+    fn claude_env_file_is_loaded_with_inline_override() {
+        let dir = tempfile::tempdir().unwrap();
+        let env_path = dir.path().join("claude.env");
+        std::fs::write(
+            &env_path,
+            "CLAUDE_CODE_OAUTH_TOKEN=file-token\nHTTPS_PROXY=http://proxy\n",
+        )
+        .unwrap();
+        let mut env = std::collections::BTreeMap::new();
+        env.insert(
+            "CLAUDE_CODE_OAUTH_TOKEN".to_string(),
+            "inline-token".to_string(),
+        );
+        let p = CliProfile::Claude {
+            bin: "claude".into(),
+            model: None,
+            stream_json: true,
+            extra_args: vec![],
+            env,
+            env_file: Some(env_path.to_string_lossy().to_string()),
+        };
+        let mut cmd = Command::new("env");
+        p.apply_runtime_environment(&mut cmd).unwrap();
+        let envs: std::collections::BTreeMap<_, _> = cmd
+            .as_std()
+            .get_envs()
+            .filter_map(|(key, value)| Some((key.to_str()?, value?.to_str()?)))
+            .collect();
+        assert_eq!(envs.get("CLAUDE_CODE_OAUTH_TOKEN"), Some(&"inline-token"));
+        assert_eq!(envs.get("HTTPS_PROXY"), Some(&"http://proxy"));
+    }
+
+    #[test]
     fn copilot_missing_env_file_is_traceable() {
         let p = CliProfile::Copilot {
             bin: "copilot".into(),

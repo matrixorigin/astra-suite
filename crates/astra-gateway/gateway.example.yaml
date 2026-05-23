@@ -53,7 +53,8 @@ storage:
 
 # ─── CLI (default agent backend) ─────────────────────────────────────────────
 #
-# The CLI that handles user messages. Only one `cli:` block is active.
+# The CLI that handles user messages. Keep the legacy object form below, or set
+# `cli: <profile-name>` and define the concrete backend under `cli_profiles:`.
 # Users can switch between profiles at runtime with `/cli <name>`.
 
 # ── Option A: Claude-only (minimal, no astra server needed) ──
@@ -117,11 +118,13 @@ cli:
 
 providers:
   bedrock:
+    enabled: false                    # set true after filling credentials
     env:
       CLAUDE_CODE_USE_BEDROCK: "1"
       AWS_REGION: "us-east-1"
       AWS_BEARER_TOKEN_BEDROCK: ""            # FILL ME — your Bedrock bearer token
   dashscope:
+    enabled: false                    # set true after filling credentials
     env:
       ANTHROPIC_API_KEY: ""                   # FILL ME — your DashScope API key
       ANTHROPIC_BASE_URL: "https://dashscope.aliyuncs.com/apps/anthropic"
