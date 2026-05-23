@@ -622,7 +622,7 @@ impl GatewayRunner {
             profile.set_model_override(model_name);
         }
 
-        let entries = crate::commands::all_model_entries(&self.config);
+        let entries = crate::commands::all_model_entries(&self.config, profile.name());
         let provider = profile
             .model_name()
             .and_then(|mid| crate::commands::model_provider(mid, &entries))
@@ -693,7 +693,7 @@ impl GatewayRunner {
         let (cli_profile, _provider_config) = self
             .resolve_cli_profile(msg.platform, &msg.user_id, &effective_chat_id)
             .await;
-        let entries = crate::commands::all_model_entries(&self.config);
+        let entries = crate::commands::all_model_entries(&self.config, cli_profile.name());
         let provider_name = cli_profile
             .model_name()
             .and_then(|mid| crate::commands::model_provider(mid, &entries));
@@ -813,7 +813,7 @@ impl GatewayRunner {
                 // resolved to a valid model. Otherwise the user just gets an
                 // error message back and the existing session stays warm.
                 let should_kill = if let Some(arg) = msg.text.strip_prefix("/model ") {
-                    let entries = commands::all_model_entries(&self.config);
+                    let entries = commands::all_model_entries(&self.config, cli_profile.name());
                     !matches!(
                         commands::resolve_model_input(arg, &entries),
                         commands::ResolvedModel::Unrecognized
@@ -1205,6 +1205,10 @@ impl GatewayRunner {
             let kill_token = cancel_token.clone();
             let mcp_cfg = mcp_config_path.clone();
             let pc = provider_config.clone();
+            let sid = sid.clone();
+            let pool_store = self.store.clone();
+            let pool_platform = msg.platform.to_string();
+            let pool_cli_name = cli_name.clone();
 
             tokio::spawn(async move {
                 let mut pool_guard = pool.lock().await;
@@ -1213,6 +1217,7 @@ impl GatewayRunner {
                         &pool_key,
                         &msg_text,
                         &profile,
+                        sid.as_deref(),
                         ws.as_deref(),
                         Some(&sp),
                         token.as_deref(),
@@ -1226,15 +1231,31 @@ impl GatewayRunner {
                 // until the turn ends (channel closes), cancel, or timeout.
                 let deadline = tokio::time::sleep(cli_timeout);
                 tokio::pin!(deadline);
+                // Silence heartbeat: every 60s without progress, reassure the user
+                let heartbeat = tokio::time::sleep(Duration::from_secs(60));
+                tokio::pin!(heartbeat);
                 loop {
                     tokio::select! {
                         ev = pool_progress_rx.recv() => {
                             match ev {
                                 Some(event) => {
+                                    heartbeat.as_mut().reset(
+                                        tokio::time::Instant::now() + Duration::from_secs(60),
+                                    );
                                     let _ = progress_tx.send(event).await;
                                 }
                                 None => break, // turn complete
                             }
+                        }
+                        _ = &mut heartbeat => {
+                            let _ = progress_tx
+                                .send(CliProgress::Status(
+                                    "⏳ 模型正在深入分析，请稍候…".into(),
+                                ))
+                                .await;
+                            heartbeat.as_mut().reset(
+                                tokio::time::Instant::now() + Duration::from_secs(60),
+                            );
                         }
                         _ = kill_token.cancelled() => {
                             let pool = pool.lock().await;
@@ -1268,7 +1289,23 @@ impl GatewayRunner {
                 let pool_guard = pool.lock().await;
                 let session_id = pool_guard.session_id(&pool_key).await;
                 let result_json = pool_guard.take_last_result(&pool_key).await;
+                let stderr_hint = pool_guard
+                    .take_stderr_hint(&pool_key)
+                    .await
+                    .unwrap_or_default();
                 drop(pool_guard);
+
+                // Clear stale session if the CLI reported it missing
+                if stderr_hint.contains("No conversation found")
+                    || stderr_hint.contains("session not found")
+                {
+                    if let Some(ref store) = pool_store {
+                        let _ = store
+                            .reset_session(&pool_platform, &pool_key, &pool_cli_name)
+                            .await;
+                    }
+                    tracing::info!(key = %pool_key, "pool: cleared stale session");
+                }
 
                 let (text, tokens_prompt, tokens_completion, tool_calls_count) =
                     if let Some(ref v) = result_json {
@@ -1283,6 +1320,15 @@ impl GatewayRunner {
                     } else {
                         (None, None, None, None)
                     };
+
+                // Process exited without producing a result event
+                if result_json.is_none() && text.is_none() {
+                    return Err(if stderr_hint.is_empty() {
+                        "pool process exited without result".to_string()
+                    } else {
+                        format!("pool process exited: {stderr_hint}")
+                    });
+                }
 
                 Ok(cli_bridge::CliResult {
                     stdout: String::new(),

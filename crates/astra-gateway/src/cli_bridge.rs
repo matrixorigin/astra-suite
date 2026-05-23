@@ -423,6 +423,7 @@ impl CliProfile {
                     cmd.arg("--session-id").arg(sid);
                 }
                 if let Some(m) = model {
+                    let m = m.strip_prefix("@taas/").unwrap_or(m);
                     cmd.arg("--model").arg(m);
                 }
                 if let Some(sp) = system_prompt {
@@ -2093,6 +2094,9 @@ pub fn translate_cli_error(profile: &CliProfile, exit_code: i32, stderr: &str) -
     }
     if stderr.contains("rate limit") || stderr.contains("429") {
         return format!("⏳ `{name}` 请求过于频繁，请稍后再试。");
+    }
+    if stderr.contains("waiting_for_model") {
+        return format!("⏳ `{name}` 模型繁忙，请稍后重试。");
     }
     if stderr.contains("timeout") || stderr.contains("timed out") {
         return format!("⏰ `{name}` 响应超时，请重试。");
