@@ -122,11 +122,10 @@ impl CodexAppPool {
         }
 
         match profile {
-            CliProfile::Codex { model, sandbox, .. } => {
-                if let Some(model) = model {
-                    params["model"] = Value::String(model.clone());
-                }
-                params["sandboxPolicy"] = sandbox_policy_json(sandbox, working_dir);
+            CliProfile::Codex {
+                model: Some(model), ..
+            } => {
+                params["model"] = Value::String(model.clone());
             }
             CliProfile::Astra {
                 model,
@@ -486,15 +485,11 @@ fn thread_start_params(
 
     match profile {
         CliProfile::Codex {
-            model,
-            sandbox,
-            ephemeral,
-            ..
+            model, ephemeral, ..
         } => {
             if let Some(model) = model {
                 params["model"] = Value::String(model.clone());
             }
-            params["sandbox"] = Value::String(sandbox.clone());
             params["ephemeral"] = Value::Bool(*ephemeral);
         }
         CliProfile::Astra {
@@ -535,11 +530,10 @@ fn thread_resume_params(
     }
 
     match profile {
-        CliProfile::Codex { model, sandbox, .. } => {
-            if let Some(model) = model {
-                params["model"] = Value::String(model.clone());
-            }
-            params["sandbox"] = Value::String(sandbox.clone());
+        CliProfile::Codex {
+            model: Some(model), ..
+        } => {
+            params["model"] = Value::String(model.clone());
         }
         CliProfile::Astra {
             model,
@@ -555,28 +549,6 @@ fn thread_resume_params(
     }
 
     params
-}
-
-fn sandbox_policy_json(sandbox: &str, working_dir: Option<&Path>) -> Value {
-    match sandbox {
-        "danger-full-access" => serde_json::json!({ "type": "dangerFullAccess" }),
-        "read-only" => serde_json::json!({
-            "type": "readOnly",
-            "networkAccess": false,
-        }),
-        _ => {
-            let writable_roots = working_dir
-                .map(|p| vec![Value::String(p.to_string_lossy().to_string())])
-                .unwrap_or_default();
-            serde_json::json!({
-                "type": "workspaceWrite",
-                "writableRoots": writable_roots,
-                "networkAccess": false,
-                "excludeTmpdirEnvVar": false,
-                "excludeSlashTmp": false,
-            })
-        }
-    }
 }
 
 async fn stdin_writer_task(
@@ -1168,7 +1140,7 @@ mod tests {
         );
         assert_eq!(params["cwd"], "/tmp/project");
         assert_eq!(params["model"], "gpt-5.5");
-        assert_eq!(params["sandbox"], "workspace-write");
+        assert!(params.get("sandbox").is_none());
         assert_eq!(params["ephemeral"], true);
         assert_eq!(params["developerInstructions"], "system prompt");
         assert_eq!(params["approvalPolicy"], "never");
@@ -1418,13 +1390,6 @@ mod tests {
     }
 
     #[test]
-    fn workspace_sandbox_policy_names_codex_shape() {
-        let policy = sandbox_policy_json("workspace-write", Some(Path::new("/repo")));
-        assert_eq!(policy["type"], "workspaceWrite");
-        assert_eq!(policy["writableRoots"][0], "/repo");
-    }
-
-    #[test]
     fn thread_resume_includes_existing_thread_id() {
         let profile = CliProfile::Codex {
             bin: "codex".into(),
@@ -1439,7 +1404,7 @@ mod tests {
         assert_eq!(params["threadId"], "thread-1");
         assert_eq!(params["excludeTurns"], true);
         assert_eq!(params["persistExtendedHistory"], false);
-        assert_eq!(params["sandbox"], "read-only");
+        assert!(params.get("sandbox").is_none());
     }
 
     #[test]

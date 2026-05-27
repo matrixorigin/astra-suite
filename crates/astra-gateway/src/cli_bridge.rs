@@ -533,7 +533,7 @@ impl CliProfile {
             Self::Codex {
                 bin,
                 model,
-                sandbox,
+                sandbox: _,
                 stream_json,
                 extra_args,
                 skip_git_repo_check,
@@ -547,7 +547,6 @@ impl CliProfile {
                     }
                 } else {
                     cmd.arg("exec").arg(message);
-                    cmd.arg("--sandbox").arg(sandbox);
                 }
                 if *stream_json {
                     cmd.arg("--json");
@@ -3214,8 +3213,8 @@ printf '%s\n' '{"type":"assistant.message_delta","data":{"deltaContent":"from sc
         assert_eq!(cmd.as_std().get_program(), std::ffi::OsStr::new("codex"));
         assert!(args.contains(&std::ffi::OsStr::new("exec")));
         assert!(args.contains(&std::ffi::OsStr::new("fix the bug")));
-        assert!(args.contains(&std::ffi::OsStr::new("--sandbox")));
-        assert!(args.contains(&std::ffi::OsStr::new("workspace-write")));
+        assert!(!args.contains(&std::ffi::OsStr::new("--sandbox")));
+        assert!(!args.contains(&std::ffi::OsStr::new("workspace-write")));
         assert!(args.contains(&std::ffi::OsStr::new("--json")));
         assert!(args.contains(&std::ffi::OsStr::new("--model")));
         assert!(args.contains(&std::ffi::OsStr::new("o3")));
