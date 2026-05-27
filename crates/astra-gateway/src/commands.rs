@@ -2497,7 +2497,7 @@ fn strip_whitespace(s: &str) -> String {
 
 /// Render a model id using the friendly label from the entries list,
 /// falling back to the raw id if unknown.
-fn display_model_name(id: &str, entries: &[ModelEntry]) -> String {
+pub(crate) fn display_model_name(id: &str, entries: &[ModelEntry]) -> String {
     for entry in entries {
         if entry.full_id.as_deref() == Some(id) {
             return entry.label.clone();

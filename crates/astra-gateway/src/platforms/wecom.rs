@@ -402,7 +402,14 @@ async fn handle_wecom_message(
         .trim();
 
     // Strip @mentions (e.g. "@BotName ") so the model receives clean user text
-    let text = strip_at_mentions(raw_text);
+    let stripped_text = strip_at_mentions(raw_text);
+    let text = if stripped_text.is_empty() && !raw_text.is_empty() {
+        // A bare group mention (for example "@BotName") is an intentional ping.
+        // Preserve it as a greeting instead of dropping it before the runner sees it.
+        "你好".to_string()
+    } else {
+        stripped_text
+    };
 
     if text.is_empty() {
         return;
@@ -610,6 +617,39 @@ mod tests {
         rt.block_on(async {
             handle_wecom_message(&data, &tx, &mut dedup).await;
             assert!(rx.try_recv().is_err());
+        });
+    }
+
+    #[test]
+    fn bare_group_mention_becomes_greeting() {
+        let data: Value = serde_json::from_str(
+            r#"{
+            "cmd": "aibot_msg_callback",
+            "headers": {"req_id": "r"},
+            "body": {
+                "msgid": "bare-mention",
+                "from": {"userid": "u"},
+                "chatid": "group-1",
+                "chattype": "group",
+                "text": {"content": "@BisectBot"}
+            }
+        }"#,
+        )
+        .unwrap();
+
+        let (tx, mut rx) = mpsc::channel(10);
+        let mut dedup = MessageDeduplicator::new();
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            handle_wecom_message(&data, &tx, &mut dedup).await;
+            let msg = rx.recv().await.unwrap();
+            assert_eq!(msg.text, "你好");
+            assert_eq!(msg.chat_type, ChatType::Group);
         });
     }
 
