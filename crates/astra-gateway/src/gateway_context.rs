@@ -4,6 +4,7 @@
 //! Dynamic variables are rendered at runtime per message.
 
 use crate::cli_bridge::CliProfile;
+use std::collections::HashSet;
 
 const SKILL_TEMPLATE: &str = include_str!("../skills/gateway.md");
 
@@ -145,6 +146,7 @@ impl GatewayContext {
         lines.push(
             r#"- "提醒我X" → remind_after(exec=false); "帮我做X" → remind_after(exec=true)"#.into(),
         );
+        append_extra_skills(&mut lines, &self.extra_skills);
         lines.join("\n")
     }
 }
@@ -162,23 +164,165 @@ pub fn load_skills_from_dir(dir: &str) -> Vec<(String, String)> {
         return Vec::new();
     }
     let mut skills = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(path) {
-        for entry in entries.flatten() {
-            let p = entry.path();
-            if p.extension().and_then(|e| e.to_str()) == Some("md")
-                && let Ok(content) = std::fs::read_to_string(&p)
-            {
-                let name = p
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("unknown")
-                    .to_string();
-                skills.push((name, content));
-            }
-        }
-    }
+    collect_skill_files(path, path, &mut skills);
     skills.sort_by(|a, b| a.0.cmp(&b.0));
     skills
+}
+
+/// Select the most relevant skills for a user query with a small local scorer.
+/// This intentionally avoids external services; it is a lightweight filter
+/// before prompt injection, not a semantic embedding search.
+pub fn select_relevant_skills(
+    skills: &[(String, String)],
+    query: &str,
+    top_k: usize,
+    max_skill_chars: usize,
+) -> Vec<(String, String)> {
+    if skills.is_empty() || top_k == 0 {
+        return Vec::new();
+    }
+    let query_terms = tokenize(query);
+    if query_terms.is_empty() {
+        return skills
+            .iter()
+            .take(top_k)
+            .map(|(name, content)| (name.clone(), truncate_chars(content, max_skill_chars)))
+            .collect();
+    }
+    let query_lc = query.to_lowercase();
+    let mut scored: Vec<(usize, usize, &(String, String))> = skills
+        .iter()
+        .enumerate()
+        .map(|(idx, skill)| (score_skill(skill, &query_terms, &query_lc), idx, skill))
+        .filter(|(score, _, _)| *score > 0)
+        .collect();
+    scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    scored
+        .into_iter()
+        .take(top_k)
+        .map(|(_, _, (name, content))| (name.clone(), truncate_chars(content, max_skill_chars)))
+        .collect()
+}
+
+fn append_extra_skills(lines: &mut Vec<String>, skills: &[(String, String)]) {
+    for (name, content) in skills {
+        lines.push(String::new());
+        lines.push(format!("### Skill: {name}"));
+        lines.push(String::new());
+        lines.push(content.clone());
+    }
+}
+
+fn collect_skill_files(
+    root: &std::path::Path,
+    dir: &std::path::Path,
+    skills: &mut Vec<(String, String)>,
+) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let p = entry.path();
+        if p.is_dir() {
+            collect_skill_files(root, &p, skills);
+            continue;
+        }
+        let is_markdown = p.extension().and_then(|e| e.to_str()) == Some("md");
+        if !is_markdown {
+            continue;
+        }
+        let Ok(content) = std::fs::read_to_string(&p) else {
+            continue;
+        };
+        let name = skill_name_from_path(root, &p);
+        skills.push((name, content));
+    }
+}
+
+fn skill_name_from_path(root: &std::path::Path, path: &std::path::Path) -> String {
+    if path.file_name().and_then(|s| s.to_str()) == Some("SKILL.md")
+        && let Some(parent) = path.parent().and_then(|p| p.file_name())
+    {
+        return parent.to_string_lossy().to_string();
+    }
+    path.strip_prefix(root)
+        .ok()
+        .and_then(|p| p.with_extension("").to_str().map(String::from))
+        .or_else(|| path.file_stem().and_then(|s| s.to_str()).map(String::from))
+        .unwrap_or_else(|| "unknown".into())
+}
+
+fn score_skill(skill: &(String, String), query_terms: &HashSet<String>, query_lc: &str) -> usize {
+    let name_lc = skill.0.to_lowercase();
+    let content_lc = skill.1.to_lowercase();
+    let mut score = 0usize;
+    if !query_lc.trim().is_empty() && content_lc.contains(query_lc.trim()) {
+        score += 25;
+    }
+    if !query_lc.trim().is_empty() && name_lc.contains(query_lc.trim()) {
+        score += 50;
+    }
+    for term in query_terms {
+        if name_lc.contains(term) {
+            score += 10;
+        }
+        if content_lc.contains(term) {
+            score += 2;
+        }
+    }
+    score
+}
+
+fn tokenize(text: &str) -> HashSet<String> {
+    let mut tokens = HashSet::new();
+    let mut ascii = String::new();
+    let mut cjk_run = String::new();
+    for ch in text.chars().flat_map(char::to_lowercase) {
+        if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
+            flush_cjk(&mut cjk_run, &mut tokens);
+            ascii.push(ch);
+        } else if is_cjk(ch) {
+            flush_ascii(&mut ascii, &mut tokens);
+            cjk_run.push(ch);
+        } else {
+            flush_ascii(&mut ascii, &mut tokens);
+            flush_cjk(&mut cjk_run, &mut tokens);
+        }
+    }
+    flush_ascii(&mut ascii, &mut tokens);
+    flush_cjk(&mut cjk_run, &mut tokens);
+    tokens
+}
+
+fn flush_ascii(buf: &mut String, tokens: &mut HashSet<String>) {
+    if buf.len() >= 2 {
+        tokens.insert(std::mem::take(buf));
+    } else {
+        buf.clear();
+    }
+}
+
+fn flush_cjk(buf: &mut String, tokens: &mut HashSet<String>) {
+    let chars: Vec<char> = buf.chars().collect();
+    if chars.len() >= 2 {
+        for window in chars.windows(2) {
+            tokens.insert(window.iter().collect());
+        }
+    }
+    buf.clear();
+}
+
+fn is_cjk(ch: char) -> bool {
+    matches!(ch as u32, 0x4E00..=0x9FFF | 0x3400..=0x4DBF)
+}
+
+fn truncate_chars(text: &str, max_chars: usize) -> String {
+    if max_chars == 0 || text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    let mut out: String = text.chars().take(max_chars).collect();
+    out.push_str("\n\n...(truncated)");
+    out
 }
 
 fn render_template(template: &str, ctx: &GatewayContext) -> String {
@@ -440,19 +584,26 @@ fn load_skills_nonexistent_dir() {
 #[test]
 fn load_skills_from_dir_basic() {
     let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("debug")).unwrap();
     std::fs::write(
         dir.path().join("report.md"),
         "# Weekly Report\nCollect stats.",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("debug").join("SKILL.md"),
+        "# Debug\nInvestigate logs.",
     )
     .unwrap();
     std::fs::write(dir.path().join("alert.md"), "# Alert Rules").unwrap();
     std::fs::write(dir.path().join("ignore.txt"), "not a skill").unwrap();
 
     let skills = load_skills_from_dir(dir.path().to_str().unwrap());
-    assert_eq!(skills.len(), 2);
+    assert_eq!(skills.len(), 3);
     assert_eq!(skills[0].0, "alert"); // sorted
-    assert_eq!(skills[1].0, "report");
-    assert!(skills[1].1.contains("Weekly Report"));
+    assert_eq!(skills[1].0, "debug");
+    assert_eq!(skills[2].0, "report");
+    assert!(skills[2].1.contains("Weekly Report"));
 }
 
 #[test]
@@ -462,6 +613,32 @@ fn extra_skills_appended_to_prompt() {
     let prompt = ctx.to_system_prompt();
     assert!(prompt.contains("### Skill: myskill"));
     assert!(prompt.contains("Do X then Y."));
+    let slim = ctx.to_slim_system_prompt();
+    assert!(slim.contains("### Skill: myskill"));
+    assert!(slim.contains("Do X then Y."));
+}
+
+#[test]
+fn select_relevant_skills_prefers_matching_content() {
+    let skills = vec![
+        ("report".into(), "Create weekly status reports.".into()),
+        (
+            "oom-debug".into(),
+            "排查 OOM, memory leak, and crash logs.".into(),
+        ),
+        ("release".into(), "Prepare release notes.".into()),
+    ];
+    let selected = select_relevant_skills(&skills, "怎么排查 OOM", 2, 1000);
+    assert_eq!(selected.len(), 1);
+    assert_eq!(selected[0].0, "oom-debug");
+}
+
+#[test]
+fn select_relevant_skills_truncates_large_content() {
+    let skills = vec![("large".into(), "abc ".repeat(100))];
+    let selected = select_relevant_skills(&skills, "abc", 1, 10);
+    assert_eq!(selected.len(), 1);
+    assert!(selected[0].1.contains("truncated"));
 }
 
 #[test]

@@ -21,6 +21,9 @@ pub struct GatewayConfig {
     pub platforms: PlatformConfigs,
     /// Directory containing user-defined skill markdown files.
     pub skills_dir: Option<String>,
+    /// Optional lightweight retrieval over skills_dir. When enabled, only the
+    /// most relevant skills are injected per user message instead of all skills.
+    pub skills_retrieval: SkillsRetrievalConfig,
     /// Session auto-reset policy.
     pub session_reset: crate::session_policy::ResetPolicy,
     /// Access control policy (who can send messages).
@@ -66,6 +69,8 @@ struct RawGatewayConfig {
     platforms: PlatformConfigs,
     #[serde(default)]
     skills_dir: Option<String>,
+    #[serde(default)]
+    skills_retrieval: SkillsRetrievalConfig,
     #[serde(default)]
     session_reset: crate::session_policy::ResetPolicy,
     #[serde(default)]
@@ -130,6 +135,7 @@ impl<'de> serde::Deserialize<'de> for GatewayConfig {
             cli_timeout_secs: raw.cli_timeout_secs,
             platforms: raw.platforms,
             skills_dir: raw.skills_dir,
+            skills_retrieval: raw.skills_retrieval,
             session_reset: raw.session_reset,
             access: raw.access,
             action_policy: raw.action_policy,
@@ -143,6 +149,34 @@ impl<'de> serde::Deserialize<'de> for GatewayConfig {
             api_port: raw.api_port,
         })
     }
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct SkillsRetrievalConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_skills_top_k")]
+    pub top_k: usize,
+    #[serde(default = "default_skill_max_chars")]
+    pub max_skill_chars: usize,
+}
+
+impl Default for SkillsRetrievalConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            top_k: default_skills_top_k(),
+            max_skill_chars: default_skill_max_chars(),
+        }
+    }
+}
+
+fn default_skills_top_k() -> usize {
+    5
+}
+
+fn default_skill_max_chars() -> usize {
+    12_000
 }
 
 #[derive(Clone, Default, serde::Deserialize)]

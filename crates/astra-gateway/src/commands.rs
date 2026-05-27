@@ -2712,6 +2712,7 @@ mod tests {
             cli_timeout_secs: 3600,
             platforms: Default::default(),
             skills_dir: None,
+            skills_retrieval: Default::default(),
             session_reset: Default::default(),
             access: Default::default(),
             action_policy: Default::default(),

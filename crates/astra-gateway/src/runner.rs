@@ -1091,8 +1091,9 @@ impl GatewayRunner {
                     ctx = ctx.with_active_tasks(task_list);
                 }
             }
-            if !self.user_skills.is_empty() {
-                ctx = ctx.with_extra_skills(self.user_skills.clone());
+            let selected_skills = self.skills_for_message(&msg.text);
+            if !selected_skills.is_empty() {
+                ctx = ctx.with_extra_skills(selected_skills);
             }
             if !self.projects.is_empty() {
                 ctx = ctx.with_projects(self.projects.clone());
@@ -2309,6 +2310,22 @@ impl GatewayRunner {
                 .await,
             )
         }
+    }
+
+    fn skills_for_message(&self, message: &str) -> Vec<(String, String)> {
+        if self.user_skills.is_empty() {
+            return Vec::new();
+        }
+        let retrieval = &self.config.skills_retrieval;
+        if !retrieval.enabled {
+            return self.user_skills.clone();
+        }
+        crate::gateway_context::select_relevant_skills(
+            &self.user_skills,
+            message,
+            retrieval.top_k,
+            retrieval.max_skill_chars,
+        )
     }
 
     async fn outbound_response(
