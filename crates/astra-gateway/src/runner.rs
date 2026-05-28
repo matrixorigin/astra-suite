@@ -45,6 +45,8 @@ fn redact_sensitive(s: &str) -> String {
 const MAX_CHUNK_LEN: usize = 3800;
 const INITIAL_ACK_DELAY: Duration = Duration::from_secs(3);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(25);
+const WECOM_STREAM_CUTOFF: Duration = Duration::from_secs(9 * 60 + 30);
+const WECOM_POST_STREAM_HEARTBEAT: Duration = Duration::from_secs(120);
 #[allow(dead_code)]
 const PROGRESSIVE_FLUSH_INTERVAL: Duration = Duration::from_secs(8);
 const PROGRESSIVE_MIN_CHARS: usize = 200;
@@ -1514,6 +1516,11 @@ impl GatewayRunner {
         let mut _chunk_counter: u32 = 0;
         let next_timer = tokio::time::sleep(INITIAL_ACK_DELAY);
         tokio::pin!(next_timer);
+        let stream_cutoff_timer = tokio::time::sleep(WECOM_STREAM_CUTOFF);
+        tokio::pin!(stream_cutoff_timer);
+        let post_stream_heartbeat_timer =
+            tokio::time::sleep(Duration::from_secs(365 * 24 * 60 * 60));
+        tokio::pin!(post_stream_heartbeat_timer);
 
         // Health key for heartbeat circuit-breaker. MUST use msg.chat_id
         // (not effective_chat_id) because deliver_outbound receives
@@ -1525,6 +1532,10 @@ impl GatewayRunner {
 
         // Full accumulated text for stream (WeCom stream content is full-replacement, not append).
         let mut accumulated = String::new();
+        let stream_cutoff_enabled = msg.platform == "wecom" && stream_id.is_some();
+        let mut stream_cutoff_active = false;
+        let mut post_stream_buffer = String::new();
+        let mut post_stream_final_sent = false;
         // Next flush threshold: random 5-20 chars.
         let mut next_flush_at: usize = 5 + (rand::random::<u8>() % 16) as usize;
 
@@ -1553,6 +1564,22 @@ impl GatewayRunner {
                 reply_token,
                 stream_id,
                 finish,
+            ));
+        };
+        let send_plain = |text: String,
+                          tx: &Option<tokio::sync::mpsc::Sender<OutboundMessage>>,
+                          platform: &str,
+                          chat: &str| {
+            let Some(tx) = tx else {
+                return;
+            };
+            if text.trim().is_empty() {
+                return;
+            }
+            let _ = tx.try_send(OutboundMessage::plain(
+                platform.to_string(),
+                chat.to_string(),
+                text,
             ));
         };
         let flush_reasoning_buf = |buf: &mut String,
@@ -1607,22 +1634,28 @@ impl GatewayRunner {
                                 if allow_answer_progressive_flush
                                     && token_buf.len() >= next_flush_at
                                 {
+                                    let chunk = std::mem::take(&mut token_buf);
                                     // Check if appending would exceed stream limit — if so, close current stream first
-                                    if stream_id.is_some()
-                                        && accumulated.len() + token_buf.len() > STREAM_MAX_BYTES
+                                    if !stream_cutoff_active
+                                        && stream_id.is_some()
+                                        && accumulated.len() + chunk.len() > STREAM_MAX_BYTES
                                     {
                                         send_stream(&accumulated, &self.outbound_tx, msg.platform, &chat_id, reply_token.clone(), stream_id.clone(), true);
                                         accumulated.clear();
                                         stream_id = reply_token.as_ref().map(|_| uuid::Uuid::new_v4().to_string());
                                     }
-                                    accumulated.push_str(&token_buf);
-                                    token_buf.clear();
+                                    accumulated.push_str(&chunk);
+                                    if stream_cutoff_active {
+                                        post_stream_buffer.push_str(&chunk);
+                                    }
                                     next_flush_at = 5 + (rand::random::<u8>() % 16) as usize;
                                     _chunk_counter += 1;
                                     if stream_id.is_some() {
                                         progressive_text_len = accumulated.len();
                                     }
-                                    send_stream(&accumulated, &self.outbound_tx, msg.platform, &chat_id, reply_token.clone(), stream_id.clone(), false);
+                                    if !stream_cutoff_active {
+                                        send_stream(&accumulated, &self.outbound_tx, msg.platform, &chat_id, reply_token.clone(), stream_id.clone(), false);
+                                    }
                                 }
                             }
                         }
@@ -1646,17 +1679,22 @@ impl GatewayRunner {
                                     .await;
                             }
                             // Append tool use indicator to stream and flush immediately
-                            if stream_id.is_some() {
+                            if stream_id.is_some() || stream_cutoff_active {
+                                let mut chunk = String::new();
                                 if !accumulated.is_empty() && !accumulated.ends_with('\n') {
-                                    accumulated.push_str("\n\n");
+                                    chunk.push_str("\n\n");
                                 }
-                                let tool_line = if let Some(p) = params {
-                                    format!("🔧 {}: {}\n\n", name, p)
+                                if let Some(p) = params {
+                                    chunk.push_str(&format!("🔧 {}: {}\n\n", name, p));
                                 } else {
-                                    format!("🔧 {}\n\n", name)
-                                };
-                                accumulated.push_str(&tool_line);
-                                send_stream(&accumulated, &self.outbound_tx, msg.platform, &chat_id, reply_token.clone(), stream_id.clone(), false);
+                                    chunk.push_str(&format!("🔧 {}\n\n", name));
+                                }
+                                accumulated.push_str(&chunk);
+                                if stream_cutoff_active {
+                                    post_stream_buffer.push_str(&chunk);
+                                } else {
+                                    send_stream(&accumulated, &self.outbound_tx, msg.platform, &chat_id, reply_token.clone(), stream_id.clone(), false);
+                                }
                             }
                         }
                         Some(CliProgress::ToolDone { name, duration_ms }) => {
@@ -1783,8 +1821,11 @@ impl GatewayRunner {
                                 token_buf.push_str(&tail);
                             }
                             if !token_buf.is_empty() {
-                                accumulated.push_str(&token_buf);
-                                token_buf.clear();
+                                let chunk = std::mem::take(&mut token_buf);
+                                accumulated.push_str(&chunk);
+                                if stream_cutoff_active {
+                                    post_stream_buffer.push_str(&chunk);
+                                }
                             }
                             if !accumulated.is_empty() && stream_id.is_some() {
                                 progressive_text_len = accumulated.len();
@@ -1806,10 +1847,51 @@ impl GatewayRunner {
                                     .await;
                             }
                             // Send full accumulated content with finish=true to close the stream
-                            send_stream(&accumulated, &self.outbound_tx, msg.platform, &chat_id, reply_token.clone(), stream_id.clone(), true);
+                            if stream_cutoff_active {
+                                send_plain(
+                                    post_stream_buffer.clone(),
+                                    &self.outbound_tx,
+                                    msg.platform,
+                                    &chat_id,
+                                );
+                                post_stream_final_sent = true;
+                            } else {
+                                send_stream(&accumulated, &self.outbound_tx, msg.platform, &chat_id, reply_token.clone(), stream_id.clone(), true);
+                            }
                             break;
                         }
                     }
+                }
+                _ = &mut stream_cutoff_timer, if stream_cutoff_enabled && !stream_cutoff_active => {
+                    if !token_buf.is_empty() {
+                        let chunk = std::mem::take(&mut token_buf);
+                        accumulated.push_str(&chunk);
+                    }
+                    if !accumulated.is_empty() && stream_id.is_some() {
+                        progressive_text_len = accumulated.len();
+                    }
+                    send_stream(&accumulated, &self.outbound_tx, msg.platform, &chat_id, reply_token.clone(), stream_id.clone(), true);
+                    stream_id = None;
+                    stream_cutoff_active = true;
+                    post_stream_heartbeat_timer.as_mut().reset(
+                        tokio::time::Instant::now() + WECOM_POST_STREAM_HEARTBEAT,
+                    );
+                    tracing::info!(
+                        platform = %msg.platform,
+                        chat_id = %safe_id(&chat_id),
+                        bytes = accumulated.len(),
+                        "wecom stream cutoff reached; continuing with deferred plain output"
+                    );
+                }
+                _ = &mut post_stream_heartbeat_timer, if stream_cutoff_active && !post_stream_final_sent => {
+                    let heartbeat = format!(
+                        "[{request_tag}] 流式窗口已切段，仍在继续处理；当前已累积后续输出 {} 字节。",
+                        post_stream_buffer.len() + token_buf.len()
+                    );
+                    send_plain(heartbeat, &self.outbound_tx, msg.platform, &chat_id);
+                    post_stream_heartbeat_timer.as_mut().reset(
+                        tokio::time::Instant::now() + WECOM_POST_STREAM_HEARTBEAT,
+                    );
                 }
                 _ = &mut next_timer => {
                     if !sent_initial_ack {
@@ -2246,11 +2328,16 @@ impl GatewayRunner {
         if cost > 0.001 {
             stats_parts.push(format!("${cost:.3}"));
         }
+        let progressive_delivery_len = if progressive_text_len > 0 || post_stream_final_sent {
+            progressive_text_len.max(1)
+        } else {
+            0
+        };
         text = build_final_message(
             &text,
             &action_results_text,
             &stats_parts,
-            progressive_text_len,
+            progressive_delivery_len,
             &request_tag,
         );
 
@@ -2283,7 +2370,7 @@ impl GatewayRunner {
         // as a plain message (no durable outbox) avoids retry storms: if this
         // low-value footer fails to deliver it is simply dropped rather than
         // retried on every restart.
-        if progressive_text_len > 0 {
+        if progressive_delivery_len > 0 {
             // Still mark the trace request as completed (even without outbox).
             if let Some(writer) = trace_writer.as_ref() {
                 let _ = writer.complete_request().await;
