@@ -39,6 +39,11 @@ struct ProcessHandle {
     last_text: Arc<Mutex<String>>,
     tokens_prompt: Arc<Mutex<Option<u64>>>,
     tokens_completion: Arc<Mutex<Option<u64>>>,
+    cached_input_tokens: Arc<Mutex<Option<u64>>>,
+    reasoning_output_tokens: Arc<Mutex<Option<u64>>>,
+    total_tokens: Arc<Mutex<Option<u64>>>,
+    context_window: Arc<Mutex<Option<u64>>>,
+    raw_usage_json: Arc<Mutex<Option<String>>>,
     tool_calls_count: Arc<Mutex<u32>>,
     tools_used: Arc<Mutex<Vec<String>>>,
     last_error: Arc<Mutex<Option<String>>>,
@@ -93,6 +98,11 @@ impl CodexAppPool {
         *handle.last_text.lock().await = String::new();
         *handle.tokens_prompt.lock().await = None;
         *handle.tokens_completion.lock().await = None;
+        *handle.cached_input_tokens.lock().await = None;
+        *handle.reasoning_output_tokens.lock().await = None;
+        *handle.total_tokens.lock().await = None;
+        *handle.context_window.lock().await = None;
+        *handle.raw_usage_json.lock().await = None;
         *handle.tool_calls_count.lock().await = 0;
         *handle.tools_used.lock().await = Vec::new();
         *handle.last_error.lock().await = None;
@@ -238,6 +248,15 @@ impl CodexAppPool {
             tools_used,
             tokens_prompt: *handle.tokens_prompt.lock().await,
             tokens_completion: *handle.tokens_completion.lock().await,
+            cached_input_tokens: *handle.cached_input_tokens.lock().await,
+            cache_creation_input_tokens: None,
+            cache_read_input_tokens: None,
+            reasoning_output_tokens: *handle.reasoning_output_tokens.lock().await,
+            total_tokens: *handle.total_tokens.lock().await,
+            context_window: *handle.context_window.lock().await,
+            max_output_tokens: None,
+            cost_usd: None,
+            raw_usage_json: handle.raw_usage_json.lock().await.clone(),
         })
     }
 
@@ -281,6 +300,11 @@ impl CodexAppPool {
         let last_text = Arc::new(Mutex::new(String::new()));
         let tokens_prompt = Arc::new(Mutex::new(None));
         let tokens_completion = Arc::new(Mutex::new(None));
+        let cached_input_tokens = Arc::new(Mutex::new(None));
+        let reasoning_output_tokens = Arc::new(Mutex::new(None));
+        let total_tokens = Arc::new(Mutex::new(None));
+        let context_window = Arc::new(Mutex::new(None));
+        let raw_usage_json = Arc::new(Mutex::new(None));
         let tool_calls_count = Arc::new(Mutex::new(0));
         let tools_used = Arc::new(Mutex::new(Vec::new()));
         let last_error = Arc::new(Mutex::new(None));
@@ -298,6 +322,11 @@ impl CodexAppPool {
             last_text.clone(),
             tokens_prompt.clone(),
             tokens_completion.clone(),
+            cached_input_tokens.clone(),
+            reasoning_output_tokens.clone(),
+            total_tokens.clone(),
+            context_window.clone(),
+            raw_usage_json.clone(),
             tool_calls_count.clone(),
             tools_used.clone(),
             last_error.clone(),
@@ -330,6 +359,11 @@ impl CodexAppPool {
             last_text,
             tokens_prompt,
             tokens_completion,
+            cached_input_tokens,
+            reasoning_output_tokens,
+            total_tokens,
+            context_window,
+            raw_usage_json,
             tool_calls_count,
             tools_used,
             last_error,
@@ -584,6 +618,11 @@ async fn stdout_reader_task(
     last_text: Arc<Mutex<String>>,
     tokens_prompt: Arc<Mutex<Option<u64>>>,
     tokens_completion: Arc<Mutex<Option<u64>>>,
+    cached_input_tokens: Arc<Mutex<Option<u64>>>,
+    reasoning_output_tokens: Arc<Mutex<Option<u64>>>,
+    total_tokens: Arc<Mutex<Option<u64>>>,
+    context_window: Arc<Mutex<Option<u64>>>,
+    raw_usage_json: Arc<Mutex<Option<String>>>,
     tool_calls_count: Arc<Mutex<u32>>,
     tools_used: Arc<Mutex<Vec<String>>>,
     last_error: Arc<Mutex<Option<String>>>,
@@ -626,6 +665,11 @@ async fn stdout_reader_task(
                             &last_text,
                             &tokens_prompt,
                             &tokens_completion,
+                            &cached_input_tokens,
+                            &reasoning_output_tokens,
+                            &total_tokens,
+                            &context_window,
+                            &raw_usage_json,
                             &tool_calls_count,
                             &tools_used,
                             &last_error,
@@ -693,6 +737,11 @@ async fn handle_notification(
     last_text: &Arc<Mutex<String>>,
     tokens_prompt: &Arc<Mutex<Option<u64>>>,
     tokens_completion: &Arc<Mutex<Option<u64>>>,
+    cached_input_tokens: &Arc<Mutex<Option<u64>>>,
+    reasoning_output_tokens: &Arc<Mutex<Option<u64>>>,
+    total_tokens: &Arc<Mutex<Option<u64>>>,
+    context_window: &Arc<Mutex<Option<u64>>>,
+    raw_usage_json: &Arc<Mutex<Option<String>>>,
     tool_calls_count: &Arc<Mutex<u32>>,
     tools_used: &Arc<Mutex<Vec<String>>>,
     last_error: &Arc<Mutex<Option<String>>>,
@@ -773,6 +822,11 @@ async fn handle_notification(
             let usage = &params["tokenUsage"]["last"];
             *tokens_prompt.lock().await = usage["inputTokens"].as_u64();
             *tokens_completion.lock().await = usage["outputTokens"].as_u64();
+            *cached_input_tokens.lock().await = usage["cachedInputTokens"].as_u64();
+            *reasoning_output_tokens.lock().await = usage["reasoningOutputTokens"].as_u64();
+            *total_tokens.lock().await = usage["totalTokens"].as_u64();
+            *context_window.lock().await = params["tokenUsage"]["modelContextWindow"].as_u64();
+            *raw_usage_json.lock().await = serde_json::to_string(&params["tokenUsage"]).ok();
         }
         "turn/completed" => {
             if params["status"].as_str() == Some("failed") {
@@ -1255,6 +1309,11 @@ mod tests {
         let last_text = Arc::new(Mutex::new("partial text".to_string()));
         let tokens_prompt = Arc::new(Mutex::new(None));
         let tokens_completion = Arc::new(Mutex::new(None));
+        let cached_input_tokens = Arc::new(Mutex::new(None));
+        let reasoning_output_tokens = Arc::new(Mutex::new(None));
+        let total_tokens = Arc::new(Mutex::new(None));
+        let context_window = Arc::new(Mutex::new(None));
+        let raw_usage_json = Arc::new(Mutex::new(None));
         let tool_calls_count = Arc::new(Mutex::new(0));
         let tools_used = Arc::new(Mutex::new(Vec::new()));
         let last_error = Arc::new(Mutex::new(None));
@@ -1272,6 +1331,11 @@ mod tests {
             &last_text,
             &tokens_prompt,
             &tokens_completion,
+            &cached_input_tokens,
+            &reasoning_output_tokens,
+            &total_tokens,
+            &context_window,
+            &raw_usage_json,
             &tool_calls_count,
             &tools_used,
             &last_error,
@@ -1290,6 +1354,11 @@ mod tests {
             &last_text,
             &tokens_prompt,
             &tokens_completion,
+            &cached_input_tokens,
+            &reasoning_output_tokens,
+            &total_tokens,
+            &context_window,
+            &raw_usage_json,
             &tool_calls_count,
             &tools_used,
             &last_error,
@@ -1346,6 +1415,11 @@ mod tests {
         let last_text = Arc::new(Mutex::new(String::new()));
         let tokens_prompt = Arc::new(Mutex::new(None));
         let tokens_completion = Arc::new(Mutex::new(None));
+        let cached_input_tokens = Arc::new(Mutex::new(None));
+        let reasoning_output_tokens = Arc::new(Mutex::new(None));
+        let total_tokens = Arc::new(Mutex::new(None));
+        let context_window = Arc::new(Mutex::new(None));
+        let raw_usage_json = Arc::new(Mutex::new(None));
         let tool_calls_count = Arc::new(Mutex::new(0));
         let tools_used = Arc::new(Mutex::new(Vec::new()));
         let last_error = Arc::new(Mutex::new(None));
@@ -1371,6 +1445,11 @@ mod tests {
             &last_text,
             &tokens_prompt,
             &tokens_completion,
+            &cached_input_tokens,
+            &reasoning_output_tokens,
+            &total_tokens,
+            &context_window,
+            &raw_usage_json,
             &tool_calls_count,
             &tools_used,
             &last_error,
