@@ -1318,19 +1318,56 @@ impl GatewayRunner {
                     tracing::info!(key = %pool_key, "pool: cleared stale session");
                 }
 
-                let (text, tokens_prompt, tokens_completion, tool_calls_count) =
-                    if let Some(ref v) = result_json {
-                        (
-                            v["result"].as_str().map(String::from),
-                            v["usage"]["input_tokens"].as_u64(),
-                            v["usage"]["output_tokens"].as_u64(),
-                            v["num_turns"]
-                                .as_u64()
-                                .and_then(|t| if t > 1 { Some(t as u32) } else { None }),
-                        )
-                    } else {
-                        (None, None, None, None)
-                    };
+                let (
+                    text,
+                    tokens_prompt,
+                    tokens_completion,
+                    tool_calls_count,
+                    cache_creation_input_tokens,
+                    cache_read_input_tokens,
+                    context_window,
+                    max_output_tokens,
+                    cost_usd,
+                    raw_usage_json,
+                ) = if let Some(ref v) = result_json {
+                    let usage = &v["usage"];
+                    let model_usage = v["modelUsage"].as_object().and_then(|m| m.values().next());
+                    (
+                        v["result"].as_str().map(String::from),
+                        usage["input_tokens"].as_u64(),
+                        usage["output_tokens"].as_u64(),
+                        v["num_turns"]
+                            .as_u64()
+                            .and_then(|t| if t > 1 { Some(t as u32) } else { None }),
+                        usage["cache_creation_input_tokens"].as_u64(),
+                        usage["cache_read_input_tokens"].as_u64(),
+                        model_usage.and_then(|m| m["contextWindow"].as_u64()),
+                        model_usage.and_then(|m| m["maxOutputTokens"].as_u64()),
+                        v["total_cost_usd"]
+                            .as_f64()
+                            .or_else(|| model_usage.and_then(|m| m["costUSD"].as_f64())),
+                        serde_json::to_string(usage).ok(),
+                    )
+                } else {
+                    (None, None, None, None, None, None, None, None, None, None)
+                };
+                let total_tokens = {
+                    let mut total = 0u64;
+                    let mut any = false;
+                    for value in [
+                        tokens_prompt,
+                        tokens_completion,
+                        cache_creation_input_tokens,
+                        cache_read_input_tokens,
+                    ]
+                    .into_iter()
+                    .flatten()
+                    {
+                        total = total.saturating_add(value);
+                        any = true;
+                    }
+                    any.then_some(total)
+                };
 
                 // Process exited without producing a result event
                 if result_json.is_none() && text.is_none() {
@@ -1356,6 +1393,15 @@ impl GatewayRunner {
                     tools_used: Vec::new(),
                     tokens_prompt,
                     tokens_completion,
+                    cached_input_tokens: cache_read_input_tokens,
+                    cache_creation_input_tokens,
+                    cache_read_input_tokens,
+                    reasoning_output_tokens: None,
+                    total_tokens,
+                    context_window,
+                    max_output_tokens,
+                    cost_usd,
+                    raw_usage_json,
                 })
             })
         } else if use_codex_app_pool {
@@ -2312,13 +2358,48 @@ impl GatewayRunner {
         let elapsed = start.elapsed();
         let prompt_tok = result.tokens_prompt.unwrap_or(0);
         let completion_tok = result.tokens_completion.unwrap_or(0);
-        let cost = (prompt_tok as f64 * 3.0 + completion_tok as f64 * 15.0) / 1_000_000.0;
+        let cache_create_tok = result.cache_creation_input_tokens.unwrap_or(0);
+        let cache_read_tok = result.cache_read_input_tokens.unwrap_or(0);
+        let cached_tok = result.cached_input_tokens.unwrap_or(0);
+        let reasoning_tok = result.reasoning_output_tokens.unwrap_or(0);
+        let total_tok = result.total_tokens.unwrap_or_else(|| {
+            prompt_tok + completion_tok + cache_create_tok + cache_read_tok + reasoning_tok
+        });
+        let cost = result.cost_usd.unwrap_or_else(|| {
+            (prompt_tok as f64 * 3.0 + completion_tok as f64 * 15.0) / 1_000_000.0
+        });
         let mut stats_parts = Vec::new();
         if prompt_tok > 0 {
             stats_parts.push(format!("↓{}", format_tokens(prompt_tok)));
         }
         if completion_tok > 0 {
             stats_parts.push(format!("↑{}", format_tokens(completion_tok)));
+        }
+        if cache_read_tok > 0 || cache_create_tok > 0 || cached_tok > 0 {
+            let cache_display = cache_read_tok.max(cached_tok);
+            let cache_part = if cache_create_tok > 0 {
+                format!(
+                    "cache r{} c{}",
+                    format_tokens(cache_display),
+                    format_tokens(cache_create_tok)
+                )
+            } else {
+                format!("cache {}", format_tokens(cache_display))
+            };
+            stats_parts.push(cache_part);
+        }
+        if reasoning_tok > 0 {
+            stats_parts.push(format!("reason {}", format_tokens(reasoning_tok)));
+        }
+        if let Some(context_window) = result.context_window
+            && context_window > 0
+            && total_tok > 0
+        {
+            stats_parts.push(format!(
+                "ctx {}/{}",
+                format_tokens(total_tok),
+                format_tokens(context_window)
+            ));
         }
         let tool_count_total = result.tool_calls_count.unwrap_or(0);
         if tool_count_total > 0 {
@@ -2349,8 +2430,30 @@ impl GatewayRunner {
                     user_id: msg.user_id.clone(),
                     cli_profile: cli_name.clone(),
                     model: cli_profile.model_name().map(String::from),
-                    tokens_prompt: result.tokens_prompt.unwrap_or(0),
-                    tokens_completion: result.tokens_completion.unwrap_or(0),
+                    trace_id: result
+                        .trace_id
+                        .clone()
+                        .or_else(|| trace.as_ref().map(|t| t.trace_id.to_string())),
+                    request_id: result
+                        .request_id
+                        .clone()
+                        .or_else(|| trace.as_ref().map(|t| t.request_id.to_string())),
+                    run_id: result
+                        .run_id
+                        .clone()
+                        .or_else(|| run_id.as_ref().map(ToString::to_string)),
+                    session_id: result.session_id.clone(),
+                    tokens_prompt: prompt_tok,
+                    tokens_completion: completion_tok,
+                    cached_input_tokens: cached_tok,
+                    cache_creation_input_tokens: cache_create_tok,
+                    cache_read_input_tokens: cache_read_tok,
+                    reasoning_output_tokens: reasoning_tok,
+                    total_tokens: total_tok,
+                    context_window: result.context_window,
+                    max_output_tokens: result.max_output_tokens,
+                    cost_usd: result.cost_usd,
+                    raw_usage_json: result.raw_usage_json.clone(),
                     tool_calls: result.tool_calls_count.unwrap_or(0),
                     elapsed_ms: elapsed.as_millis() as u64,
                 })

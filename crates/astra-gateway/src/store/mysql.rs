@@ -47,8 +47,21 @@ impl MysqlGatewayStore {
                 user_id VARCHAR(128) NOT NULL,
                 cli_profile VARCHAR(32) NOT NULL DEFAULT 'astra',
                 model VARCHAR(128),
+                trace_id VARCHAR(64),
+                request_id VARCHAR(64),
+                run_id VARCHAR(64),
+                session_id VARCHAR(128),
                 tokens_prompt BIGINT NOT NULL DEFAULT 0,
                 tokens_completion BIGINT NOT NULL DEFAULT 0,
+                cached_input_tokens BIGINT NOT NULL DEFAULT 0,
+                cache_creation_input_tokens BIGINT NOT NULL DEFAULT 0,
+                cache_read_input_tokens BIGINT NOT NULL DEFAULT 0,
+                reasoning_output_tokens BIGINT NOT NULL DEFAULT 0,
+                total_tokens BIGINT NOT NULL DEFAULT 0,
+                context_window BIGINT,
+                max_output_tokens BIGINT,
+                cost_usd DOUBLE,
+                raw_usage_json JSON,
                 tool_calls INT NOT NULL DEFAULT 0,
                 elapsed_ms BIGINT NOT NULL DEFAULT 0,
                 created_at DATETIME(6) DEFAULT NOW(6),
@@ -58,6 +71,23 @@ impl MysqlGatewayStore {
         .execute(&self.pool)
         .await
         .map_err(|e| StoreError::Database(e.to_string()))?;
+        for migration in [
+            "ALTER TABLE gw_usage ADD COLUMN trace_id VARCHAR(64)",
+            "ALTER TABLE gw_usage ADD COLUMN request_id VARCHAR(64)",
+            "ALTER TABLE gw_usage ADD COLUMN run_id VARCHAR(64)",
+            "ALTER TABLE gw_usage ADD COLUMN session_id VARCHAR(128)",
+            "ALTER TABLE gw_usage ADD COLUMN cached_input_tokens BIGINT NOT NULL DEFAULT 0",
+            "ALTER TABLE gw_usage ADD COLUMN cache_creation_input_tokens BIGINT NOT NULL DEFAULT 0",
+            "ALTER TABLE gw_usage ADD COLUMN cache_read_input_tokens BIGINT NOT NULL DEFAULT 0",
+            "ALTER TABLE gw_usage ADD COLUMN reasoning_output_tokens BIGINT NOT NULL DEFAULT 0",
+            "ALTER TABLE gw_usage ADD COLUMN total_tokens BIGINT NOT NULL DEFAULT 0",
+            "ALTER TABLE gw_usage ADD COLUMN context_window BIGINT",
+            "ALTER TABLE gw_usage ADD COLUMN max_output_tokens BIGINT",
+            "ALTER TABLE gw_usage ADD COLUMN cost_usd DOUBLE",
+            "ALTER TABLE gw_usage ADD COLUMN raw_usage_json JSON",
+        ] {
+            let _ = sqlx::query(migration).execute(&self.pool).await;
+        }
         Ok(())
     }
 }
@@ -182,6 +212,8 @@ impl GatewayStore for MysqlGatewayStore {
         .execute(&self.pool)
         .await
         .map_err(|e| StoreError::Database(e.to_string()))?;
+
+        self.ensure_usage_table().await?;
 
         tracing::info!("gateway schema ensured");
         Ok(())
@@ -716,15 +748,33 @@ impl GatewayStore for MysqlGatewayStore {
 
     async fn record_usage(&self, record: &UsageRecord) -> Result<(), StoreError> {
         sqlx::query(
-            "INSERT INTO gw_usage (platform, user_id, cli_profile, model, tokens_prompt, tokens_completion, tool_calls, elapsed_ms)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO gw_usage (
+                platform, user_id, cli_profile, model, trace_id, request_id, run_id, session_id,
+                tokens_prompt, tokens_completion, cached_input_tokens, cache_creation_input_tokens,
+                cache_read_input_tokens, reasoning_output_tokens, total_tokens, context_window,
+                max_output_tokens, cost_usd, raw_usage_json, tool_calls, elapsed_ms
+             )
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&record.platform)
         .bind(&record.user_id)
         .bind(&record.cli_profile)
         .bind(&record.model)
+        .bind(&record.trace_id)
+        .bind(&record.request_id)
+        .bind(&record.run_id)
+        .bind(&record.session_id)
         .bind(record.tokens_prompt as i64)
         .bind(record.tokens_completion as i64)
+        .bind(record.cached_input_tokens as i64)
+        .bind(record.cache_creation_input_tokens as i64)
+        .bind(record.cache_read_input_tokens as i64)
+        .bind(record.reasoning_output_tokens as i64)
+        .bind(record.total_tokens as i64)
+        .bind(record.context_window.map(|v| v as i64))
+        .bind(record.max_output_tokens.map(|v| v as i64))
+        .bind(record.cost_usd)
+        .bind(&record.raw_usage_json)
         .bind(record.tool_calls as i32)
         .bind(record.elapsed_ms as i64)
         .execute(&self.pool)
@@ -738,8 +788,36 @@ impl GatewayStore for MysqlGatewayStore {
         platform: &str,
         user_id: &str,
     ) -> Result<UsageSummary, StoreError> {
-        let row: Option<(i64, i64, i64, i64)> = sqlx::query_as(
-            "SELECT COUNT(*), COALESCE(SUM(tokens_prompt),0), COALESCE(SUM(tokens_completion),0), COALESCE(SUM(tool_calls),0)
+        let row: Option<(
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            Option<i64>,
+            Option<i64>,
+            f64,
+            i64,
+        )> = sqlx::query_as(
+            "SELECT COUNT(*),
+                    COALESCE(SUM(tokens_prompt),0),
+                    COALESCE(SUM(tokens_completion),0),
+                    COALESCE(SUM(cached_input_tokens),0),
+                    COALESCE(SUM(cache_creation_input_tokens),0),
+                    COALESCE(SUM(cache_read_input_tokens),0),
+                    COALESCE(SUM(reasoning_output_tokens),0),
+                    COALESCE(SUM(CASE
+                        WHEN total_tokens > 0 THEN total_tokens
+                        ELSE tokens_prompt + tokens_completion + cache_creation_input_tokens
+                             + cache_read_input_tokens + reasoning_output_tokens
+                    END),0),
+                    MAX(context_window),
+                    MAX(max_output_tokens),
+                    COALESCE(SUM(cost_usd),0.0),
+                    COALESCE(SUM(tool_calls),0)
              FROM gw_usage WHERE platform = ? AND user_id = ? AND created_at >= CURDATE()",
         )
         .bind(platform)
@@ -749,12 +827,35 @@ impl GatewayStore for MysqlGatewayStore {
         .map_err(|e| StoreError::Database(e.to_string()))?;
 
         Ok(row
-            .map(|(m, p, c, t)| UsageSummary {
-                messages: m as u64,
-                tokens_prompt: p as u64,
-                tokens_completion: c as u64,
-                tool_calls: t as u64,
-            })
+            .map(
+                |(
+                    m,
+                    p,
+                    c,
+                    cached,
+                    cache_create,
+                    cache_read,
+                    reasoning,
+                    total,
+                    ctx,
+                    max_out,
+                    cost,
+                    t,
+                )| UsageSummary {
+                    messages: m as u64,
+                    tokens_prompt: p as u64,
+                    tokens_completion: c as u64,
+                    cached_input_tokens: cached as u64,
+                    cache_creation_input_tokens: cache_create as u64,
+                    cache_read_input_tokens: cache_read as u64,
+                    reasoning_output_tokens: reasoning as u64,
+                    total_tokens: total as u64,
+                    context_window: ctx.map(|v| v as u64),
+                    max_output_tokens: max_out.map(|v| v as u64),
+                    cost_usd: cost,
+                    tool_calls: t as u64,
+                },
+            )
             .unwrap_or_default())
     }
 
@@ -763,8 +864,36 @@ impl GatewayStore for MysqlGatewayStore {
         platform: &str,
         user_id: &str,
     ) -> Result<UsageSummary, StoreError> {
-        let row: Option<(i64, i64, i64, i64)> = sqlx::query_as(
-            "SELECT COUNT(*), COALESCE(SUM(tokens_prompt),0), COALESCE(SUM(tokens_completion),0), COALESCE(SUM(tool_calls),0)
+        let row: Option<(
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            Option<i64>,
+            Option<i64>,
+            f64,
+            i64,
+        )> = sqlx::query_as(
+            "SELECT COUNT(*),
+                    COALESCE(SUM(tokens_prompt),0),
+                    COALESCE(SUM(tokens_completion),0),
+                    COALESCE(SUM(cached_input_tokens),0),
+                    COALESCE(SUM(cache_creation_input_tokens),0),
+                    COALESCE(SUM(cache_read_input_tokens),0),
+                    COALESCE(SUM(reasoning_output_tokens),0),
+                    COALESCE(SUM(CASE
+                        WHEN total_tokens > 0 THEN total_tokens
+                        ELSE tokens_prompt + tokens_completion + cache_creation_input_tokens
+                             + cache_read_input_tokens + reasoning_output_tokens
+                    END),0),
+                    MAX(context_window),
+                    MAX(max_output_tokens),
+                    COALESCE(SUM(cost_usd),0.0),
+                    COALESCE(SUM(tool_calls),0)
              FROM gw_usage WHERE platform = ? AND user_id = ?",
         )
         .bind(platform)
@@ -774,12 +903,113 @@ impl GatewayStore for MysqlGatewayStore {
         .map_err(|e| StoreError::Database(e.to_string()))?;
 
         Ok(row
-            .map(|(m, p, c, t)| UsageSummary {
-                messages: m as u64,
-                tokens_prompt: p as u64,
-                tokens_completion: c as u64,
-                tool_calls: t as u64,
-            })
+            .map(
+                |(
+                    m,
+                    p,
+                    c,
+                    cached,
+                    cache_create,
+                    cache_read,
+                    reasoning,
+                    total,
+                    ctx,
+                    max_out,
+                    cost,
+                    t,
+                )| UsageSummary {
+                    messages: m as u64,
+                    tokens_prompt: p as u64,
+                    tokens_completion: c as u64,
+                    cached_input_tokens: cached as u64,
+                    cache_creation_input_tokens: cache_create as u64,
+                    cache_read_input_tokens: cache_read as u64,
+                    reasoning_output_tokens: reasoning as u64,
+                    total_tokens: total as u64,
+                    context_window: ctx.map(|v| v as u64),
+                    max_output_tokens: max_out.map(|v| v as u64),
+                    cost_usd: cost,
+                    tool_calls: t as u64,
+                },
+            )
+            .unwrap_or_default())
+    }
+
+    async fn get_usage_session(
+        &self,
+        platform: &str,
+        user_id: &str,
+        session_id: &str,
+    ) -> Result<UsageSummary, StoreError> {
+        let row: Option<(
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            Option<i64>,
+            Option<i64>,
+            f64,
+            i64,
+        )> = sqlx::query_as(
+            "SELECT COUNT(*),
+                    COALESCE(SUM(tokens_prompt),0),
+                    COALESCE(SUM(tokens_completion),0),
+                    COALESCE(SUM(cached_input_tokens),0),
+                    COALESCE(SUM(cache_creation_input_tokens),0),
+                    COALESCE(SUM(cache_read_input_tokens),0),
+                    COALESCE(SUM(reasoning_output_tokens),0),
+                    COALESCE(SUM(CASE
+                        WHEN total_tokens > 0 THEN total_tokens
+                        ELSE tokens_prompt + tokens_completion + cache_creation_input_tokens
+                             + cache_read_input_tokens + reasoning_output_tokens
+                    END),0),
+                    MAX(context_window),
+                    MAX(max_output_tokens),
+                    COALESCE(SUM(cost_usd),0.0),
+                    COALESCE(SUM(tool_calls),0)
+             FROM gw_usage WHERE platform = ? AND user_id = ? AND session_id = ?",
+        )
+        .bind(platform)
+        .bind(user_id)
+        .bind(session_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| StoreError::Database(e.to_string()))?;
+
+        Ok(row
+            .map(
+                |(
+                    m,
+                    p,
+                    c,
+                    cached,
+                    cache_create,
+                    cache_read,
+                    reasoning,
+                    total,
+                    ctx,
+                    max_out,
+                    cost,
+                    t,
+                )| UsageSummary {
+                    messages: m as u64,
+                    tokens_prompt: p as u64,
+                    tokens_completion: c as u64,
+                    cached_input_tokens: cached as u64,
+                    cache_creation_input_tokens: cache_create as u64,
+                    cache_read_input_tokens: cache_read as u64,
+                    reasoning_output_tokens: reasoning as u64,
+                    total_tokens: total as u64,
+                    context_window: ctx.map(|v| v as u64),
+                    max_output_tokens: max_out.map(|v| v as u64),
+                    cost_usd: cost,
+                    tool_calls: t as u64,
+                },
+            )
             .unwrap_or_default())
     }
 

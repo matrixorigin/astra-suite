@@ -81,8 +81,26 @@ struct UsageEntry {
     user_id: String,
     cli_profile: String,
     model: Option<String>,
+    trace_id: Option<String>,
+    request_id: Option<String>,
+    run_id: Option<String>,
+    session_id: Option<String>,
     tokens_prompt: u64,
     tokens_completion: u64,
+    #[serde(default)]
+    cached_input_tokens: u64,
+    #[serde(default)]
+    cache_creation_input_tokens: u64,
+    #[serde(default)]
+    cache_read_input_tokens: u64,
+    #[serde(default)]
+    reasoning_output_tokens: u64,
+    #[serde(default)]
+    total_tokens: u64,
+    context_window: Option<u64>,
+    max_output_tokens: Option<u64>,
+    cost_usd: Option<f64>,
+    raw_usage_json: Option<String>,
     tool_calls: u32,
     elapsed_ms: u64,
     created_at: String,
@@ -561,8 +579,21 @@ impl GatewayStore for FileGatewayStore {
             user_id: record.user_id.clone(),
             cli_profile: record.cli_profile.clone(),
             model: record.model.clone(),
+            trace_id: record.trace_id.clone(),
+            request_id: record.request_id.clone(),
+            run_id: record.run_id.clone(),
+            session_id: record.session_id.clone(),
             tokens_prompt: record.tokens_prompt,
             tokens_completion: record.tokens_completion,
+            cached_input_tokens: record.cached_input_tokens,
+            cache_creation_input_tokens: record.cache_creation_input_tokens,
+            cache_read_input_tokens: record.cache_read_input_tokens,
+            reasoning_output_tokens: record.reasoning_output_tokens,
+            total_tokens: record.total_tokens,
+            context_window: record.context_window,
+            max_output_tokens: record.max_output_tokens,
+            cost_usd: record.cost_usd,
+            raw_usage_json: record.raw_usage_json.clone(),
             tool_calls: record.tool_calls,
             elapsed_ms: record.elapsed_ms,
             created_at: now_str(),
@@ -597,12 +628,7 @@ impl GatewayStore for FileGatewayStore {
         user_id: &str,
     ) -> Result<UsageSummary, StoreError> {
         let dir = self.base_dir.join("usage");
-        let mut total = UsageSummary {
-            messages: 0,
-            tokens_prompt: 0,
-            tokens_completion: 0,
-            tool_calls: 0,
-        };
+        let mut total = UsageSummary::default();
         let mut entries = match tokio::fs::read_dir(&dir).await {
             Ok(e) => e,
             Err(_) => return Ok(total),
@@ -614,6 +640,48 @@ impl GatewayStore for FileGatewayStore {
                 total.messages += day.messages;
                 total.tokens_prompt += day.tokens_prompt;
                 total.tokens_completion += day.tokens_completion;
+                total.cached_input_tokens += day.cached_input_tokens;
+                total.cache_creation_input_tokens += day.cache_creation_input_tokens;
+                total.cache_read_input_tokens += day.cache_read_input_tokens;
+                total.reasoning_output_tokens += day.reasoning_output_tokens;
+                total.total_tokens += day.total_tokens;
+                total.context_window = total.context_window.max(day.context_window);
+                total.max_output_tokens = total.max_output_tokens.max(day.max_output_tokens);
+                total.cost_usd += day.cost_usd;
+                total.tool_calls += day.tool_calls;
+            }
+        }
+        Ok(total)
+    }
+
+    async fn get_usage_session(
+        &self,
+        platform: &str,
+        user_id: &str,
+        session_id: &str,
+    ) -> Result<UsageSummary, StoreError> {
+        let dir = self.base_dir.join("usage");
+        let mut total = UsageSummary::default();
+        let mut entries = match tokio::fs::read_dir(&dir).await {
+            Ok(e) => e,
+            Err(_) => return Ok(total),
+        };
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
+                let day =
+                    load_usage_summary_for_session(&path, platform, user_id, session_id).await?;
+                total.messages += day.messages;
+                total.tokens_prompt += day.tokens_prompt;
+                total.tokens_completion += day.tokens_completion;
+                total.cached_input_tokens += day.cached_input_tokens;
+                total.cache_creation_input_tokens += day.cache_creation_input_tokens;
+                total.cache_read_input_tokens += day.cache_read_input_tokens;
+                total.reasoning_output_tokens += day.reasoning_output_tokens;
+                total.total_tokens += day.total_tokens;
+                total.context_window = total.context_window.max(day.context_window);
+                total.max_output_tokens = total.max_output_tokens.max(day.max_output_tokens);
+                total.cost_usd += day.cost_usd;
                 total.tool_calls += day.tool_calls;
             }
         }
@@ -770,12 +838,25 @@ async fn load_usage_summary(
     platform: &str,
     user_id: &str,
 ) -> Result<UsageSummary, StoreError> {
-    let mut summary = UsageSummary {
-        messages: 0,
-        tokens_prompt: 0,
-        tokens_completion: 0,
-        tool_calls: 0,
-    };
+    load_usage_summary_filtered(path, platform, user_id, None).await
+}
+
+async fn load_usage_summary_for_session(
+    path: &Path,
+    platform: &str,
+    user_id: &str,
+    session_id: &str,
+) -> Result<UsageSummary, StoreError> {
+    load_usage_summary_filtered(path, platform, user_id, Some(session_id)).await
+}
+
+async fn load_usage_summary_filtered(
+    path: &Path,
+    platform: &str,
+    user_id: &str,
+    session_id: Option<&str>,
+) -> Result<UsageSummary, StoreError> {
+    let mut summary = UsageSummary::default();
     let data = match tokio::fs::read_to_string(path).await {
         Ok(d) => d,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(summary),
@@ -788,10 +869,27 @@ async fn load_usage_summary(
         if let Ok(entry) = serde_json::from_str::<UsageEntry>(line)
             && entry.platform == platform
             && entry.user_id == user_id
+            && session_id.is_none_or(|sid| entry.session_id.as_deref() == Some(sid))
         {
             summary.messages += 1;
             summary.tokens_prompt += entry.tokens_prompt;
             summary.tokens_completion += entry.tokens_completion;
+            summary.cached_input_tokens += entry.cached_input_tokens;
+            summary.cache_creation_input_tokens += entry.cache_creation_input_tokens;
+            summary.cache_read_input_tokens += entry.cache_read_input_tokens;
+            summary.reasoning_output_tokens += entry.reasoning_output_tokens;
+            summary.total_tokens += if entry.total_tokens > 0 {
+                entry.total_tokens
+            } else {
+                entry.tokens_prompt
+                    + entry.tokens_completion
+                    + entry.cache_creation_input_tokens
+                    + entry.cache_read_input_tokens
+                    + entry.reasoning_output_tokens
+            };
+            summary.context_window = summary.context_window.max(entry.context_window);
+            summary.max_output_tokens = summary.max_output_tokens.max(entry.max_output_tokens);
+            summary.cost_usd += entry.cost_usd.unwrap_or(0.0);
             summary.tool_calls += entry.tool_calls as u64;
         }
     }
@@ -1011,8 +1109,21 @@ mod tests {
             user_id: "u1".into(),
             cli_profile: "astra".into(),
             model: None,
+            trace_id: None,
+            request_id: None,
+            run_id: None,
+            session_id: None,
             tokens_prompt: 100,
             tokens_completion: 50,
+            cached_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+            reasoning_output_tokens: 0,
+            total_tokens: 150,
+            context_window: None,
+            max_output_tokens: None,
+            cost_usd: None,
+            raw_usage_json: None,
             tool_calls: 2,
             elapsed_ms: 3000,
         };
@@ -1020,7 +1131,9 @@ mod tests {
         let today = store.get_usage_today("wx", "u1").await.unwrap();
         assert_eq!(today.messages, 1);
         assert_eq!(today.tokens_prompt, 100);
+        assert_eq!(today.total_tokens, 150);
         let total = store.get_usage_total("wx", "u1").await.unwrap();
         assert_eq!(total.messages, 1);
+        assert_eq!(total.total_tokens, 150);
     }
 }
