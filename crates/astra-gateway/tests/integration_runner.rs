@@ -929,6 +929,13 @@ async fn group_mention_filter() {
     let result = gw.runner.handle_fast(&m).await;
     // This goes to slow path (Err) since it's not a slash command
     assert!(result.is_err());
+
+    // Bare @mention should also pass the mention gate and become a greeting
+    // before entering the slow path.
+    let m = group_msg("group-mention", "user-1", "@Astra");
+    let result = gw.runner.handle_fast(&m).await;
+    let slow_msg = result.expect_err("bare mention should enter slow path");
+    assert_eq!(slow_msg.text, "你好");
 }
 
 #[tokio::test]
