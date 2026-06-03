@@ -1306,10 +1306,8 @@ impl GatewayRunner {
                     .unwrap_or_default();
                 drop(pool_guard);
 
-                // Clear stale session if the CLI reported it missing
-                if stderr_hint.contains("No conversation found")
-                    || stderr_hint.contains("session not found")
-                {
+                // Clear stale session if the CLI reported it missing.
+                if profile.is_stale_session_error(&stderr_hint) {
                     if let Some(ref store) = pool_store {
                         let _ = store
                             .reset_session(&pool_platform, &pool_key, &pool_cli_name)
@@ -1370,20 +1368,28 @@ impl GatewayRunner {
                 };
 
                 // Process exited without producing a result event
-                if result_json.is_none() && text.is_none() {
+                if result_json.is_none()
+                    && text.is_none()
+                    && !profile.is_stale_session_error(&stderr_hint)
+                {
                     return Err(if stderr_hint.is_empty() {
                         "pool process exited without result".to_string()
                     } else {
                         format!("pool process exited: {stderr_hint}")
                     });
                 }
+                let stale_session_error = profile.is_stale_session_error(&stderr_hint);
 
                 Ok(cli_bridge::CliResult {
                     stdout: String::new(),
-                    stderr: String::new(),
-                    exit_code: 0,
-                    success: true,
-                    error_kind: None,
+                    stderr: stderr_hint,
+                    exit_code: if stale_session_error { 1 } else { 0 },
+                    success: !stale_session_error,
+                    error_kind: if stale_session_error {
+                        Some("stale_session".to_string())
+                    } else {
+                        None
+                    },
                     trace_id: None,
                     request_id: None,
                     run_id: None,
@@ -2014,7 +2020,7 @@ impl GatewayRunner {
             }
         };
 
-        let result = match cli_handle.await {
+        let mut result = match cli_handle.await {
             Ok(Ok(result)) => result,
             Ok(Err(e)) => {
                 // Track auth failures for circuit breaker
@@ -2069,12 +2075,10 @@ impl GatewayRunner {
             }
         };
 
-        // Stale session recovery: if CLI says "No conversation found", clear and retry
-        if result.exit_code != 0
-            && (result.stderr.contains("No conversation found")
-                || result.stderr.contains("session not found"))
-            && session_id.is_some()
-        {
+        // Stale session recovery: if CLI says the stored session/thread is gone,
+        // clear it and retry without resume. Some backends report this on stderr
+        // while still exiting 0, so do not gate on exit_code.
+        if cli_profile.is_stale_session_error(&result.stderr) && session_id.is_some() {
             if let Some(writer) = trace_writer.as_ref()
                 && let Some(ref run_id) = run_id
             {
@@ -2096,87 +2100,48 @@ impl GatewayRunner {
                     .reset_session(msg.platform, &effective_chat_id, &cli_name)
                     .await;
             }
-            // Retry without session-id
-            let retry_handle = tokio::spawn({
-                let profile = cli_profile.clone();
-                let message_text = msg.text.clone();
-                let system_prompt = system_prompt.clone();
-                let ws = workspace.clone();
-                let access_token = access_token.clone();
-                async move {
-                    cli_bridge::run_cli_with_context(
-                        &profile,
-                        &message_text,
-                        None, // no session-id
-                        ws.as_deref(),
-                        None,
-                        Some(&system_prompt),
-                        access_token.as_deref(),
-                        None,
-                    )
-                    .await
-                }
-            });
             let retry_run_id = if let Some(writer) = trace_writer.as_ref() {
                 writer.start_run(&cli_name, None).await.ok()
             } else {
                 None
             };
-            match retry_handle.await {
-                Ok(Ok(retry_result)) if retry_result.exit_code == 0 => {
+            result = match cli_bridge::run_cli_with_context(
+                &cli_profile,
+                &msg.text,
+                None,
+                workspace.as_deref(),
+                None,
+                Some(&system_prompt),
+                access_token.as_deref(),
+                None,
+            )
+            .await
+            {
+                Ok(retry_result) => retry_result,
+                Err(e) => {
+                    let trace_error = format!("stale session retry failed: {e}");
                     if let Some(writer) = trace_writer.as_ref()
                         && let Some(ref retry_run_id) = retry_run_id
                     {
                         let _ = writer
-                            .finish_run(
-                                retry_run_id,
-                                RunStatus::Succeeded,
-                                Some(retry_result.exit_code),
-                                None,
-                            )
+                            .finish_run(retry_run_id, RunStatus::Failed, None, Some(&trace_error))
                             .await;
+                        let _ = writer.fail_request(&trace_error).await;
                     }
-                    // Save new session
-                    if let Some(ref store) = self.store
-                        && let Some(ref sid) = retry_result.session_id
-                        && let Err(e) = store
-                            .set_current_session(
-                                msg.platform,
-                                &effective_chat_id,
-                                &msg.user_id,
-                                sid,
-                                &cli_name,
-                            )
-                            .await
-                    {
-                        tracing::warn!(error = %e, "failed to persist session after retry");
-                    }
-                    let text = retry_result
-                        .text
-                        .as_deref()
-                        .unwrap_or(retry_result.stdout.trim());
-                    let text = if text.is_empty() { "(无回复)" } else { text };
+                    let text = cli_bridge::translate_cli_error(&cli_profile, -1, &e);
                     return Some(
                         self.outbound_response(
                             trace.as_ref(),
                             msg.platform,
                             &msg.chat_id,
                             msg.reply_token.clone(),
-                            text.to_string(),
+                            format!("[{request_tag}] 会话已失效，自动重试失败: {text}"),
                         )
                         .await,
                     );
                 }
-                _ => {
-                    if let Some(writer) = trace_writer.as_ref()
-                        && let Some(ref retry_run_id) = retry_run_id
-                    {
-                        let _ = writer
-                            .finish_run(retry_run_id, RunStatus::Failed, None, Some("retry failed"))
-                            .await;
-                    }
-                } // fall through to normal error handling
-            }
+            };
+            run_id = retry_run_id;
         }
 
         if result.exit_code != 0 {

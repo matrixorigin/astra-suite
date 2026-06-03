@@ -379,7 +379,9 @@ impl CodexAppPool {
                         "name": "astra-gateway",
                         "version": env!("CARGO_PKG_VERSION"),
                     },
-                    "capabilities": null,
+                    "capabilities": {
+                        "experimentalApi": true,
+                    },
                 }),
             )
             .await?;

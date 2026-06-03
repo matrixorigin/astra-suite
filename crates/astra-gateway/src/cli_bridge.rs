@@ -674,6 +674,18 @@ impl CliProfile {
         }
     }
 
+    pub fn is_stale_session_error(&self, stderr: &str) -> bool {
+        match self {
+            Self::Claude { .. } => {
+                stderr.contains("No conversation found with session ID")
+                    || stderr.contains("No conversation found")
+                    || stderr.contains("session not found")
+            }
+            Self::Codex { .. } => stderr.contains("no rollout found for thread id"),
+            _ => false,
+        }
+    }
+
     fn probe_cache_key(&self) -> String {
         match self {
             Self::Astra {
@@ -2983,6 +2995,39 @@ printf '%s\n' '{"type":"assistant.message_delta","data":{"deltaContent":"from sc
             },
         );
         assert!(msg.is_empty());
+    }
+
+    #[test]
+    fn stale_session_error_is_backend_specific() {
+        let claude = CliProfile::Claude {
+            bin: "claude".into(),
+            model: None,
+            stream_json: true,
+            extra_args: vec![],
+            env: std::collections::BTreeMap::new(),
+            env_file: None,
+        };
+        assert!(claude.is_stale_session_error(
+            "No conversation found with session ID: f22599c8-9c3b-44b0-bb96-613c4db552d9"
+        ));
+
+        let codex = CliProfile::Codex {
+            bin: "codex".into(),
+            model: None,
+            sandbox: "workspace-write".into(),
+            stream_json: true,
+            extra_args: vec![],
+            skip_git_repo_check: false,
+            ephemeral: false,
+        };
+        assert!(codex.is_stale_session_error(
+            "Error: thread/resume: thread/resume failed: no rollout found for thread id 00000000-0000-0000-0000-000000000000 (code -32600)"
+        ));
+        assert!(!codex.is_stale_session_error(
+            "Error: thread/resume: thread/resume failed: capability mismatch"
+        ));
+
+        assert!(!CliProfile::default().is_stale_session_error("session not found"));
     }
 
     #[test]
