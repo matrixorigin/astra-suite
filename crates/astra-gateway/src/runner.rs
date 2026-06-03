@@ -45,6 +45,8 @@ fn redact_sensitive(s: &str) -> String {
 const MAX_CHUNK_LEN: usize = 3800;
 const INITIAL_ACK_DELAY: Duration = Duration::from_secs(3);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(25);
+const WECOM_STREAM_CUTOFF: Duration = Duration::from_secs(9 * 60 + 30);
+const WECOM_POST_STREAM_HEARTBEAT: Duration = Duration::from_secs(120);
 #[allow(dead_code)]
 const PROGRESSIVE_FLUSH_INTERVAL: Duration = Duration::from_secs(8);
 const PROGRESSIVE_MIN_CHARS: usize = 200;
@@ -1304,10 +1306,8 @@ impl GatewayRunner {
                     .unwrap_or_default();
                 drop(pool_guard);
 
-                // Clear stale session if the CLI reported it missing
-                if stderr_hint.contains("No conversation found")
-                    || stderr_hint.contains("session not found")
-                {
+                // Clear stale session if the CLI reported it missing.
+                if profile.is_stale_session_error(&stderr_hint) {
                     if let Some(ref store) = pool_store {
                         let _ = store
                             .reset_session(&pool_platform, &pool_key, &pool_cli_name)
@@ -1316,35 +1316,80 @@ impl GatewayRunner {
                     tracing::info!(key = %pool_key, "pool: cleared stale session");
                 }
 
-                let (text, tokens_prompt, tokens_completion, tool_calls_count) =
-                    if let Some(ref v) = result_json {
-                        (
-                            v["result"].as_str().map(String::from),
-                            v["usage"]["input_tokens"].as_u64(),
-                            v["usage"]["output_tokens"].as_u64(),
-                            v["num_turns"]
-                                .as_u64()
-                                .and_then(|t| if t > 1 { Some(t as u32) } else { None }),
-                        )
-                    } else {
-                        (None, None, None, None)
-                    };
+                let (
+                    text,
+                    tokens_prompt,
+                    tokens_completion,
+                    tool_calls_count,
+                    cache_creation_input_tokens,
+                    cache_read_input_tokens,
+                    context_window,
+                    max_output_tokens,
+                    cost_usd,
+                    raw_usage_json,
+                ) = if let Some(ref v) = result_json {
+                    let usage = &v["usage"];
+                    let model_usage = v["modelUsage"].as_object().and_then(|m| m.values().next());
+                    (
+                        v["result"].as_str().map(String::from),
+                        usage["input_tokens"].as_u64(),
+                        usage["output_tokens"].as_u64(),
+                        v["num_turns"]
+                            .as_u64()
+                            .and_then(|t| if t > 1 { Some(t as u32) } else { None }),
+                        usage["cache_creation_input_tokens"].as_u64(),
+                        usage["cache_read_input_tokens"].as_u64(),
+                        model_usage.and_then(|m| m["contextWindow"].as_u64()),
+                        model_usage.and_then(|m| m["maxOutputTokens"].as_u64()),
+                        v["total_cost_usd"]
+                            .as_f64()
+                            .or_else(|| model_usage.and_then(|m| m["costUSD"].as_f64())),
+                        serde_json::to_string(usage).ok(),
+                    )
+                } else {
+                    (None, None, None, None, None, None, None, None, None, None)
+                };
+                let total_tokens = {
+                    let mut total = 0u64;
+                    let mut any = false;
+                    for value in [
+                        tokens_prompt,
+                        tokens_completion,
+                        cache_creation_input_tokens,
+                        cache_read_input_tokens,
+                    ]
+                    .into_iter()
+                    .flatten()
+                    {
+                        total = total.saturating_add(value);
+                        any = true;
+                    }
+                    any.then_some(total)
+                };
 
                 // Process exited without producing a result event
-                if result_json.is_none() && text.is_none() {
+                if result_json.is_none()
+                    && text.is_none()
+                    && !profile.is_stale_session_error(&stderr_hint)
+                {
                     return Err(if stderr_hint.is_empty() {
                         "pool process exited without result".to_string()
                     } else {
                         format!("pool process exited: {stderr_hint}")
                     });
                 }
+                let stale_session_error = profile.is_stale_session_error(&stderr_hint);
 
                 Ok(cli_bridge::CliResult {
                     stdout: String::new(),
-                    stderr: String::new(),
-                    exit_code: 0,
-                    success: true,
-                    error_kind: None,
+                    stderr: stderr_hint,
+                    exit_code: if stale_session_error { 1 } else { 0 },
+                    success: !stale_session_error,
+                    error_kind: if stale_session_error {
+                        Some("stale_session".to_string())
+                    } else {
+                        None
+                    },
                     trace_id: None,
                     request_id: None,
                     run_id: None,
@@ -1354,6 +1399,15 @@ impl GatewayRunner {
                     tools_used: Vec::new(),
                     tokens_prompt,
                     tokens_completion,
+                    cached_input_tokens: cache_read_input_tokens,
+                    cache_creation_input_tokens,
+                    cache_read_input_tokens,
+                    reasoning_output_tokens: None,
+                    total_tokens,
+                    context_window,
+                    max_output_tokens,
+                    cost_usd,
+                    raw_usage_json,
                 })
             })
         } else if use_codex_app_pool {
@@ -1514,6 +1568,11 @@ impl GatewayRunner {
         let mut _chunk_counter: u32 = 0;
         let next_timer = tokio::time::sleep(INITIAL_ACK_DELAY);
         tokio::pin!(next_timer);
+        let stream_cutoff_timer = tokio::time::sleep(WECOM_STREAM_CUTOFF);
+        tokio::pin!(stream_cutoff_timer);
+        let post_stream_heartbeat_timer =
+            tokio::time::sleep(Duration::from_secs(365 * 24 * 60 * 60));
+        tokio::pin!(post_stream_heartbeat_timer);
 
         // Health key for heartbeat circuit-breaker. MUST use msg.chat_id
         // (not effective_chat_id) because deliver_outbound receives
@@ -1525,6 +1584,10 @@ impl GatewayRunner {
 
         // Full accumulated text for stream (WeCom stream content is full-replacement, not append).
         let mut accumulated = String::new();
+        let stream_cutoff_enabled = msg.platform == "wecom" && stream_id.is_some();
+        let mut stream_cutoff_active = false;
+        let mut post_stream_buffer = String::new();
+        let mut post_stream_final_sent = false;
         // Next flush threshold: random 5-20 chars.
         let mut next_flush_at: usize = 5 + (rand::random::<u8>() % 16) as usize;
 
@@ -1553,6 +1616,22 @@ impl GatewayRunner {
                 reply_token,
                 stream_id,
                 finish,
+            ));
+        };
+        let send_plain = |text: String,
+                          tx: &Option<tokio::sync::mpsc::Sender<OutboundMessage>>,
+                          platform: &str,
+                          chat: &str| {
+            let Some(tx) = tx else {
+                return;
+            };
+            if text.trim().is_empty() {
+                return;
+            }
+            let _ = tx.try_send(OutboundMessage::plain(
+                platform.to_string(),
+                chat.to_string(),
+                text,
             ));
         };
         let flush_reasoning_buf = |buf: &mut String,
@@ -1607,22 +1686,28 @@ impl GatewayRunner {
                                 if allow_answer_progressive_flush
                                     && token_buf.len() >= next_flush_at
                                 {
+                                    let chunk = std::mem::take(&mut token_buf);
                                     // Check if appending would exceed stream limit — if so, close current stream first
-                                    if stream_id.is_some()
-                                        && accumulated.len() + token_buf.len() > STREAM_MAX_BYTES
+                                    if !stream_cutoff_active
+                                        && stream_id.is_some()
+                                        && accumulated.len() + chunk.len() > STREAM_MAX_BYTES
                                     {
                                         send_stream(&accumulated, &self.outbound_tx, msg.platform, &chat_id, reply_token.clone(), stream_id.clone(), true);
                                         accumulated.clear();
                                         stream_id = reply_token.as_ref().map(|_| uuid::Uuid::new_v4().to_string());
                                     }
-                                    accumulated.push_str(&token_buf);
-                                    token_buf.clear();
+                                    accumulated.push_str(&chunk);
+                                    if stream_cutoff_active {
+                                        post_stream_buffer.push_str(&chunk);
+                                    }
                                     next_flush_at = 5 + (rand::random::<u8>() % 16) as usize;
                                     _chunk_counter += 1;
                                     if stream_id.is_some() {
                                         progressive_text_len = accumulated.len();
                                     }
-                                    send_stream(&accumulated, &self.outbound_tx, msg.platform, &chat_id, reply_token.clone(), stream_id.clone(), false);
+                                    if !stream_cutoff_active {
+                                        send_stream(&accumulated, &self.outbound_tx, msg.platform, &chat_id, reply_token.clone(), stream_id.clone(), false);
+                                    }
                                 }
                             }
                         }
@@ -1646,17 +1731,22 @@ impl GatewayRunner {
                                     .await;
                             }
                             // Append tool use indicator to stream and flush immediately
-                            if stream_id.is_some() {
+                            if stream_id.is_some() || stream_cutoff_active {
+                                let mut chunk = String::new();
                                 if !accumulated.is_empty() && !accumulated.ends_with('\n') {
-                                    accumulated.push_str("\n\n");
+                                    chunk.push_str("\n\n");
                                 }
-                                let tool_line = if let Some(p) = params {
-                                    format!("🔧 {}: {}\n\n", name, p)
+                                if let Some(p) = params {
+                                    chunk.push_str(&format!("🔧 {}: {}\n\n", name, p));
                                 } else {
-                                    format!("🔧 {}\n\n", name)
-                                };
-                                accumulated.push_str(&tool_line);
-                                send_stream(&accumulated, &self.outbound_tx, msg.platform, &chat_id, reply_token.clone(), stream_id.clone(), false);
+                                    chunk.push_str(&format!("🔧 {}\n\n", name));
+                                }
+                                accumulated.push_str(&chunk);
+                                if stream_cutoff_active {
+                                    post_stream_buffer.push_str(&chunk);
+                                } else {
+                                    send_stream(&accumulated, &self.outbound_tx, msg.platform, &chat_id, reply_token.clone(), stream_id.clone(), false);
+                                }
                             }
                         }
                         Some(CliProgress::ToolDone { name, duration_ms }) => {
@@ -1783,8 +1873,11 @@ impl GatewayRunner {
                                 token_buf.push_str(&tail);
                             }
                             if !token_buf.is_empty() {
-                                accumulated.push_str(&token_buf);
-                                token_buf.clear();
+                                let chunk = std::mem::take(&mut token_buf);
+                                accumulated.push_str(&chunk);
+                                if stream_cutoff_active {
+                                    post_stream_buffer.push_str(&chunk);
+                                }
                             }
                             if !accumulated.is_empty() && stream_id.is_some() {
                                 progressive_text_len = accumulated.len();
@@ -1806,10 +1899,51 @@ impl GatewayRunner {
                                     .await;
                             }
                             // Send full accumulated content with finish=true to close the stream
-                            send_stream(&accumulated, &self.outbound_tx, msg.platform, &chat_id, reply_token.clone(), stream_id.clone(), true);
+                            if stream_cutoff_active {
+                                send_plain(
+                                    post_stream_buffer.clone(),
+                                    &self.outbound_tx,
+                                    msg.platform,
+                                    &chat_id,
+                                );
+                                post_stream_final_sent = true;
+                            } else {
+                                send_stream(&accumulated, &self.outbound_tx, msg.platform, &chat_id, reply_token.clone(), stream_id.clone(), true);
+                            }
                             break;
                         }
                     }
+                }
+                _ = &mut stream_cutoff_timer, if stream_cutoff_enabled && !stream_cutoff_active => {
+                    if !token_buf.is_empty() {
+                        let chunk = std::mem::take(&mut token_buf);
+                        accumulated.push_str(&chunk);
+                    }
+                    if !accumulated.is_empty() && stream_id.is_some() {
+                        progressive_text_len = accumulated.len();
+                    }
+                    send_stream(&accumulated, &self.outbound_tx, msg.platform, &chat_id, reply_token.clone(), stream_id.clone(), true);
+                    stream_id = None;
+                    stream_cutoff_active = true;
+                    post_stream_heartbeat_timer.as_mut().reset(
+                        tokio::time::Instant::now() + WECOM_POST_STREAM_HEARTBEAT,
+                    );
+                    tracing::info!(
+                        platform = %msg.platform,
+                        chat_id = %safe_id(&chat_id),
+                        bytes = accumulated.len(),
+                        "wecom stream cutoff reached; continuing with deferred plain output"
+                    );
+                }
+                _ = &mut post_stream_heartbeat_timer, if stream_cutoff_active && !post_stream_final_sent => {
+                    let heartbeat = format!(
+                        "[{request_tag}] 流式窗口已切段，仍在继续处理；当前已累积后续输出 {} 字节。",
+                        post_stream_buffer.len() + token_buf.len()
+                    );
+                    send_plain(heartbeat, &self.outbound_tx, msg.platform, &chat_id);
+                    post_stream_heartbeat_timer.as_mut().reset(
+                        tokio::time::Instant::now() + WECOM_POST_STREAM_HEARTBEAT,
+                    );
                 }
                 _ = &mut next_timer => {
                     if !sent_initial_ack {
@@ -1886,7 +2020,7 @@ impl GatewayRunner {
             }
         };
 
-        let result = match cli_handle.await {
+        let mut result = match cli_handle.await {
             Ok(Ok(result)) => result,
             Ok(Err(e)) => {
                 // Track auth failures for circuit breaker
@@ -1941,12 +2075,10 @@ impl GatewayRunner {
             }
         };
 
-        // Stale session recovery: if CLI says "No conversation found", clear and retry
-        if result.exit_code != 0
-            && (result.stderr.contains("No conversation found")
-                || result.stderr.contains("session not found"))
-            && session_id.is_some()
-        {
+        // Stale session recovery: if CLI says the stored session/thread is gone,
+        // clear it and retry without resume. Some backends report this on stderr
+        // while still exiting 0, so do not gate on exit_code.
+        if cli_profile.is_stale_session_error(&result.stderr) && session_id.is_some() {
             if let Some(writer) = trace_writer.as_ref()
                 && let Some(ref run_id) = run_id
             {
@@ -1968,87 +2100,48 @@ impl GatewayRunner {
                     .reset_session(msg.platform, &effective_chat_id, &cli_name)
                     .await;
             }
-            // Retry without session-id
-            let retry_handle = tokio::spawn({
-                let profile = cli_profile.clone();
-                let message_text = msg.text.clone();
-                let system_prompt = system_prompt.clone();
-                let ws = workspace.clone();
-                let access_token = access_token.clone();
-                async move {
-                    cli_bridge::run_cli_with_context(
-                        &profile,
-                        &message_text,
-                        None, // no session-id
-                        ws.as_deref(),
-                        None,
-                        Some(&system_prompt),
-                        access_token.as_deref(),
-                        None,
-                    )
-                    .await
-                }
-            });
             let retry_run_id = if let Some(writer) = trace_writer.as_ref() {
                 writer.start_run(&cli_name, None).await.ok()
             } else {
                 None
             };
-            match retry_handle.await {
-                Ok(Ok(retry_result)) if retry_result.exit_code == 0 => {
+            result = match cli_bridge::run_cli_with_context(
+                &cli_profile,
+                &msg.text,
+                None,
+                workspace.as_deref(),
+                None,
+                Some(&system_prompt),
+                access_token.as_deref(),
+                None,
+            )
+            .await
+            {
+                Ok(retry_result) => retry_result,
+                Err(e) => {
+                    let trace_error = format!("stale session retry failed: {e}");
                     if let Some(writer) = trace_writer.as_ref()
                         && let Some(ref retry_run_id) = retry_run_id
                     {
                         let _ = writer
-                            .finish_run(
-                                retry_run_id,
-                                RunStatus::Succeeded,
-                                Some(retry_result.exit_code),
-                                None,
-                            )
+                            .finish_run(retry_run_id, RunStatus::Failed, None, Some(&trace_error))
                             .await;
+                        let _ = writer.fail_request(&trace_error).await;
                     }
-                    // Save new session
-                    if let Some(ref store) = self.store
-                        && let Some(ref sid) = retry_result.session_id
-                        && let Err(e) = store
-                            .set_current_session(
-                                msg.platform,
-                                &effective_chat_id,
-                                &msg.user_id,
-                                sid,
-                                &cli_name,
-                            )
-                            .await
-                    {
-                        tracing::warn!(error = %e, "failed to persist session after retry");
-                    }
-                    let text = retry_result
-                        .text
-                        .as_deref()
-                        .unwrap_or(retry_result.stdout.trim());
-                    let text = if text.is_empty() { "(无回复)" } else { text };
+                    let text = cli_bridge::translate_cli_error(&cli_profile, -1, &e);
                     return Some(
                         self.outbound_response(
                             trace.as_ref(),
                             msg.platform,
                             &msg.chat_id,
                             msg.reply_token.clone(),
-                            text.to_string(),
+                            format!("[{request_tag}] 会话已失效，自动重试失败: {text}"),
                         )
                         .await,
                     );
                 }
-                _ => {
-                    if let Some(writer) = trace_writer.as_ref()
-                        && let Some(ref retry_run_id) = retry_run_id
-                    {
-                        let _ = writer
-                            .finish_run(retry_run_id, RunStatus::Failed, None, Some("retry failed"))
-                            .await;
-                    }
-                } // fall through to normal error handling
-            }
+            };
+            run_id = retry_run_id;
         }
 
         if result.exit_code != 0 {
@@ -2230,13 +2323,48 @@ impl GatewayRunner {
         let elapsed = start.elapsed();
         let prompt_tok = result.tokens_prompt.unwrap_or(0);
         let completion_tok = result.tokens_completion.unwrap_or(0);
-        let cost = (prompt_tok as f64 * 3.0 + completion_tok as f64 * 15.0) / 1_000_000.0;
+        let cache_create_tok = result.cache_creation_input_tokens.unwrap_or(0);
+        let cache_read_tok = result.cache_read_input_tokens.unwrap_or(0);
+        let cached_tok = result.cached_input_tokens.unwrap_or(0);
+        let reasoning_tok = result.reasoning_output_tokens.unwrap_or(0);
+        let total_tok = result.total_tokens.unwrap_or_else(|| {
+            prompt_tok + completion_tok + cache_create_tok + cache_read_tok + reasoning_tok
+        });
+        let cost = result.cost_usd.unwrap_or_else(|| {
+            (prompt_tok as f64 * 3.0 + completion_tok as f64 * 15.0) / 1_000_000.0
+        });
         let mut stats_parts = Vec::new();
         if prompt_tok > 0 {
             stats_parts.push(format!("↓{}", format_tokens(prompt_tok)));
         }
         if completion_tok > 0 {
             stats_parts.push(format!("↑{}", format_tokens(completion_tok)));
+        }
+        if cache_read_tok > 0 || cache_create_tok > 0 || cached_tok > 0 {
+            let cache_display = cache_read_tok.max(cached_tok);
+            let cache_part = if cache_create_tok > 0 {
+                format!(
+                    "cache r{} c{}",
+                    format_tokens(cache_display),
+                    format_tokens(cache_create_tok)
+                )
+            } else {
+                format!("cache {}", format_tokens(cache_display))
+            };
+            stats_parts.push(cache_part);
+        }
+        if reasoning_tok > 0 {
+            stats_parts.push(format!("reason {}", format_tokens(reasoning_tok)));
+        }
+        if let Some(context_window) = result.context_window
+            && context_window > 0
+            && total_tok > 0
+        {
+            stats_parts.push(format!(
+                "ctx {}/{}",
+                format_tokens(total_tok),
+                format_tokens(context_window)
+            ));
         }
         let tool_count_total = result.tool_calls_count.unwrap_or(0);
         if tool_count_total > 0 {
@@ -2246,11 +2374,16 @@ impl GatewayRunner {
         if cost > 0.001 {
             stats_parts.push(format!("${cost:.3}"));
         }
+        let progressive_delivery_len = if progressive_text_len > 0 || post_stream_final_sent {
+            progressive_text_len.max(1)
+        } else {
+            0
+        };
         text = build_final_message(
             &text,
             &action_results_text,
             &stats_parts,
-            progressive_text_len,
+            progressive_delivery_len,
             &request_tag,
         );
 
@@ -2262,8 +2395,30 @@ impl GatewayRunner {
                     user_id: msg.user_id.clone(),
                     cli_profile: cli_name.clone(),
                     model: cli_profile.model_name().map(String::from),
-                    tokens_prompt: result.tokens_prompt.unwrap_or(0),
-                    tokens_completion: result.tokens_completion.unwrap_or(0),
+                    trace_id: result
+                        .trace_id
+                        .clone()
+                        .or_else(|| trace.as_ref().map(|t| t.trace_id.to_string())),
+                    request_id: result
+                        .request_id
+                        .clone()
+                        .or_else(|| trace.as_ref().map(|t| t.request_id.to_string())),
+                    run_id: result
+                        .run_id
+                        .clone()
+                        .or_else(|| run_id.as_ref().map(ToString::to_string)),
+                    session_id: result.session_id.clone(),
+                    tokens_prompt: prompt_tok,
+                    tokens_completion: completion_tok,
+                    cached_input_tokens: cached_tok,
+                    cache_creation_input_tokens: cache_create_tok,
+                    cache_read_input_tokens: cache_read_tok,
+                    reasoning_output_tokens: reasoning_tok,
+                    total_tokens: total_tok,
+                    context_window: result.context_window,
+                    max_output_tokens: result.max_output_tokens,
+                    cost_usd: result.cost_usd,
+                    raw_usage_json: result.raw_usage_json.clone(),
                     tool_calls: result.tool_calls_count.unwrap_or(0),
                     elapsed_ms: elapsed.as_millis() as u64,
                 })
@@ -2283,7 +2438,7 @@ impl GatewayRunner {
         // as a plain message (no durable outbox) avoids retry storms: if this
         // low-value footer fails to deliver it is simply dropped rather than
         // retried on every restart.
-        if progressive_text_len > 0 {
+        if progressive_delivery_len > 0 {
             // Still mark the trace request as completed (even without outbox).
             if let Some(writer) = trace_writer.as_ref() {
                 let _ = writer.complete_request().await;

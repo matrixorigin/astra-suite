@@ -127,8 +127,21 @@ impl GatewayStore for SqliteGatewayStore {
                 user_id TEXT NOT NULL,
                 cli_profile TEXT NOT NULL DEFAULT 'astra',
                 model TEXT,
+                trace_id TEXT,
+                request_id TEXT,
+                run_id TEXT,
+                session_id TEXT,
                 tokens_prompt INTEGER NOT NULL DEFAULT 0,
                 tokens_completion INTEGER NOT NULL DEFAULT 0,
+                cached_input_tokens INTEGER NOT NULL DEFAULT 0,
+                cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0,
+                cache_read_input_tokens INTEGER NOT NULL DEFAULT 0,
+                reasoning_output_tokens INTEGER NOT NULL DEFAULT 0,
+                total_tokens INTEGER NOT NULL DEFAULT 0,
+                context_window INTEGER,
+                max_output_tokens INTEGER,
+                cost_usd REAL,
+                raw_usage_json TEXT,
                 tool_calls INTEGER NOT NULL DEFAULT 0,
                 elapsed_ms INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT DEFAULT (strftime('%Y-%m-%d %H:%M:%f', 'now'))
@@ -136,6 +149,24 @@ impl GatewayStore for SqliteGatewayStore {
         )
         .execute(&self.pool)
         .await?;
+
+        for migration in [
+            "ALTER TABLE gw_usage ADD COLUMN trace_id TEXT",
+            "ALTER TABLE gw_usage ADD COLUMN request_id TEXT",
+            "ALTER TABLE gw_usage ADD COLUMN run_id TEXT",
+            "ALTER TABLE gw_usage ADD COLUMN session_id TEXT",
+            "ALTER TABLE gw_usage ADD COLUMN cached_input_tokens INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE gw_usage ADD COLUMN cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE gw_usage ADD COLUMN cache_read_input_tokens INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE gw_usage ADD COLUMN reasoning_output_tokens INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE gw_usage ADD COLUMN total_tokens INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE gw_usage ADD COLUMN context_window INTEGER",
+            "ALTER TABLE gw_usage ADD COLUMN max_output_tokens INTEGER",
+            "ALTER TABLE gw_usage ADD COLUMN cost_usd REAL",
+            "ALTER TABLE gw_usage ADD COLUMN raw_usage_json TEXT",
+        ] {
+            let _ = sqlx::query(migration).execute(&self.pool).await;
+        }
 
         sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_usage_user_day
@@ -704,15 +735,33 @@ impl GatewayStore for SqliteGatewayStore {
 
     async fn record_usage(&self, r: &UsageRecord) -> Result<(), StoreError> {
         sqlx::query(
-            "INSERT INTO gw_usage (platform, user_id, cli_profile, model, tokens_prompt, tokens_completion, tool_calls, elapsed_ms)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO gw_usage (
+                platform, user_id, cli_profile, model, trace_id, request_id, run_id, session_id,
+                tokens_prompt, tokens_completion, cached_input_tokens, cache_creation_input_tokens,
+                cache_read_input_tokens, reasoning_output_tokens, total_tokens, context_window,
+                max_output_tokens, cost_usd, raw_usage_json, tool_calls, elapsed_ms
+             )
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&r.platform)
         .bind(&r.user_id)
         .bind(&r.cli_profile)
         .bind(&r.model)
+        .bind(&r.trace_id)
+        .bind(&r.request_id)
+        .bind(&r.run_id)
+        .bind(&r.session_id)
         .bind(r.tokens_prompt as i64)
         .bind(r.tokens_completion as i64)
+        .bind(r.cached_input_tokens as i64)
+        .bind(r.cache_creation_input_tokens as i64)
+        .bind(r.cache_read_input_tokens as i64)
+        .bind(r.reasoning_output_tokens as i64)
+        .bind(r.total_tokens as i64)
+        .bind(r.context_window.map(|v| v as i64))
+        .bind(r.max_output_tokens.map(|v| v as i64))
+        .bind(r.cost_usd)
+        .bind(&r.raw_usage_json)
         .bind(r.tool_calls as i32)
         .bind(r.elapsed_ms as i64)
         .execute(&self.pool)
@@ -725,10 +774,35 @@ impl GatewayStore for SqliteGatewayStore {
         platform: &str,
         user_id: &str,
     ) -> Result<UsageSummary, StoreError> {
-        let row: Option<(i64, i64, i64, i64)> = sqlx::query_as(
+        let row: Option<(
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            Option<i64>,
+            Option<i64>,
+            f64,
+            i64,
+        )> = sqlx::query_as(
             "SELECT COUNT(*),
                     COALESCE(SUM(tokens_prompt), 0),
                     COALESCE(SUM(tokens_completion), 0),
+                    COALESCE(SUM(cached_input_tokens), 0),
+                    COALESCE(SUM(cache_creation_input_tokens), 0),
+                    COALESCE(SUM(cache_read_input_tokens), 0),
+                    COALESCE(SUM(reasoning_output_tokens), 0),
+                    COALESCE(SUM(CASE
+                        WHEN total_tokens > 0 THEN total_tokens
+                        ELSE tokens_prompt + tokens_completion + cache_creation_input_tokens
+                             + cache_read_input_tokens + reasoning_output_tokens
+                    END), 0),
+                    MAX(context_window),
+                    MAX(max_output_tokens),
+                    COALESCE(SUM(cost_usd), 0.0),
                     COALESCE(SUM(tool_calls), 0)
              FROM gw_usage
              WHERE platform = ? AND user_id = ? AND created_at >= date('now')",
@@ -739,12 +813,35 @@ impl GatewayStore for SqliteGatewayStore {
         .await?;
 
         Ok(row
-            .map(|(m, p, c, t)| UsageSummary {
-                messages: m as u64,
-                tokens_prompt: p as u64,
-                tokens_completion: c as u64,
-                tool_calls: t as u64,
-            })
+            .map(
+                |(
+                    m,
+                    p,
+                    c,
+                    cached,
+                    cache_create,
+                    cache_read,
+                    reasoning,
+                    total,
+                    ctx,
+                    max_out,
+                    cost,
+                    t,
+                )| UsageSummary {
+                    messages: m as u64,
+                    tokens_prompt: p as u64,
+                    tokens_completion: c as u64,
+                    cached_input_tokens: cached as u64,
+                    cache_creation_input_tokens: cache_create as u64,
+                    cache_read_input_tokens: cache_read as u64,
+                    reasoning_output_tokens: reasoning as u64,
+                    total_tokens: total as u64,
+                    context_window: ctx.map(|v| v as u64),
+                    max_output_tokens: max_out.map(|v| v as u64),
+                    cost_usd: cost,
+                    tool_calls: t as u64,
+                },
+            )
             .unwrap_or_default())
     }
 
@@ -753,10 +850,35 @@ impl GatewayStore for SqliteGatewayStore {
         platform: &str,
         user_id: &str,
     ) -> Result<UsageSummary, StoreError> {
-        let row: Option<(i64, i64, i64, i64)> = sqlx::query_as(
+        let row: Option<(
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            Option<i64>,
+            Option<i64>,
+            f64,
+            i64,
+        )> = sqlx::query_as(
             "SELECT COUNT(*),
                     COALESCE(SUM(tokens_prompt), 0),
                     COALESCE(SUM(tokens_completion), 0),
+                    COALESCE(SUM(cached_input_tokens), 0),
+                    COALESCE(SUM(cache_creation_input_tokens), 0),
+                    COALESCE(SUM(cache_read_input_tokens), 0),
+                    COALESCE(SUM(reasoning_output_tokens), 0),
+                    COALESCE(SUM(CASE
+                        WHEN total_tokens > 0 THEN total_tokens
+                        ELSE tokens_prompt + tokens_completion + cache_creation_input_tokens
+                             + cache_read_input_tokens + reasoning_output_tokens
+                    END), 0),
+                    MAX(context_window),
+                    MAX(max_output_tokens),
+                    COALESCE(SUM(cost_usd), 0.0),
                     COALESCE(SUM(tool_calls), 0)
              FROM gw_usage
              WHERE platform = ? AND user_id = ?",
@@ -767,12 +889,113 @@ impl GatewayStore for SqliteGatewayStore {
         .await?;
 
         Ok(row
-            .map(|(m, p, c, t)| UsageSummary {
-                messages: m as u64,
-                tokens_prompt: p as u64,
-                tokens_completion: c as u64,
-                tool_calls: t as u64,
-            })
+            .map(
+                |(
+                    m,
+                    p,
+                    c,
+                    cached,
+                    cache_create,
+                    cache_read,
+                    reasoning,
+                    total,
+                    ctx,
+                    max_out,
+                    cost,
+                    t,
+                )| UsageSummary {
+                    messages: m as u64,
+                    tokens_prompt: p as u64,
+                    tokens_completion: c as u64,
+                    cached_input_tokens: cached as u64,
+                    cache_creation_input_tokens: cache_create as u64,
+                    cache_read_input_tokens: cache_read as u64,
+                    reasoning_output_tokens: reasoning as u64,
+                    total_tokens: total as u64,
+                    context_window: ctx.map(|v| v as u64),
+                    max_output_tokens: max_out.map(|v| v as u64),
+                    cost_usd: cost,
+                    tool_calls: t as u64,
+                },
+            )
+            .unwrap_or_default())
+    }
+
+    async fn get_usage_session(
+        &self,
+        platform: &str,
+        user_id: &str,
+        session_id: &str,
+    ) -> Result<UsageSummary, StoreError> {
+        let row: Option<(
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            Option<i64>,
+            Option<i64>,
+            f64,
+            i64,
+        )> = sqlx::query_as(
+            "SELECT COUNT(*),
+                    COALESCE(SUM(tokens_prompt), 0),
+                    COALESCE(SUM(tokens_completion), 0),
+                    COALESCE(SUM(cached_input_tokens), 0),
+                    COALESCE(SUM(cache_creation_input_tokens), 0),
+                    COALESCE(SUM(cache_read_input_tokens), 0),
+                    COALESCE(SUM(reasoning_output_tokens), 0),
+                    COALESCE(SUM(CASE
+                        WHEN total_tokens > 0 THEN total_tokens
+                        ELSE tokens_prompt + tokens_completion + cache_creation_input_tokens
+                             + cache_read_input_tokens + reasoning_output_tokens
+                    END), 0),
+                    MAX(context_window),
+                    MAX(max_output_tokens),
+                    COALESCE(SUM(cost_usd), 0.0),
+                    COALESCE(SUM(tool_calls), 0)
+             FROM gw_usage
+             WHERE platform = ? AND user_id = ? AND session_id = ?",
+        )
+        .bind(platform)
+        .bind(user_id)
+        .bind(session_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row
+            .map(
+                |(
+                    m,
+                    p,
+                    c,
+                    cached,
+                    cache_create,
+                    cache_read,
+                    reasoning,
+                    total,
+                    ctx,
+                    max_out,
+                    cost,
+                    t,
+                )| UsageSummary {
+                    messages: m as u64,
+                    tokens_prompt: p as u64,
+                    tokens_completion: c as u64,
+                    cached_input_tokens: cached as u64,
+                    cache_creation_input_tokens: cache_create as u64,
+                    cache_read_input_tokens: cache_read as u64,
+                    reasoning_output_tokens: reasoning as u64,
+                    total_tokens: total as u64,
+                    context_window: ctx.map(|v| v as u64),
+                    max_output_tokens: max_out.map(|v| v as u64),
+                    cost_usd: cost,
+                    tool_calls: t as u64,
+                },
+            )
             .unwrap_or_default())
     }
 
@@ -1182,8 +1405,21 @@ mod tests {
                 user_id: "u1".into(),
                 cli_profile: "astra".into(),
                 model: Some("opus".into()),
+                trace_id: None,
+                request_id: None,
+                run_id: None,
+                session_id: None,
                 tokens_prompt: 1000,
                 tokens_completion: 200,
+                cached_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 0,
+                reasoning_output_tokens: 0,
+                total_tokens: 1200,
+                context_window: None,
+                max_output_tokens: None,
+                cost_usd: None,
+                raw_usage_json: None,
                 tool_calls: 3,
                 elapsed_ms: 5000,
             })
@@ -1194,6 +1430,7 @@ mod tests {
         assert_eq!(today.messages, 1);
         assert_eq!(today.tokens_prompt, 1000);
         assert_eq!(today.tokens_completion, 200);
+        assert_eq!(today.total_tokens, 1200);
         assert_eq!(today.tool_calls, 3);
 
         let total = store.get_usage_total("wx", "u1").await.unwrap();
@@ -1589,8 +1826,21 @@ mod tests {
                     user_id: "u1".into(),
                     cli_profile: "astra".into(),
                     model: Some("opus".into()),
+                    trace_id: None,
+                    request_id: None,
+                    run_id: None,
+                    session_id: None,
                     tokens_prompt: 100 * (i + 1),
                     tokens_completion: 50 * (i + 1),
+                    cached_input_tokens: 0,
+                    cache_creation_input_tokens: 0,
+                    cache_read_input_tokens: 0,
+                    reasoning_output_tokens: 0,
+                    total_tokens: 150 * (i + 1),
+                    context_window: None,
+                    max_output_tokens: None,
+                    cost_usd: None,
+                    raw_usage_json: None,
                     tool_calls: i as u32 + 1,
                     elapsed_ms: 1000,
                 })
@@ -1604,6 +1854,7 @@ mod tests {
         assert_eq!(total.tokens_prompt, 600);
         // 50+100+150 = 300
         assert_eq!(total.tokens_completion, 300);
+        assert_eq!(total.total_tokens, 900);
         // 1+2+3 = 6
         assert_eq!(total.tool_calls, 6);
     }

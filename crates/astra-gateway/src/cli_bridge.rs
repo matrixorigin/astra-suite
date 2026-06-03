@@ -160,6 +160,15 @@ pub struct CliResult {
     pub tools_used: Vec<String>,
     pub tokens_prompt: Option<u64>,
     pub tokens_completion: Option<u64>,
+    pub cached_input_tokens: Option<u64>,
+    pub cache_creation_input_tokens: Option<u64>,
+    pub cache_read_input_tokens: Option<u64>,
+    pub reasoning_output_tokens: Option<u64>,
+    pub total_tokens: Option<u64>,
+    pub context_window: Option<u64>,
+    pub max_output_tokens: Option<u64>,
+    pub cost_usd: Option<f64>,
+    pub raw_usage_json: Option<String>,
 }
 
 // ─── CLI Profile ────────────────────────────────────────────────────────────
@@ -533,7 +542,7 @@ impl CliProfile {
             Self::Codex {
                 bin,
                 model,
-                sandbox,
+                sandbox: _,
                 stream_json,
                 extra_args,
                 skip_git_repo_check,
@@ -547,7 +556,6 @@ impl CliProfile {
                     }
                 } else {
                     cmd.arg("exec").arg(message);
-                    cmd.arg("--sandbox").arg(sandbox);
                 }
                 if *stream_json {
                     cmd.arg("--json");
@@ -641,6 +649,15 @@ impl CliProfile {
                         tools_used: Vec::new(),
                         tokens_prompt: None,
                         tokens_completion: None,
+                        cached_input_tokens: None,
+                        cache_creation_input_tokens: None,
+                        cache_read_input_tokens: None,
+                        reasoning_output_tokens: None,
+                        total_tokens: None,
+                        context_window: None,
+                        max_output_tokens: None,
+                        cost_usd: None,
+                        raw_usage_json: None,
                     }
                 }
             }
@@ -654,6 +671,18 @@ impl CliProfile {
             Self::Copilot { .. } => "copilot",
             Self::Codex { .. } => "codex",
             Self::Custom { bin, .. } => bin,
+        }
+    }
+
+    pub fn is_stale_session_error(&self, stderr: &str) -> bool {
+        match self {
+            Self::Claude { .. } => {
+                stderr.contains("No conversation found with session ID")
+                    || stderr.contains("No conversation found")
+                    || stderr.contains("session not found")
+            }
+            Self::Codex { .. } => stderr.contains("no rollout found for thread id"),
+            _ => false,
         }
     }
 
@@ -869,6 +898,15 @@ fn parse_strict_astra_envelope(
         tools_used,
         tokens_prompt: Some(required_u64(v, "prompt_tokens")?),
         tokens_completion: Some(required_u64(v, "completion_tokens")?),
+        cached_input_tokens: v["cached_input_tokens"].as_u64(),
+        cache_creation_input_tokens: v["cache_creation_input_tokens"].as_u64(),
+        cache_read_input_tokens: v["cache_read_input_tokens"].as_u64(),
+        reasoning_output_tokens: v["reasoning_output_tokens"].as_u64(),
+        total_tokens: v["total_tokens"].as_u64(),
+        context_window: v["context_window"].as_u64(),
+        max_output_tokens: v["max_output_tokens"].as_u64(),
+        cost_usd: v["cost_usd"].as_f64(),
+        raw_usage_json: v.get("usage").and_then(raw_json),
     })
 }
 
@@ -913,6 +951,24 @@ fn required_u32(v: &serde_json::Value, field: &str) -> Result<u32, String> {
     u32::try_from(raw).map_err(|_| format!("`{field}` is outside u32 range"))
 }
 
+fn raw_json(value: &serde_json::Value) -> Option<String> {
+    serde_json::to_string(value).ok()
+}
+
+fn sum_tokens(parts: &[Option<u64>]) -> Option<u64> {
+    let mut total = 0u64;
+    let mut any = false;
+    for value in parts.iter().flatten() {
+        total = total.saturating_add(*value);
+        any = true;
+    }
+    any.then_some(total)
+}
+
+fn first_model_usage(v: &serde_json::Value) -> Option<&serde_json::Value> {
+    v["modelUsage"].as_object()?.values().next()
+}
+
 fn malformed_astra_result(exit_code: i32, reason: String) -> CliResult {
     CliResult {
         stdout: String::new(),
@@ -929,12 +985,26 @@ fn malformed_astra_result(exit_code: i32, reason: String) -> CliResult {
         tools_used: Vec::new(),
         tokens_prompt: None,
         tokens_completion: None,
+        cached_input_tokens: None,
+        cache_creation_input_tokens: None,
+        cache_read_input_tokens: None,
+        reasoning_output_tokens: None,
+        total_tokens: None,
+        context_window: None,
+        max_output_tokens: None,
+        cost_usd: None,
+        raw_usage_json: None,
     }
 }
 
 fn parse_claude_json(stdout: &str, exit_code: i32) -> CliResult {
     if let Ok(v) = serde_json::from_str::<serde_json::Value>(stdout) {
         let usage = &v["usage"];
+        let model_usage = first_model_usage(&v);
+        let tokens_prompt = usage["input_tokens"].as_u64();
+        let tokens_completion = usage["output_tokens"].as_u64();
+        let cache_creation_input_tokens = usage["cache_creation_input_tokens"].as_u64();
+        let cache_read_input_tokens = usage["cache_read_input_tokens"].as_u64();
         CliResult {
             stdout: String::new(),
             stderr: String::new(),
@@ -948,10 +1018,24 @@ fn parse_claude_json(stdout: &str, exit_code: i32) -> CliResult {
             text: v["result"].as_str().map(String::from),
             tool_calls_count: v["num_turns"].as_u64().map(|n| n as u32),
             tools_used: Vec::new(),
-            tokens_prompt: usage["input_tokens"]
-                .as_u64()
-                .or_else(|| usage["cache_creation_input_tokens"].as_u64()),
-            tokens_completion: usage["output_tokens"].as_u64(),
+            tokens_prompt,
+            tokens_completion,
+            cached_input_tokens: cache_read_input_tokens,
+            cache_creation_input_tokens,
+            cache_read_input_tokens,
+            reasoning_output_tokens: None,
+            total_tokens: sum_tokens(&[
+                tokens_prompt,
+                cache_creation_input_tokens,
+                cache_read_input_tokens,
+                tokens_completion,
+            ]),
+            context_window: model_usage.and_then(|m| m["contextWindow"].as_u64()),
+            max_output_tokens: model_usage.and_then(|m| m["maxOutputTokens"].as_u64()),
+            cost_usd: v["total_cost_usd"]
+                .as_f64()
+                .or_else(|| model_usage.and_then(|m| m["costUSD"].as_f64())),
+            raw_usage_json: raw_json(usage),
         }
     } else {
         plain_result(stdout, exit_code)
@@ -966,6 +1050,12 @@ fn parse_claude_stream_json_stdout(stdout: &str, exit_code: i32) -> CliResult {
     let mut text: Option<String> = None;
     let mut tokens_prompt: Option<u64> = None;
     let mut tokens_completion: Option<u64> = None;
+    let mut cache_creation_input_tokens: Option<u64> = None;
+    let mut cache_read_input_tokens: Option<u64> = None;
+    let mut context_window: Option<u64> = None;
+    let mut max_output_tokens: Option<u64> = None;
+    let mut cost_usd: Option<f64> = None;
+    let mut raw_usage_json: Option<String> = None;
     let mut tools_used: Vec<String> = Vec::new();
     let mut tool_use_count: u32 = 0;
 
@@ -998,6 +1088,15 @@ fn parse_claude_stream_json_stdout(stdout: &str, exit_code: i32) -> CliResult {
                 let usage = &v["usage"];
                 tokens_prompt = usage["input_tokens"].as_u64();
                 tokens_completion = usage["output_tokens"].as_u64();
+                cache_creation_input_tokens = usage["cache_creation_input_tokens"].as_u64();
+                cache_read_input_tokens = usage["cache_read_input_tokens"].as_u64();
+                if let Some(model_usage) = first_model_usage(&v) {
+                    context_window = model_usage["contextWindow"].as_u64();
+                    max_output_tokens = model_usage["maxOutputTokens"].as_u64();
+                    cost_usd = model_usage["costUSD"].as_f64();
+                }
+                cost_usd = v["total_cost_usd"].as_f64().or(cost_usd);
+                raw_usage_json = raw_json(usage);
             }
             _ => {}
         }
@@ -1024,6 +1123,20 @@ fn parse_claude_stream_json_stdout(stdout: &str, exit_code: i32) -> CliResult {
             tools_used,
             tokens_prompt,
             tokens_completion,
+            cached_input_tokens: cache_read_input_tokens,
+            cache_creation_input_tokens,
+            cache_read_input_tokens,
+            reasoning_output_tokens: None,
+            total_tokens: sum_tokens(&[
+                tokens_prompt,
+                cache_creation_input_tokens,
+                cache_read_input_tokens,
+                tokens_completion,
+            ]),
+            context_window,
+            max_output_tokens,
+            cost_usd,
+            raw_usage_json,
         }
     } else {
         plain_result(stdout, exit_code)
@@ -1235,6 +1348,15 @@ fn parse_copilot_jsonl(stdout: &str, exit_code: i32) -> CliResult {
             tools_used,
             tokens_prompt,
             tokens_completion,
+            cached_input_tokens: None,
+            cache_creation_input_tokens: None,
+            cache_read_input_tokens: None,
+            reasoning_output_tokens: None,
+            total_tokens: sum_tokens(&[tokens_prompt, tokens_completion]),
+            context_window: None,
+            max_output_tokens: None,
+            cost_usd: None,
+            raw_usage_json: None,
         }
     } else {
         plain_result(stdout, exit_code)
@@ -1326,6 +1448,10 @@ fn parse_codex_stream_json_stdout(stdout: &str, exit_code: i32) -> CliResult {
     let mut text = String::new();
     let mut tokens_prompt: Option<u64> = None;
     let mut tokens_completion: Option<u64> = None;
+    let mut cached_input_tokens: Option<u64> = None;
+    let mut reasoning_output_tokens: Option<u64> = None;
+    let mut total_tokens: Option<u64> = None;
+    let mut raw_usage_json: Option<String> = None;
     let mut tools_used: Vec<String> = Vec::new();
     let mut tool_use_count: u32 = 0;
 
@@ -1343,12 +1469,14 @@ fn parse_codex_stream_json_stdout(stdout: &str, exit_code: i32) -> CliResult {
             }
             Some("turn.completed") => {
                 let usage = &v["usage"];
-                tokens_prompt = usage["input_tokens"]
-                    .as_u64()
-                    .or_else(|| usage["cached_input_tokens"].as_u64());
-                tokens_completion = usage["output_tokens"]
-                    .as_u64()
-                    .or_else(|| usage["reasoning_output_tokens"].as_u64());
+                tokens_prompt = usage["input_tokens"].as_u64();
+                cached_input_tokens = usage["cached_input_tokens"].as_u64();
+                tokens_completion = usage["output_tokens"].as_u64();
+                reasoning_output_tokens = usage["reasoning_output_tokens"].as_u64();
+                total_tokens = usage["total_tokens"].as_u64().or_else(|| {
+                    sum_tokens(&[tokens_prompt, tokens_completion, reasoning_output_tokens])
+                });
+                raw_usage_json = raw_json(usage);
             }
             Some("item.completed") => {
                 let item = &v["item"];
@@ -1408,6 +1536,15 @@ fn parse_codex_stream_json_stdout(stdout: &str, exit_code: i32) -> CliResult {
             tools_used,
             tokens_prompt,
             tokens_completion,
+            cached_input_tokens,
+            cache_creation_input_tokens: None,
+            cache_read_input_tokens: None,
+            reasoning_output_tokens,
+            total_tokens,
+            context_window: None,
+            max_output_tokens: None,
+            cost_usd: None,
+            raw_usage_json,
         }
     } else {
         plain_result(stdout, exit_code)
@@ -1537,6 +1674,15 @@ fn parse_generic_json(
             tools_used: Vec::new(),
             tokens_prompt: None,
             tokens_completion: None,
+            cached_input_tokens: None,
+            cache_creation_input_tokens: None,
+            cache_read_input_tokens: None,
+            reasoning_output_tokens: None,
+            total_tokens: None,
+            context_window: None,
+            max_output_tokens: None,
+            cost_usd: None,
+            raw_usage_json: None,
         }
     } else {
         plain_result(stdout, exit_code)
@@ -1563,6 +1709,15 @@ fn plain_result(stdout: &str, exit_code: i32) -> CliResult {
         tools_used: Vec::new(),
         tokens_prompt: None,
         tokens_completion: None,
+        cached_input_tokens: None,
+        cache_creation_input_tokens: None,
+        cache_read_input_tokens: None,
+        reasoning_output_tokens: None,
+        total_tokens: None,
+        context_window: None,
+        max_output_tokens: None,
+        cost_usd: None,
+        raw_usage_json: None,
     }
 }
 
@@ -2843,6 +2998,39 @@ printf '%s\n' '{"type":"assistant.message_delta","data":{"deltaContent":"from sc
     }
 
     #[test]
+    fn stale_session_error_is_backend_specific() {
+        let claude = CliProfile::Claude {
+            bin: "claude".into(),
+            model: None,
+            stream_json: true,
+            extra_args: vec![],
+            env: std::collections::BTreeMap::new(),
+            env_file: None,
+        };
+        assert!(claude.is_stale_session_error(
+            "No conversation found with session ID: f22599c8-9c3b-44b0-bb96-613c4db552d9"
+        ));
+
+        let codex = CliProfile::Codex {
+            bin: "codex".into(),
+            model: None,
+            sandbox: "workspace-write".into(),
+            stream_json: true,
+            extra_args: vec![],
+            skip_git_repo_check: false,
+            ephemeral: false,
+        };
+        assert!(codex.is_stale_session_error(
+            "Error: thread/resume: thread/resume failed: no rollout found for thread id 00000000-0000-0000-0000-000000000000 (code -32600)"
+        ));
+        assert!(!codex.is_stale_session_error(
+            "Error: thread/resume: thread/resume failed: capability mismatch"
+        ));
+
+        assert!(!CliProfile::default().is_stale_session_error("session not found"));
+    }
+
+    #[test]
     fn translate_auth_error() {
         let p = CliProfile::default();
         let msg = translate_cli_error(&p, 1, "Error: Could not validate credentials");
@@ -3214,8 +3402,8 @@ printf '%s\n' '{"type":"assistant.message_delta","data":{"deltaContent":"from sc
         assert_eq!(cmd.as_std().get_program(), std::ffi::OsStr::new("codex"));
         assert!(args.contains(&std::ffi::OsStr::new("exec")));
         assert!(args.contains(&std::ffi::OsStr::new("fix the bug")));
-        assert!(args.contains(&std::ffi::OsStr::new("--sandbox")));
-        assert!(args.contains(&std::ffi::OsStr::new("workspace-write")));
+        assert!(!args.contains(&std::ffi::OsStr::new("--sandbox")));
+        assert!(!args.contains(&std::ffi::OsStr::new("workspace-write")));
         assert!(args.contains(&std::ffi::OsStr::new("--json")));
         assert!(args.contains(&std::ffi::OsStr::new("--model")));
         assert!(args.contains(&std::ffi::OsStr::new("o3")));

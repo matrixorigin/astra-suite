@@ -151,6 +151,23 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
                 lines.push(format!("- 认证: {auth_status}"));
             }
 
+            if let (Some(store), Some(sid)) = (ctx.store, session.as_deref()) {
+                match store
+                    .get_usage_session(ctx.platform, ctx.user_id, sid)
+                    .await
+                {
+                    Ok(usage) if usage.messages > 0 => {
+                        lines.push(String::new());
+                        lines.push("**💳 Session Usage**".into());
+                        lines.extend(format_session_usage_lines(&usage));
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::warn!(error = %e, "session usage lookup failed in /status");
+                    }
+                }
+            }
+
             if let Some(repo) = ctx.trace_repo {
                 let conversation = ConversationKey::new(ctx.platform, ctx.chat_id, cli_name);
                 if let Ok(status) = repo.gateway_status(&conversation).await {
@@ -1253,23 +1270,64 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
                 .get_usage_total(ctx.platform, ctx.user_id)
                 .await
                 .unwrap_or_default();
+            let fmt_extra = |s: &crate::store::UsageSummary| {
+                let mut parts = Vec::new();
+                if s.cache_read_input_tokens > 0 || s.cached_input_tokens > 0 {
+                    parts.push(format!(
+                        "cache read {}",
+                        format_tokens(s.cache_read_input_tokens.max(s.cached_input_tokens))
+                    ));
+                }
+                if s.cache_creation_input_tokens > 0 {
+                    parts.push(format!(
+                        "cache create {}",
+                        format_tokens(s.cache_creation_input_tokens)
+                    ));
+                }
+                if s.reasoning_output_tokens > 0 {
+                    parts.push(format!(
+                        "reasoning {}",
+                        format_tokens(s.reasoning_output_tokens)
+                    ));
+                }
+                if s.total_tokens > 0 {
+                    parts.push(format!("total {}", format_tokens(s.total_tokens)));
+                }
+                if let Some(ctx) = s.context_window
+                    && ctx > 0
+                {
+                    parts.push(format!("ctx {}", format_tokens(ctx)));
+                }
+                if s.cost_usd > 0.0 {
+                    parts.push(format!("${:.4}", s.cost_usd));
+                }
+                if parts.is_empty() {
+                    "—".to_string()
+                } else {
+                    parts.join(" · ")
+                }
+            };
             Some(format!(
                 "📊 **用量统计**\n\n\
                  **今日**\n\
                  - 消息: {}\n\
                  - Token: ↓{} ↑{}\n\
+                 - 细分: {}\n\
                  - 工具: {}\n\n\
                  **累计**\n\
                  - 消息: {}\n\
                  - Token: ↓{} ↑{}\n\
+                 - 细分: {}\n\
                  - 工具: {}",
                 today.messages,
                 format_tokens(today.tokens_prompt),
                 format_tokens(today.tokens_completion),
+                fmt_extra(&today),
                 today.tool_calls,
                 total.messages,
                 format_tokens(total.tokens_prompt),
                 format_tokens(total.tokens_completion),
+                fmt_extra(&total),
                 total.tool_calls,
             ))
         }
@@ -2028,6 +2086,53 @@ fn format_tokens(n: u64) -> String {
     } else {
         format!("{n}")
     }
+}
+
+fn format_session_usage_lines(usage: &store::UsageSummary) -> Vec<String> {
+    let cache_read = usage.cache_read_input_tokens.max(usage.cached_input_tokens);
+    let cache_denom = usage
+        .tokens_prompt
+        .saturating_add(usage.cache_creation_input_tokens)
+        .saturating_add(cache_read);
+    let cache_hit = if cache_denom > 0 {
+        format!("{:.1}%", cache_read as f64 * 100.0 / cache_denom as f64)
+    } else {
+        "—".to_string()
+    };
+
+    let mut lines = vec![
+        format!("- 轮次: {}", usage.messages),
+        format!(
+            "- Token: ↓{} ↑{} total {}",
+            format_tokens(usage.tokens_prompt),
+            format_tokens(usage.tokens_completion),
+            format_tokens(usage.total_tokens)
+        ),
+        format!(
+            "- Cache: read {} create {} hit {}",
+            format_tokens(cache_read),
+            format_tokens(usage.cache_creation_input_tokens),
+            cache_hit
+        ),
+    ];
+    if usage.reasoning_output_tokens > 0 {
+        lines.push(format!(
+            "- Reasoning: {}",
+            format_tokens(usage.reasoning_output_tokens)
+        ));
+    }
+    if let Some(window) = usage.context_window
+        && window > 0
+    {
+        lines.push(format!("- Context window: {}", format_tokens(window)));
+    }
+    if usage.cost_usd > 0.0 {
+        lines.push(format!("- Cost: ${:.4}", usage.cost_usd));
+    }
+    if usage.tool_calls > 0 {
+        lines.push(format!("- 工具: {}", usage.tool_calls));
+    }
+    lines
 }
 
 fn format_duration(ms: u64) -> String {
