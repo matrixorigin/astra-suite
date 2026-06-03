@@ -2497,7 +2497,7 @@ fn strip_whitespace(s: &str) -> String {
 
 /// Render a model id using the friendly label from the entries list,
 /// falling back to the raw id if unknown.
-pub(crate) fn display_model_name(id: &str, entries: &[ModelEntry]) -> String {
+fn display_model_name(id: &str, entries: &[ModelEntry]) -> String {
     for entry in entries {
         if entry.full_id.as_deref() == Some(id) {
             return entry.label.clone();
@@ -2712,7 +2712,6 @@ mod tests {
             cli_timeout_secs: 3600,
             platforms: Default::default(),
             skills_dir: None,
-            skills_retrieval: Default::default(),
             session_reset: Default::default(),
             access: Default::default(),
             action_policy: Default::default(),

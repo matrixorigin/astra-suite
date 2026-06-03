@@ -401,15 +401,7 @@ async fn handle_wecom_message(
         .unwrap_or("")
         .trim();
 
-    // Strip @mentions (e.g. "@BotName ") so the model receives clean user text
-    let stripped_text = strip_at_mentions(raw_text);
-    let text = if stripped_text.is_empty() && !raw_text.is_empty() {
-        // A bare group mention (for example "@BotName") is an intentional ping.
-        // Preserve it as a greeting instead of dropping it before the runner sees it.
-        "你好".to_string()
-    } else {
-        stripped_text
-    };
+    let text = raw_text.to_string();
 
     if text.is_empty() {
         return;
@@ -446,28 +438,6 @@ async fn handle_wecom_message(
     if msg_tx.send(msg).await.is_err() {
         tracing::warn!("wecom message channel full, dropping message");
     }
-}
-
-fn strip_at_mentions(text: &str) -> String {
-    // Remove @mentions only at word boundaries (start of string or after whitespace).
-    // WeCom group messages arrive as "@BotName actual message".
-    // Preserves @-signs in emails, code, etc.
-    let mut result = String::with_capacity(text.len());
-    let mut chars = text.char_indices().peekable();
-    while let Some((i, ch)) = chars.next() {
-        if ch == '@' && (i == 0 || text.as_bytes()[i - 1] == b' ') {
-            // Skip the mention token (until next space or end)
-            while let Some(&(_, c)) = chars.peek() {
-                if c == ' ' {
-                    break;
-                }
-                chars.next();
-            }
-        } else {
-            result.push(ch);
-        }
-    }
-    result.trim().to_string()
 }
 
 fn classify_wecom_control_message(
@@ -621,7 +591,7 @@ mod tests {
     }
 
     #[test]
-    fn bare_group_mention_becomes_greeting() {
+    fn bare_group_mention_is_preserved_for_runner() {
         let data: Value = serde_json::from_str(
             r#"{
             "cmd": "aibot_msg_callback",
@@ -648,7 +618,7 @@ mod tests {
         rt.block_on(async {
             handle_wecom_message(&data, &tx, &mut dedup).await;
             let msg = rx.recv().await.unwrap();
-            assert_eq!(msg.text, "你好");
+            assert_eq!(msg.text, "@BisectBot");
             assert_eq!(msg.chat_type, ChatType::Group);
         });
     }
@@ -916,16 +886,5 @@ mod tests {
             handle_wecom_message(&data, &tx, &mut dedup).await;
             assert!(rx.try_recv().is_err());
         });
-    }
-
-    #[test]
-    fn strip_at_mentions_basic() {
-        assert_eq!(strip_at_mentions("@Bot 你好"), "你好");
-        assert_eq!(strip_at_mentions("@Bot"), "");
-        assert_eq!(strip_at_mentions("你好"), "你好");
-        assert_eq!(strip_at_mentions("@A @B 消息"), "消息");
-        assert_eq!(strip_at_mentions("hello @user world"), "hello  world");
-        // Preserves @ in emails/code (not at word boundary)
-        assert_eq!(strip_at_mentions("test@example.com"), "test@example.com");
     }
 }

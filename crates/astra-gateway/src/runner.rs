@@ -1091,9 +1091,8 @@ impl GatewayRunner {
                     ctx = ctx.with_active_tasks(task_list);
                 }
             }
-            let selected_skills = self.skills_for_message(&msg.text);
-            if !selected_skills.is_empty() {
-                ctx = ctx.with_extra_skills(selected_skills);
+            if !self.user_skills.is_empty() {
+                ctx = ctx.with_extra_skills(self.user_skills.clone());
             }
             if !self.projects.is_empty() {
                 ctx = ctx.with_projects(self.projects.clone());
@@ -1150,7 +1149,6 @@ impl GatewayRunner {
             .as_ref()
             .map(|_| uuid::Uuid::new_v4().to_string());
         let cli_name = cli_profile.name().to_string();
-        let ack_agent_name = progress_agent_name(&self.config, &cli_profile);
         let cli_timeout = Duration::from_secs(self.config.cli_timeout_secs.max(1));
 
         // Pre-fetch shared access token so the CLI can skip per-spawn auth.
@@ -1816,7 +1814,7 @@ impl GatewayRunner {
                 _ = &mut next_timer => {
                     if !sent_initial_ack {
                         sent_initial_ack = true;
-                        let ack = format!("[{request_tag}] 🤔 {ack_agent_name} 思考中…");
+                        let ack = format!("[{request_tag}] 🤔 {cli_name} 思考中…");
                         if let Some(ref tx) = self.outbound_tx {
                             let _ = tx.try_send(OutboundMessage {
                                 platform: msg.platform.to_string(),
@@ -2310,22 +2308,6 @@ impl GatewayRunner {
                 .await,
             )
         }
-    }
-
-    fn skills_for_message(&self, message: &str) -> Vec<(String, String)> {
-        if self.user_skills.is_empty() {
-            return Vec::new();
-        }
-        let retrieval = &self.config.skills_retrieval;
-        if !retrieval.enabled {
-            return self.user_skills.clone();
-        }
-        crate::gateway_context::select_relevant_skills(
-            &self.user_skills,
-            message,
-            retrieval.top_k,
-            retrieval.max_skill_chars,
-        )
     }
 
     async fn outbound_response(
@@ -4387,14 +4369,6 @@ fn reasoning_block_title(kind: ReasoningKind, agent_name: &str) -> String {
         ReasoningKind::Summary => "思考摘要",
     };
     format!("【{agent_name} {label}】")
-}
-
-fn progress_agent_name(config: &GatewayConfig, cli_profile: &CliProfile) -> String {
-    let Some(model_id) = cli_profile.model_name() else {
-        return cli_profile.name().to_string();
-    };
-    let entries = commands::all_model_entries(config, cli_profile.name());
-    commands::display_model_name(model_id, &entries)
 }
 
 fn answer_progressive_flush_enabled(reasoning_display: ReasoningDisplay) -> bool {
