@@ -2828,6 +2828,7 @@ mod tests {
             bot_name: String::new(),
             timezone: None,
             project_dirs: vec![],
+            working_dir: None,
             system_prompt_extra: None,
             api_port: None,
         }

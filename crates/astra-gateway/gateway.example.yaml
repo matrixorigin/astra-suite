@@ -184,6 +184,14 @@ providers:
 
 max_concurrent_runs: 4
 
+# Default working directory for CLI processes when a user has not selected one
+# with `/workspace` or `/ws`. User workspace preferences still take priority.
+# working_dir: /home/user/projects
+
+# Directories scanned by `/workspace` and gateway workspace tools.
+# project_dirs:
+#   - /home/user/projects
+
 # ─── Action Policy ──────────────────────────────────────────────────────────
 #
 # Controls what the gateway can do in response to messages.
