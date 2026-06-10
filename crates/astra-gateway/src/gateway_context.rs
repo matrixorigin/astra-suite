@@ -391,6 +391,7 @@ mod tests {
             bin: "astra".into(),
             model: Some("MiniMax-M2.7".into()),
             permission_mode: "auto".into(),
+            app_server_url: None,
         };
         let ctx = GatewayContext::new("u1", "Test", "weixin", &cli, true);
         let prompt = ctx.to_system_prompt();

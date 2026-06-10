@@ -1208,6 +1208,7 @@ mod tests {
             bin: "astra".into(),
             model: Some("gpt-5.5".into()),
             permission_mode: "auto".into(),
+            app_server_url: None,
         };
         assert!(CodexAppPool::supports_persistent(&profile));
 
@@ -1224,6 +1225,7 @@ mod tests {
             bin: "astra".into(),
             model: None,
             permission_mode: "auto".into(),
+            app_server_url: None,
         };
         let cmd = build_app_server_command(&profile, Some(Path::new("/tmp/project")), None)
             .expect("astra should support app-server command");
@@ -1245,6 +1247,7 @@ mod tests {
             bin: astra_bin,
             model: std::env::var("ASTRA_MODEL").ok(),
             permission_mode: "auto".into(),
+            app_server_url: None,
         };
         let workspace = tempfile::tempdir().unwrap();
         let mut pool = CodexAppPool::new();

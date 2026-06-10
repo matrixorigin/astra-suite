@@ -2323,16 +2323,18 @@ async fn astra_model_entries(
         return Ok(Vec::new());
     };
 
-    let output = tokio::time::timeout(
-        Duration::from_secs(5),
-        tokio::process::Command::new(bin)
-            .arg("model")
-            .arg("list")
-            .output(),
-    )
-    .await
-    .map_err(|_| format!("`{bin} model list` 超时"))?
-    .map_err(|e| format!("运行 `{bin} model list`: {e}"))?;
+    let mut command = tokio::process::Command::new(bin);
+    command.arg("model").arg("list");
+    if let Some(url) = profile
+        .app_server_url()
+        .filter(|url| !url.trim().is_empty())
+    {
+        command.env("ASTRA_API_URL", url);
+    }
+    let output = tokio::time::timeout(Duration::from_secs(5), command.output())
+        .await
+        .map_err(|_| format!("`{bin} model list` 超时"))?
+        .map_err(|e| format!("运行 `{bin} model list`: {e}"))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
