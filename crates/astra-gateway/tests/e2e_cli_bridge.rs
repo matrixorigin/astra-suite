@@ -10,6 +10,7 @@ fn astra_profile() -> CliProfile {
         bin: find_astra_bin(),
         model: Some("MiniMax-M2.7".into()),
         permission_mode: "auto".into(),
+        app_server_url: None,
     }
 }
 

@@ -184,6 +184,8 @@ pub enum CliProfile {
         model: Option<String>,
         #[serde(default = "default_permission_mode")]
         permission_mode: String,
+        #[serde(default)]
+        app_server_url: Option<String>,
     },
     #[serde(rename = "claude")]
     Claude {
@@ -338,6 +340,7 @@ impl Default for CliProfile {
             bin: default_astra_bin(),
             model: None,
             permission_mode: default_permission_mode(),
+            app_server_url: None,
         }
     }
 }
@@ -416,10 +419,17 @@ impl CliProfile {
                 bin,
                 model,
                 permission_mode,
+                app_server_url,
             } => {
                 let mut cmd = Command::new(bin);
                 // Ensure astra CLI connects directly to local server, not via HTTP proxy
                 cmd.env("no_proxy", "127.0.0.1,localhost");
+                if let Some(url) = app_server_url
+                    .as_deref()
+                    .filter(|url| !url.trim().is_empty())
+                {
+                    cmd.env("ASTRA_API_URL", url);
+                }
                 cmd.arg("chat")
                     .arg("-m")
                     .arg(message)
@@ -760,6 +770,13 @@ impl CliProfile {
                 *model = Some(model_name);
             }
             _ => {}
+        }
+    }
+
+    pub fn app_server_url(&self) -> Option<&str> {
+        match self {
+            Self::Astra { app_server_url, .. } => app_server_url.as_deref(),
+            _ => None,
         }
     }
 
@@ -2468,6 +2485,7 @@ Your Copilot CLI policy setting may be preventing access."#;
             bin: "astra".into(),
             model: Some("MiniMax-M2.7".into()),
             permission_mode: "auto".into(),
+            app_server_url: None,
         };
         let cmd = p.build_command("hello", Some("ses-1"), None);
         let prog = cmd.as_std().get_program().to_str().unwrap();
@@ -2476,6 +2494,24 @@ Your Copilot CLI policy setting may be preventing access."#;
         assert!(args.contains(&std::ffi::OsStr::new("--json")));
         assert!(args.contains(&std::ffi::OsStr::new("--session-id")));
         assert!(args.contains(&std::ffi::OsStr::new("MiniMax-M2.7")));
+    }
+
+    #[test]
+    fn build_astra_command_sets_api_url_from_app_server_url() {
+        let p = CliProfile::Astra {
+            bin: "astra".into(),
+            model: None,
+            permission_mode: "auto".into(),
+            app_server_url: Some("http://127.0.0.1:28000".into()),
+        };
+        let cmd = p.build_command("hello", None, None);
+        let envs: std::collections::HashMap<_, _> = cmd.as_std().get_envs().collect();
+        assert_eq!(
+            envs.get(std::ffi::OsStr::new("ASTRA_API_URL"))
+                .and_then(|value| *value)
+                .and_then(|value| value.to_str()),
+            Some("http://127.0.0.1:28000")
+        );
     }
 
     #[test]
@@ -2518,6 +2554,7 @@ Your Copilot CLI policy setting may be preventing access."#;
             bin: "astra".into(),
             model: None,
             permission_mode: "auto".into(),
+            app_server_url: None,
         };
         let cmd = p.build_command_with_context("hi", None, None, Some("gateway context"));
         let args: Vec<_> = cmd.as_std().get_args().collect();
