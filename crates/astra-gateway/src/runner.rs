@@ -1034,17 +1034,23 @@ impl GatewayRunner {
             );
         }
 
-        // Resolve workspace directory for CLI
-        let workspace: Option<std::path::PathBuf> = if let Some(ref store) = self.store
+        // Resolve workspace directory for CLI. User preference wins; the
+        // configured working_dir is only a fallback for new users.
+        let user_workspace: Option<std::path::PathBuf> = if let Some(ref store) = self.store
             && let Ok(Some(ws)) = store
                 .get_user_preference(msg.platform, &msg.user_id, "workspace")
                 .await
         {
-            let path = std::path::PathBuf::from(&ws);
-            if path.is_dir() { Some(path) } else { None }
+            resolve_workspace_path(&ws)
         } else {
             None
         };
+        let workspace = user_workspace.or_else(|| {
+            self.config
+                .working_dir
+                .as_deref()
+                .and_then(resolve_workspace_path)
+        });
 
         // Build gateway context for CLI system prompt
         let gw_context = {
@@ -1222,193 +1228,205 @@ impl GatewayRunner {
             let pool_cli_name = cli_name.clone();
 
             tokio::spawn(async move {
-                let mut pool_guard = pool.lock().await;
-                let mut pool_progress_rx = pool_guard
-                    .begin_turn(
-                        &pool_key,
-                        &msg_text,
-                        &profile,
-                        sid.as_deref(),
-                        ws.as_deref(),
-                        Some(&sp),
-                        token.as_deref(),
-                        mcp_cfg.as_deref(),
-                        pc.as_ref(),
-                    )
-                    .await?;
-                drop(pool_guard); // release lock before reading progress
+                let mut attempt_sid = sid;
+                let mut retried_stale_session = false;
 
-                // Forward events from pool's progress_rx to the runner's progress_tx
-                // until the turn ends (channel closes), cancel, or timeout.
-                let deadline = tokio::time::sleep(cli_timeout);
-                tokio::pin!(deadline);
-                // Silence heartbeat: every 60s without progress, reassure the user
-                let heartbeat = tokio::time::sleep(Duration::from_secs(60));
-                tokio::pin!(heartbeat);
                 loop {
-                    tokio::select! {
-                        ev = pool_progress_rx.recv() => {
-                            match ev {
-                                Some(event) => {
-                                    heartbeat.as_mut().reset(
-                                        tokio::time::Instant::now() + Duration::from_secs(60),
-                                    );
-                                    let _ = progress_tx.send(event).await;
-                                }
-                                None => break, // turn complete
-                            }
-                        }
-                        _ = &mut heartbeat => {
-                            let _ = progress_tx
-                                .send(CliProgress::Status(
-                                    "⏳ 模型正在深入分析，请稍候…".into(),
-                                ))
-                                .await;
-                            heartbeat.as_mut().reset(
-                                tokio::time::Instant::now() + Duration::from_secs(60),
-                            );
-                        }
-                        _ = kill_token.cancelled() => {
-                            let pool = pool.lock().await;
-                            let _ = pool.interrupt(&pool_key).await;
-                            drop(pool);
-                            // Give Claude up to 3s to emit result event after interrupt
-                            let drain_deadline = tokio::time::sleep(Duration::from_secs(3));
-                            tokio::pin!(drain_deadline);
-                            loop {
-                                tokio::select! {
-                                    ev = pool_progress_rx.recv() => {
-                                        match ev {
-                                            Some(event) => { let _ = progress_tx.send(event).await; }
-                                            None => break,
-                                        }
+                    let mut pool_guard = pool.lock().await;
+                    let mut pool_progress_rx = pool_guard
+                        .begin_turn(
+                            &pool_key,
+                            &msg_text,
+                            &profile,
+                            attempt_sid.as_deref(),
+                            ws.as_deref(),
+                            Some(&sp),
+                            token.as_deref(),
+                            mcp_cfg.as_deref(),
+                            pc.as_ref(),
+                        )
+                        .await?;
+                    drop(pool_guard); // release lock before reading progress
+
+                    // Forward events from pool's progress_rx to the runner's progress_tx
+                    // until the turn ends (channel closes), cancel, or timeout.
+                    let deadline = tokio::time::sleep(cli_timeout);
+                    tokio::pin!(deadline);
+                    // Silence heartbeat: every 60s without progress, reassure the user
+                    let heartbeat = tokio::time::sleep(Duration::from_secs(60));
+                    tokio::pin!(heartbeat);
+                    loop {
+                        tokio::select! {
+                            ev = pool_progress_rx.recv() => {
+                                match ev {
+                                    Some(event) => {
+                                        heartbeat.as_mut().reset(
+                                            tokio::time::Instant::now() + Duration::from_secs(60),
+                                        );
+                                        let _ = progress_tx.send(event).await;
                                     }
-                                    _ = &mut drain_deadline => break,
+                                    None => break, // turn complete
                                 }
                             }
-                            break;
-                        }
-                        _ = &mut deadline => {
-                            tracing::warn!(key = %pool_key, "pool turn timed out, killing process");
-                            pool.lock().await.kill(&pool_key);
-                            break;
+                            _ = &mut heartbeat => {
+                                let _ = progress_tx
+                                    .send(CliProgress::Status(
+                                        "⏳ 模型正在深入分析，请稍候…".into(),
+                                    ))
+                                    .await;
+                                heartbeat.as_mut().reset(
+                                    tokio::time::Instant::now() + Duration::from_secs(60),
+                                );
+                            }
+                            _ = kill_token.cancelled() => {
+                                let pool = pool.lock().await;
+                                let _ = pool.interrupt(&pool_key).await;
+                                drop(pool);
+                                // Give Claude up to 3s to emit result event after interrupt
+                                let drain_deadline = tokio::time::sleep(Duration::from_secs(3));
+                                tokio::pin!(drain_deadline);
+                                loop {
+                                    tokio::select! {
+                                        ev = pool_progress_rx.recv() => {
+                                            match ev {
+                                                Some(event) => { let _ = progress_tx.send(event).await; }
+                                                None => break,
+                                            }
+                                        }
+                                        _ = &mut drain_deadline => break,
+                                    }
+                                }
+                                break;
+                            }
+                            _ = &mut deadline => {
+                                tracing::warn!(key = %pool_key, "pool turn timed out, killing process");
+                                pool.lock().await.kill(&pool_key);
+                                break;
+                            }
                         }
                     }
-                }
 
-                // Extract stats from the result event stored by stdout reader
-                let pool_guard = pool.lock().await;
-                let session_id = pool_guard.session_id(&pool_key).await;
-                let result_json = pool_guard.take_last_result(&pool_key).await;
-                let stderr_hint = pool_guard
-                    .take_stderr_hint(&pool_key)
-                    .await
-                    .unwrap_or_default();
-                drop(pool_guard);
+                    // Extract stats from the result event stored by stdout reader
+                    let pool_guard = pool.lock().await;
+                    let session_id = pool_guard.session_id(&pool_key).await;
+                    let result_json = pool_guard.take_last_result(&pool_key).await;
+                    let stderr_hint = pool_guard
+                        .take_stderr_hint(&pool_key)
+                        .await
+                        .unwrap_or_default();
+                    drop(pool_guard);
 
-                // Clear stale session if the CLI reported it missing.
-                if profile.is_stale_session_error(&stderr_hint) {
-                    if let Some(ref store) = pool_store {
-                        let _ = store
-                            .reset_session(&pool_platform, &pool_key, &pool_cli_name)
-                            .await;
+                    let stale_session_error = profile.is_stale_session_error(&stderr_hint);
+                    if stale_session_error
+                        && attempt_sid.is_some()
+                        && !retried_stale_session
+                        && !kill_token.is_cancelled()
+                    {
+                        if let Some(ref store) = pool_store {
+                            let _ = store
+                                .reset_session(&pool_platform, &pool_key, &pool_cli_name)
+                                .await;
+                        }
+                        tracing::info!(
+                            key = %pool_key,
+                            "pool: cleared stale session; retrying without resume"
+                        );
+                        attempt_sid = None;
+                        retried_stale_session = true;
+                        continue;
                     }
-                    tracing::info!(key = %pool_key, "pool: cleared stale session");
-                }
 
-                let (
-                    text,
-                    tokens_prompt,
-                    tokens_completion,
-                    tool_calls_count,
-                    cache_creation_input_tokens,
-                    cache_read_input_tokens,
-                    context_window,
-                    max_output_tokens,
-                    cost_usd,
-                    raw_usage_json,
-                ) = if let Some(ref v) = result_json {
-                    let usage = &v["usage"];
-                    let model_usage = v["modelUsage"].as_object().and_then(|m| m.values().next());
-                    (
-                        v["result"].as_str().map(String::from),
-                        usage["input_tokens"].as_u64(),
-                        usage["output_tokens"].as_u64(),
-                        v["num_turns"]
-                            .as_u64()
-                            .and_then(|t| if t > 1 { Some(t as u32) } else { None }),
-                        usage["cache_creation_input_tokens"].as_u64(),
-                        usage["cache_read_input_tokens"].as_u64(),
-                        model_usage.and_then(|m| m["contextWindow"].as_u64()),
-                        model_usage.and_then(|m| m["maxOutputTokens"].as_u64()),
-                        v["total_cost_usd"]
-                            .as_f64()
-                            .or_else(|| model_usage.and_then(|m| m["costUSD"].as_f64())),
-                        serde_json::to_string(usage).ok(),
-                    )
-                } else {
-                    (None, None, None, None, None, None, None, None, None, None)
-                };
-                let total_tokens = {
-                    let mut total = 0u64;
-                    let mut any = false;
-                    for value in [
+                    let (
+                        text,
                         tokens_prompt,
                         tokens_completion,
+                        tool_calls_count,
                         cache_creation_input_tokens,
                         cache_read_input_tokens,
-                    ]
-                    .into_iter()
-                    .flatten()
-                    {
-                        total = total.saturating_add(value);
-                        any = true;
-                    }
-                    any.then_some(total)
-                };
-
-                // Process exited without producing a result event
-                if result_json.is_none()
-                    && text.is_none()
-                    && !profile.is_stale_session_error(&stderr_hint)
-                {
-                    return Err(if stderr_hint.is_empty() {
-                        "pool process exited without result".to_string()
+                        context_window,
+                        max_output_tokens,
+                        cost_usd,
+                        raw_usage_json,
+                    ) = if let Some(ref v) = result_json {
+                        let usage = &v["usage"];
+                        let model_usage =
+                            v["modelUsage"].as_object().and_then(|m| m.values().next());
+                        (
+                            v["result"].as_str().map(String::from),
+                            usage["input_tokens"].as_u64(),
+                            usage["output_tokens"].as_u64(),
+                            v["num_turns"]
+                                .as_u64()
+                                .and_then(|t| if t > 1 { Some(t as u32) } else { None }),
+                            usage["cache_creation_input_tokens"].as_u64(),
+                            usage["cache_read_input_tokens"].as_u64(),
+                            model_usage.and_then(|m| m["contextWindow"].as_u64()),
+                            model_usage.and_then(|m| m["maxOutputTokens"].as_u64()),
+                            v["total_cost_usd"]
+                                .as_f64()
+                                .or_else(|| model_usage.and_then(|m| m["costUSD"].as_f64())),
+                            serde_json::to_string(usage).ok(),
+                        )
                     } else {
-                        format!("pool process exited: {stderr_hint}")
+                        (None, None, None, None, None, None, None, None, None, None)
+                    };
+                    let total_tokens = {
+                        let mut total = 0u64;
+                        let mut any = false;
+                        for value in [
+                            tokens_prompt,
+                            tokens_completion,
+                            cache_creation_input_tokens,
+                            cache_read_input_tokens,
+                        ]
+                        .into_iter()
+                        .flatten()
+                        {
+                            total = total.saturating_add(value);
+                            any = true;
+                        }
+                        any.then_some(total)
+                    };
+
+                    // Process exited without producing a result event
+                    if result_json.is_none() && text.is_none() && !stale_session_error {
+                        return Err(if stderr_hint.is_empty() {
+                            "pool process exited without result".to_string()
+                        } else {
+                            format!("pool process exited: {stderr_hint}")
+                        });
+                    }
+
+                    return Ok(cli_bridge::CliResult {
+                        stdout: String::new(),
+                        stderr: stderr_hint,
+                        exit_code: if stale_session_error { 1 } else { 0 },
+                        success: !stale_session_error,
+                        error_kind: if stale_session_error {
+                            Some("stale_session".to_string())
+                        } else {
+                            None
+                        },
+                        trace_id: None,
+                        request_id: None,
+                        run_id: None,
+                        session_id,
+                        text,
+                        tool_calls_count,
+                        tools_used: Vec::new(),
+                        tokens_prompt,
+                        tokens_completion,
+                        cached_input_tokens: cache_read_input_tokens,
+                        cache_creation_input_tokens,
+                        cache_read_input_tokens,
+                        reasoning_output_tokens: None,
+                        total_tokens,
+                        context_window,
+                        max_output_tokens,
+                        cost_usd,
+                        raw_usage_json,
                     });
                 }
-                let stale_session_error = profile.is_stale_session_error(&stderr_hint);
-
-                Ok(cli_bridge::CliResult {
-                    stdout: String::new(),
-                    stderr: stderr_hint,
-                    exit_code: if stale_session_error { 1 } else { 0 },
-                    success: !stale_session_error,
-                    error_kind: if stale_session_error {
-                        Some("stale_session".to_string())
-                    } else {
-                        None
-                    },
-                    trace_id: None,
-                    request_id: None,
-                    run_id: None,
-                    session_id,
-                    text,
-                    tool_calls_count,
-                    tools_used: Vec::new(),
-                    tokens_prompt,
-                    tokens_completion,
-                    cached_input_tokens: cache_read_input_tokens,
-                    cache_creation_input_tokens,
-                    cache_read_input_tokens,
-                    reasoning_output_tokens: None,
-                    total_tokens,
-                    context_window,
-                    max_output_tokens,
-                    cost_usd,
-                    raw_usage_json,
-                })
             })
         } else if use_codex_app_pool {
             // Long-lived Codex app-server path: JSON-RPC thread + turn protocol.
@@ -1606,7 +1624,7 @@ impl GatewayRunner {
             if stream_id.is_none() {
                 return;
             }
-            if accumulated.is_empty() && !finish {
+            if accumulated.is_empty() {
                 return;
             }
             let _ = tx.try_send(OutboundMessage::stream_chunk(
@@ -5666,6 +5684,15 @@ fn is_mentioned(text: &str, bot_name: &str) -> bool {
         let pattern = format!("@{bot_name}");
         text.to_lowercase().contains(&pattern.to_lowercase())
     }
+}
+
+fn resolve_workspace_path(path: &str) -> Option<std::path::PathBuf> {
+    let expanded = if let Some(rest) = path.strip_prefix("~/") {
+        std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(rest))?
+    } else {
+        std::path::PathBuf::from(path)
+    };
+    expanded.is_dir().then_some(expanded)
 }
 
 /// Remove `@BotName` prefix from group messages so downstream handlers see clean text.

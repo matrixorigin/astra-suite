@@ -40,6 +40,8 @@ pub struct GatewayConfig {
     pub timezone: Option<String>,
     /// Directories to scan for git projects (e.g. ["~/github", "~/work"]).
     pub project_dirs: Vec<String>,
+    /// Default working directory when a user has not set a workspace preference.
+    pub working_dir: Option<String>,
     /// Extra text appended to the system prompt (user-customizable).
     pub system_prompt_extra: Option<String>,
     /// HTTP API port for message injection (e.g. 9090). Disabled when absent.
@@ -84,6 +86,8 @@ struct RawGatewayConfig {
     timezone: Option<String>,
     #[serde(default)]
     project_dirs: Vec<String>,
+    #[serde(default)]
+    working_dir: Option<String>,
     #[serde(default)]
     system_prompt_extra: Option<String>,
     #[serde(default)]
@@ -139,6 +143,7 @@ impl<'de> serde::Deserialize<'de> for GatewayConfig {
             bot_name: raw.bot_name,
             timezone: raw.timezone,
             project_dirs: raw.project_dirs,
+            working_dir: raw.working_dir,
             system_prompt_extra: raw.system_prompt_extra,
             api_port: raw.api_port,
         })
