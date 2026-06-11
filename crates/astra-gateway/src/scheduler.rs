@@ -255,14 +255,20 @@ impl CronScheduler {
     }
 
     async fn resolve_workspace(&self, platform: &str, user_id: &str) -> Option<std::path::PathBuf> {
-        let ws = self
+        let user_workspace = self
             .store
             .get_user_preference(platform, user_id, "workspace")
             .await
             .ok()
-            .flatten()?;
-        let path = std::path::PathBuf::from(ws);
-        if path.is_dir() { Some(path) } else { None }
+            .flatten()
+            .and_then(|ws| crate::workspace::resolve_existing_dir(&ws));
+
+        user_workspace.or_else(|| {
+            self.config
+                .working_dir
+                .as_deref()
+                .and_then(crate::workspace::resolve_existing_dir)
+        })
     }
 
     /// Resolve the user_id who created the cron job.

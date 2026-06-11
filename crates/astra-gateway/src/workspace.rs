@@ -2,7 +2,7 @@
 //!
 //! Scans directories for git projects, provides listings for agent context.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Scan a directory for git projects (directories containing .git).
 pub fn discover_projects(base_dir: &str) -> Vec<ProjectInfo> {
@@ -61,6 +61,12 @@ impl ProjectInfo {
         let marker = if self.has_changes { " *" } else { "" };
         format!("`{}` → `{}` ({}{})", self.name, self.path, branch, marker)
     }
+}
+
+pub fn resolve_existing_dir(path: &str) -> Option<PathBuf> {
+    let expanded = expand_home(path);
+    let path = PathBuf::from(expanded);
+    path.is_dir().then_some(path)
 }
 
 fn expand_home(path: &str) -> String {
@@ -124,8 +130,21 @@ mod tests {
     }
 
     #[test]
+    fn expand_home_bare_tilde_works() {
+        let expanded = expand_home("~");
+        assert!(!expanded.starts_with('~'));
+        assert_eq!(expanded, std::env::var("HOME").unwrap_or_default());
+    }
+
+    #[test]
     fn expand_home_no_tilde() {
         assert_eq!(expand_home("/absolute/path"), "/absolute/path");
+    }
+
+    #[test]
+    fn resolve_existing_dir_expands_home() {
+        let resolved = resolve_existing_dir("~").unwrap();
+        assert!(resolved.is_dir());
     }
 
     #[test]

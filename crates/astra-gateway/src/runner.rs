@@ -1041,7 +1041,7 @@ impl GatewayRunner {
                 .get_user_preference(msg.platform, &msg.user_id, "workspace")
                 .await
         {
-            resolve_workspace_path(&ws)
+            crate::workspace::resolve_existing_dir(&ws)
         } else {
             None
         };
@@ -1049,7 +1049,7 @@ impl GatewayRunner {
             self.config
                 .working_dir
                 .as_deref()
-                .and_then(resolve_workspace_path)
+                .and_then(crate::workspace::resolve_existing_dir)
         });
 
         // Build gateway context for CLI system prompt
@@ -1331,6 +1331,7 @@ impl GatewayRunner {
                             key = %pool_key,
                             "pool: cleared stale session; retrying without resume"
                         );
+                        pool.lock().await.kill(&pool_key);
                         attempt_sid = None;
                         retried_stale_session = true;
                         continue;
@@ -5684,15 +5685,6 @@ fn is_mentioned(text: &str, bot_name: &str) -> bool {
         let pattern = format!("@{bot_name}");
         text.to_lowercase().contains(&pattern.to_lowercase())
     }
-}
-
-fn resolve_workspace_path(path: &str) -> Option<std::path::PathBuf> {
-    let expanded = if let Some(rest) = path.strip_prefix("~/") {
-        std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(rest))?
-    } else {
-        std::path::PathBuf::from(path)
-    };
-    expanded.is_dir().then_some(expanded)
 }
 
 /// Remove `@BotName` prefix from group messages so downstream handlers see clean text.
