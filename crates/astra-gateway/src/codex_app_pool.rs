@@ -480,9 +480,19 @@ fn build_app_server_command(
             }
             cmd
         }
-        CliProfile::Astra { bin, .. } => {
+        CliProfile::Astra {
+            bin,
+            app_server_url,
+            ..
+        } => {
             let mut cmd = Command::new(bin);
             cmd.env("no_proxy", "127.0.0.1,localhost");
+            if let Some(url) = app_server_url
+                .as_deref()
+                .filter(|url| !url.trim().is_empty())
+            {
+                cmd.env("ASTRA_API_URL", url);
+            }
             cmd.arg("serve").arg("stdio");
             cmd
         }
@@ -1235,6 +1245,25 @@ mod tests {
         assert_eq!(
             cmd.as_std().get_current_dir(),
             Some(Path::new("/tmp/project"))
+        );
+    }
+
+    #[test]
+    fn astra_app_server_command_sets_api_url_from_profile() {
+        let profile = CliProfile::Astra {
+            bin: "astra".into(),
+            model: None,
+            permission_mode: "auto".into(),
+            app_server_url: Some("http://10.222.1.50:28000".into()),
+        };
+        let cmd = build_app_server_command(&profile, None, None)
+            .expect("astra should support app-server command");
+        let envs: std::collections::HashMap<_, _> = cmd.as_std().get_envs().collect();
+        assert_eq!(
+            envs.get(std::ffi::OsStr::new("ASTRA_API_URL"))
+                .and_then(|value| *value)
+                .and_then(|value| value.to_str()),
+            Some("http://10.222.1.50:28000")
         );
     }
 
