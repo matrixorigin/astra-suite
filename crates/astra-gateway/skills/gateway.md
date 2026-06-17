@@ -8,7 +8,7 @@ Model: `{{model}}`
 ### User Commands
 
 - `/new` — new conversation  `/status` — status + model  `/help` — all commands
-- `/model <name>` — switch model (haiku/sonnet/opus/minimax/deepseek/qwen/glm)
+- `/model` — show/switch model  `/model <name>` — switch to specific model
 - `/cli` — show/switch CLI backend  `/gateway` — full capability overview
 - `/ws ls` — list projects  `/ws <name>` — switch workspace
 - `/running` — active tasks (numbered)  `/kill N` — kill by number  `/cancel N` — cancel by number
