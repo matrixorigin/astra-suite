@@ -42,7 +42,9 @@ pub struct GatewayConfig {
     pub project_dirs: Vec<String>,
     /// Default working directory when a user has not set a workspace preference.
     pub working_dir: Option<String>,
-    /// Extra text appended to the system prompt (user-customizable).
+    /// Extra text appended to the system prompt. Loaded from config
+    /// `system_prompt_extra`, or from `system_prompt_extra.md` beside the
+    /// gateway config when the config field is absent.
     pub system_prompt_extra: Option<String>,
     /// HTTP API port for message injection (e.g. 9090). Disabled when absent.
     pub api_port: Option<u16>,
@@ -112,41 +114,9 @@ impl<'de> serde::Deserialize<'de> for GatewayConfig {
     where
         D: serde::Deserializer<'de>,
     {
-        let raw = RawGatewayConfig::deserialize(deserializer)?;
-        let cli = match raw.cli {
-            CliConfig::Profile(profile) => profile,
-            CliConfig::ProfileName(name) => {
-                raw.cli_profiles.get(&name).cloned().ok_or_else(|| {
-                    serde::de::Error::custom(format!(
-                        "cli references unknown profile `{name}`; define it under cli_profiles"
-                    ))
-                })?
-            }
-        };
-
-        Ok(Self {
-            astra: raw.astra,
-            storage: raw.storage,
-            database: raw.database,
-            cli,
-            cli_profiles: raw.cli_profiles,
-            providers: raw.providers,
-            cli_timeout_secs: raw.cli_timeout_secs,
-            platforms: raw.platforms,
-            skills_dir: raw.skills_dir,
-            session_reset: raw.session_reset,
-            access: raw.access,
-            action_policy: raw.action_policy,
-            max_concurrent_runs: raw.max_concurrent_runs,
-            group_sessions_per_user: raw.group_sessions_per_user,
-            group_require_mention: raw.group_require_mention,
-            bot_name: raw.bot_name,
-            timezone: raw.timezone,
-            project_dirs: raw.project_dirs,
-            working_dir: raw.working_dir,
-            system_prompt_extra: raw.system_prompt_extra,
-            api_port: raw.api_port,
-        })
+        RawGatewayConfig::deserialize(deserializer)?
+            .try_into()
+            .map_err(serde::de::Error::custom)
     }
 }
 
@@ -320,7 +290,19 @@ impl std::fmt::Debug for TelegramConfig {
 impl GatewayConfig {
     pub fn load(path: &Path) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let content = std::fs::read_to_string(path)?;
-        let config: Self = serde_yaml_ng::from_str(&content)?;
+        let raw: RawGatewayConfig = serde_yaml_ng::from_str(&content)?;
+        let mut config: Self = raw.try_into()?;
+        if config.system_prompt_extra.is_none() {
+            let extra_path = system_prompt_extra_path(path);
+            if extra_path.exists() {
+                let extra = std::fs::read_to_string(&extra_path).map_err(|e| {
+                    format!("load system prompt extra `{}`: {e}", extra_path.display())
+                })?;
+                if !extra.is_empty() {
+                    config.system_prompt_extra = Some(extra);
+                }
+            }
+        }
         Ok(config)
     }
 
@@ -331,6 +313,52 @@ impl GatewayConfig {
     pub fn resolve_storage(&self) -> crate::store::StorageConfig {
         self.storage.clone()
     }
+}
+
+impl TryFrom<RawGatewayConfig> for GatewayConfig {
+    type Error = String;
+
+    fn try_from(raw: RawGatewayConfig) -> Result<Self, Self::Error> {
+        let cli = match raw.cli {
+            CliConfig::Profile(profile) => profile,
+            CliConfig::ProfileName(name) => {
+                raw.cli_profiles.get(&name).cloned().ok_or_else(|| {
+                    format!("cli references unknown profile `{name}`; define it under cli_profiles")
+                })?
+            }
+        };
+
+        Ok(Self {
+            astra: raw.astra,
+            storage: raw.storage,
+            database: raw.database,
+            cli,
+            cli_profiles: raw.cli_profiles,
+            providers: raw.providers,
+            cli_timeout_secs: raw.cli_timeout_secs,
+            platforms: raw.platforms,
+            skills_dir: raw.skills_dir,
+            session_reset: raw.session_reset,
+            access: raw.access,
+            action_policy: raw.action_policy,
+            max_concurrent_runs: raw.max_concurrent_runs,
+            group_sessions_per_user: raw.group_sessions_per_user,
+            group_require_mention: raw.group_require_mention,
+            bot_name: raw.bot_name,
+            timezone: raw.timezone,
+            project_dirs: raw.project_dirs,
+            working_dir: raw.working_dir,
+            system_prompt_extra: raw.system_prompt_extra,
+            api_port: raw.api_port,
+        })
+    }
+}
+
+fn system_prompt_extra_path(config_path: &Path) -> std::path::PathBuf {
+    config_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("system_prompt_extra.md")
 }
 
 impl WeComConfig {
@@ -636,5 +664,37 @@ astra:
         let cfg: GatewayConfig = serde_yaml_ng::from_str(yaml).unwrap();
         assert!(cfg.astra.username.is_none());
         assert!(cfg.astra.password.is_none());
+    }
+
+    #[test]
+    fn load_system_prompt_extra_from_convention_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("system_prompt_extra.md"), "file prompt").unwrap();
+        let config_path = dir.path().join("config.yaml");
+        std::fs::write(&config_path, "").unwrap();
+
+        let cfg = GatewayConfig::load(&config_path).unwrap();
+        assert_eq!(cfg.system_prompt_extra.as_deref(), Some("file prompt"));
+    }
+
+    #[test]
+    fn load_system_prompt_extra_absent_convention_file_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.yaml");
+        std::fs::write(&config_path, "").unwrap();
+
+        let cfg = GatewayConfig::load(&config_path).unwrap();
+        assert_eq!(cfg.system_prompt_extra.as_deref(), None);
+    }
+
+    #[test]
+    fn load_system_prompt_extra_config_field_wins_over_convention_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("system_prompt_extra.md"), "file prompt").unwrap();
+        let config_path = dir.path().join("config.yaml");
+        std::fs::write(&config_path, "system_prompt_extra: config prompt\n").unwrap();
+
+        let cfg = GatewayConfig::load(&config_path).unwrap();
+        assert_eq!(cfg.system_prompt_extra.as_deref(), Some("config prompt"));
     }
 }
