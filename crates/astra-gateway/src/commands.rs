@@ -2830,6 +2830,7 @@ mod tests {
             project_dirs: vec![],
             working_dir: None,
             system_prompt_extra: None,
+            github_tokens: Default::default(),
             api_port: None,
         }
     }
