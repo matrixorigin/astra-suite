@@ -252,6 +252,8 @@ async fn run_wecom_connection(
                 tracing::debug!(
                     cmd = frame["cmd"].as_str().unwrap_or("?"),
                     finish = %frame["body"]["stream"]["finish"],
+                    feedback = frame["body"]["stream"]["feedback"]["id"].as_str().is_some()
+                        || frame["body"]["feedback"]["id"].as_str().is_some(),
                     content_len = out.text.len(),
                     "wecom outbound frame"
                 );
@@ -353,17 +355,19 @@ fn build_send_frame(bot_id: &str, out: &OutboundMessage) -> Value {
         })
     } else if let Some(ref req_id) = out.reply_token {
         // Non-stream reply (one-shot markdown via respond)
-        json!({
+        let mut frame = json!({
             "cmd": "aibot_respond_msg",
             "headers": {"req_id": req_id},
             "body": {
                 "msgtype": "markdown",
                 "markdown": {"content": &out.text}
             }
-        })
+        });
+        attach_body_feedback(&mut frame, out.feedback_id.as_deref());
+        frame
     } else if !out.chat_id.is_empty() {
         // Proactive send (DM or group without req_id)
-        json!({
+        let mut frame = json!({
             "cmd": "aibot_send_msg",
             "headers": {"req_id": format!("send-{}", uuid::Uuid::new_v4())},
             "body": {
@@ -372,7 +376,9 @@ fn build_send_frame(bot_id: &str, out: &OutboundMessage) -> Value {
                 "msgtype": "markdown",
                 "markdown": {"content": &out.text}
             }
-        })
+        });
+        attach_body_feedback(&mut frame, out.feedback_id.as_deref());
+        frame
     } else {
         tracing::warn!(
             text_len = out.text.len(),
@@ -382,27 +388,40 @@ fn build_send_frame(bot_id: &str, out: &OutboundMessage) -> Value {
     }
 }
 
+fn attach_body_feedback(frame: &mut Value, feedback_id: Option<&str>) {
+    if let Some(feedback_id) = feedback_id {
+        frame["body"]["feedback"] = json!({ "id": feedback_id });
+    }
+}
+
 async fn handle_wecom_message(
     data: &Value,
     msg_tx: &mpsc::Sender<InboundMessage>,
     dedup: &mut MessageDeduplicator,
 ) {
     let cmd = data["cmd"].as_str().unwrap_or("");
-    if cmd != "aibot_msg_callback" && cmd != "aibot_callback" {
-        if let Some((event_type, detail)) = classify_wecom_control_message(data) {
-            emit_adapter_health(AdapterHealthEvent::new("wecom", event_type, detail));
-        }
-        return;
-    }
-
     let body = &data["body"];
     tracing::trace!(raw = %data, "wecom inbound raw");
-    let msg_id = body["msgid"].as_str().unwrap_or("").to_string();
-    if msg_id.is_empty() || !dedup.check(&msg_id) {
-        return;
-    }
 
     if let Some(feedback) = parse_feedback_event(body) {
+        let msg_id = body["msgid"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| feedback.feedback_id.clone());
+        let dedup_key = format!(
+            "feedback:{}:{}:{}",
+            msg_id, feedback.feedback_id, feedback.feedback_type
+        );
+        if !dedup.check(&dedup_key) {
+            tracing::debug!(
+                feedback_id = %feedback.feedback_id,
+                feedback_type = feedback.feedback_type,
+                "wecom duplicate feedback event skipped"
+            );
+            return;
+        }
+
         let user_id = body["from"]["userid"]
             .as_str()
             .unwrap_or("unknown")
@@ -417,6 +436,13 @@ async fn handle_wecom_message(
         } else {
             ChatType::DirectMessage
         };
+        tracing::info!(
+            feedback_id = %feedback.feedback_id,
+            feedback_type = feedback.feedback_type,
+            user = %user_id,
+            chat_id = %chat_id,
+            "wecom feedback event received"
+        );
         let msg = InboundMessage {
             platform: "wecom",
             chat_id,
@@ -429,8 +455,24 @@ async fn handle_wecom_message(
             feedback: Some(feedback),
         };
         if msg_tx.send(msg).await.is_err() {
-            tracing::warn!("wecom message channel full, dropping feedback event");
+            tracing::warn!("wecom message channel closed, dropping feedback event");
         }
+        return;
+    }
+
+    if let Some(eventtype) = body["event"]["eventtype"].as_str() {
+        tracing::info!(eventtype, cmd, "wecom event callback ignored");
+    }
+
+    if cmd != "aibot_msg_callback" && cmd != "aibot_callback" {
+        if let Some((event_type, detail)) = classify_wecom_control_message(data) {
+            emit_adapter_health(AdapterHealthEvent::new("wecom", event_type, detail));
+        }
+        return;
+    }
+
+    let msg_id = body["msgid"].as_str().unwrap_or("").to_string();
+    if msg_id.is_empty() || !dedup.check(&msg_id) {
         return;
     }
 
@@ -485,7 +527,9 @@ fn parse_feedback_event(body: &Value) -> Option<FeedbackEvent> {
     if event["eventtype"].as_str()? != "feedback_event" {
         return None;
     }
-    let feedback = &event["feedback_event"];
+    let feedback = event
+        .get("feedback_event")
+        .or_else(|| event.get("feedback"))?;
     let feedback_id = feedback["id"].as_str()?.trim().to_string();
     if feedback_id.is_empty() {
         return None;
@@ -721,6 +765,24 @@ mod tests {
     }
 
     #[test]
+    fn build_send_frame_markdown_respond_with_feedback() {
+        let out = OutboundMessage {
+            chat_id: "chat-1".into(),
+            text: "response".into(),
+            reply_token: Some("req-original".into()),
+            stream_id: None,
+            feedback_id: Some("feedback-1".into()),
+            stream_finish: true,
+        };
+        let frame = build_send_frame("bot-1", &out);
+        assert_eq!(frame["cmd"], "aibot_respond_msg");
+        assert_eq!(frame["headers"]["req_id"], "req-original");
+        assert_eq!(frame["body"]["msgtype"], "markdown");
+        assert_eq!(frame["body"]["markdown"]["content"], "response");
+        assert_eq!(frame["body"]["feedback"]["id"], "feedback-1");
+    }
+
+    #[test]
     fn parse_feedback_callback() {
         let data: Value = serde_json::from_str(
             r#"{
@@ -767,6 +829,47 @@ mod tests {
             assert_eq!(feedback.feedback_type, 1);
             assert_eq!(feedback.content.as_deref(), Some("good"));
             assert_eq!(feedback.inaccurate_reason_list, vec![2, 4]);
+        });
+    }
+
+    #[test]
+    fn parse_feedback_callback_before_cmd_filter() {
+        let data: Value = serde_json::from_str(
+            r#"{
+            "cmd": "aibot_event_callback",
+            "headers": {"req_id": "req-feedback"},
+            "body": {
+                "msgid": "feedback-msg-2",
+                "chatid": "chat-1",
+                "chattype": "single",
+                "from": {"userid": "user-1"},
+                "msgtype": "event",
+                "event": {
+                    "eventtype": "feedback_event",
+                    "feedback_event": {
+                        "id": "request-2",
+                        "type": 2
+                    }
+                }
+            }
+        }"#,
+        )
+        .unwrap();
+
+        let (tx, mut rx) = mpsc::channel(10);
+        let mut dedup = MessageDeduplicator::new();
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            handle_wecom_message(&data, &tx, &mut dedup).await;
+            let msg = rx.recv().await.unwrap();
+            let feedback = msg.feedback.unwrap();
+            assert_eq!(feedback.feedback_id, "request-2");
+            assert_eq!(feedback.feedback_type, 2);
         });
     }
 

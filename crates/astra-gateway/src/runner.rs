@@ -320,6 +320,24 @@ impl OutboundMessage {
         }
     }
 
+    pub fn plain_with_feedback(
+        platform: impl Into<String>,
+        chat_id: impl Into<String>,
+        text: impl Into<String>,
+        feedback_id: Option<String>,
+    ) -> Self {
+        Self {
+            platform: platform.into(),
+            chat_id: chat_id.into(),
+            text: text.into(),
+            reply_token: None,
+            stream_id: None,
+            feedback_id,
+            stream_finish: true,
+            outbox: None,
+        }
+    }
+
     pub fn stream_chunk(
         platform: impl Into<String>,
         chat_id: impl Into<String>,
@@ -346,6 +364,7 @@ impl OutboundMessage {
         chat_id: impl Into<String>,
         text: impl Into<String>,
         reply_token: Option<String>,
+        feedback_id: Option<String>,
         outbox: OutboxDelivery,
     ) -> Self {
         Self {
@@ -354,7 +373,7 @@ impl OutboundMessage {
             text: text.into(),
             reply_token,
             stream_id: None,
-            feedback_id: None,
+            feedback_id,
             stream_finish: true,
             outbox: Some(outbox),
         }
@@ -650,15 +669,15 @@ impl GatewayRunner {
                 GatewayEventKind::Feedback,
                 serde_json::json!({
                     "platform": msg.platform,
-                    "chat_id": msg.chat_id,
-                    "user_id": msg.user_id,
-                    "platform_msg_id": msg.msg_id,
-                    "feedback_id": feedback.feedback_id,
+                    "chat_id": &msg.chat_id,
+                    "user_id": &msg.user_id,
+                    "platform_msg_id": &msg.msg_id,
+                    "feedback_id": &feedback.feedback_id,
                     "feedback_type": feedback.feedback_type,
                     "feedback_label": feedback_type_label(feedback.feedback_type),
-                    "content": feedback.content,
-                    "inaccurate_reason_list": feedback.inaccurate_reason_list,
-                    "raw": feedback.raw,
+                    "content": &feedback.content,
+                    "inaccurate_reason_list": &feedback.inaccurate_reason_list,
+                    "raw": &feedback.raw,
                 }),
             )
             .await
@@ -1763,6 +1782,23 @@ impl GatewayRunner {
                 text,
             ));
         };
+        let send_plain_ai = |text: String,
+                             tx: &Option<tokio::sync::mpsc::Sender<OutboundMessage>>,
+                             platform: &str,
+                             chat: &str| {
+            let Some(tx) = tx else {
+                return;
+            };
+            if text.trim().is_empty() {
+                return;
+            }
+            let _ = tx.try_send(OutboundMessage::plain_with_feedback(
+                platform.to_string(),
+                chat.to_string(),
+                text,
+                feedback_id.clone(),
+            ));
+        };
         let flush_reasoning_buf = |buf: &mut String,
                                    accumulated: &mut String,
                                    kind: ReasoningKind,
@@ -2031,7 +2067,7 @@ impl GatewayRunner {
                             }
                             // Send full accumulated content with finish=true to close the stream
                             if stream_cutoff_active {
-                                send_plain(
+                                send_plain_ai(
                                     post_stream_buffer.clone(),
                                     &self.outbound_tx,
                                     msg.platform,
@@ -2624,7 +2660,7 @@ impl GatewayRunner {
                 text,
                 reply_token,
                 stream_id: None,
-                feedback_id: None,
+                feedback_id: Some(trace.request_id.to_string()),
                 stream_finish: true,
                 outbox: None,
             };
@@ -2643,6 +2679,7 @@ impl GatewayRunner {
                 chat_id.to_string(),
                 text,
                 reply_token,
+                Some(trace.request_id.to_string()),
                 OutboxDelivery {
                     outbox_id,
                     trace_id: trace.trace_id.clone(),
@@ -2657,7 +2694,7 @@ impl GatewayRunner {
                     text,
                     reply_token,
                     stream_id: None,
-                    feedback_id: None,
+                    feedback_id: Some(trace.request_id.to_string()),
                     stream_finish: true,
                     outbox: None,
                 }
@@ -3206,6 +3243,7 @@ impl GatewayRunner {
                         row.chat_id.clone(),
                         row.body.clone(),
                         row.reply_token.clone(),
+                        Some(row.request_id.to_string()),
                         OutboxDelivery {
                             outbox_id: row.outbox_id,
                             trace_id: row.trace_id,
@@ -3478,8 +3516,14 @@ async fn send_text_to_platform(
     let chunks = split_message(text);
     let chunk_count = chunks.len();
     for (i, chunk) in chunks.into_iter().enumerate() {
-        let _is_last = i == chunk_count - 1;
-        if let Err(e) = adapter.send_text(chat_id, chunk, reply_token).await {
+        let result = if feedback_id.is_some() {
+            adapter
+                .send_stream_chunk(chat_id, chunk, reply_token, None, feedback_id, true)
+                .await
+        } else {
+            adapter.send_text(chat_id, chunk, reply_token).await
+        };
+        if let Err(e) = result {
             tracing::warn!(platform, chat_id = %safe_id(chat_id), error = %e, "failed to send platform message");
             return Err((i, e));
         }
@@ -6791,7 +6835,8 @@ mod stream_tests {
     #[allow(clippy::type_complexity)]
     struct StreamRecordingAdapter {
         name: &'static str,
-        frames: std::sync::Arc<tokio::sync::Mutex<Vec<(String, Option<String>, bool)>>>,
+        frames:
+            std::sync::Arc<tokio::sync::Mutex<Vec<(String, Option<String>, Option<String>, bool)>>>,
         rx: tokio::sync::Mutex<tokio::sync::mpsc::Receiver<InboundMessage>>,
     }
 
@@ -6813,7 +6858,7 @@ mod stream_tests {
             self.frames
                 .lock()
                 .await
-                .push((text.to_string(), None, true));
+                .push((text.to_string(), None, None, true));
             Ok(())
         }
         async fn send_stream_chunk(
@@ -6822,13 +6867,15 @@ mod stream_tests {
             text: &str,
             _reply_token: Option<&str>,
             stream_id: Option<&str>,
-            _feedback_id: Option<&str>,
+            feedback_id: Option<&str>,
             finish: bool,
         ) -> Result<(), String> {
-            self.frames
-                .lock()
-                .await
-                .push((text.to_string(), stream_id.map(String::from), finish));
+            self.frames.lock().await.push((
+                text.to_string(),
+                stream_id.map(String::from),
+                feedback_id.map(String::from),
+                finish,
+            ));
             Ok(())
         }
         async fn recv(&self) -> Option<InboundMessage> {
@@ -6874,7 +6921,8 @@ mod stream_tests {
             "full content must be sent unsplit"
         );
         assert_eq!(recorded[0].1.as_deref(), Some("stream-1"));
-        assert!(!recorded[0].2);
+        assert_eq!(recorded[0].2.as_deref(), Some("feedback-1"));
+        assert!(!recorded[0].3);
         drop(recorded);
 
         // Non-stream mode: should split
@@ -6898,6 +6946,42 @@ mod stream_tests {
             recorded.len() > 1,
             "non-stream mode must split long messages"
         );
+        assert!(recorded.iter().all(|(_, sid, _, _)| sid.is_none()));
+        assert!(recorded.iter().all(|(_, _, fid, _)| fid.is_none()));
+    }
+
+    #[tokio::test]
+    async fn non_stream_feedback_is_forwarded_to_adapter() {
+        let frames = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let (_tx, rx) = tokio::sync::mpsc::channel(1);
+        let adapters: Vec<Box<dyn PlatformAdapter>> = vec![Box::new(StreamRecordingAdapter {
+            name: "wecom",
+            frames: frames.clone(),
+            rx: tokio::sync::Mutex::new(rx),
+        })];
+        let mut indices = HashMap::new();
+        indices.insert("wecom", 0usize);
+
+        send_text_to_platform(
+            &adapters,
+            &indices,
+            "wecom",
+            "chat",
+            "final response",
+            None,
+            None,
+            Some("feedback-1"),
+            true,
+        )
+        .await
+        .unwrap();
+
+        let recorded = frames.lock().await;
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].0, "final response");
+        assert!(recorded[0].1.is_none());
+        assert_eq!(recorded[0].2.as_deref(), Some("feedback-1"));
+        assert!(recorded[0].3);
     }
 
     #[test]
