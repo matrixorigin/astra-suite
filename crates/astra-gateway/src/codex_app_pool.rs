@@ -78,6 +78,7 @@ impl CodexAppPool {
         working_dir: Option<&Path>,
         system_prompt: Option<&str>,
         provider_config: Option<&crate::config::ProviderConfig>,
+        github_token: Option<&str>,
     ) -> Result<mpsc::Receiver<CliProgress>, String> {
         if !self.processes.contains_key(key) || !self.is_alive(key) {
             self.processes.remove(key);
@@ -88,6 +89,7 @@ impl CodexAppPool {
                 working_dir,
                 system_prompt,
                 provider_config,
+                github_token,
             )
             .await?;
         }
@@ -267,6 +269,7 @@ impl CodexAppPool {
             .unwrap_or(false)
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn spawn(
         &mut self,
         key: &str,
@@ -275,8 +278,9 @@ impl CodexAppPool {
         working_dir: Option<&Path>,
         system_prompt: Option<&str>,
         provider_config: Option<&crate::config::ProviderConfig>,
+        github_token: Option<&str>,
     ) -> Result<(), String> {
-        let mut cmd = build_app_server_command(profile, working_dir, provider_config)
+        let mut cmd = build_app_server_command(profile, working_dir, provider_config, github_token)
             .ok_or("profile does not support codex app-server mode")?;
         cmd.stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
@@ -468,6 +472,7 @@ fn build_app_server_command(
     profile: &CliProfile,
     working_dir: Option<&Path>,
     provider_config: Option<&crate::config::ProviderConfig>,
+    github_token: Option<&str>,
 ) -> Option<Command> {
     let mut cmd = match profile {
         CliProfile::Codex {
@@ -502,6 +507,10 @@ fn build_app_server_command(
         && let Err(e) = apply_provider_environment(&mut cmd, provider_config)
     {
         tracing::warn!(error = %e, "failed to apply provider environment to app-server command");
+    }
+    if let Some(token) = github_token {
+        cmd.env("GH_TOKEN", token);
+        cmd.env("GITHUB_TOKEN", token);
     }
     if let Some(dir) = working_dir {
         cmd.current_dir(dir);
@@ -1237,7 +1246,7 @@ mod tests {
             permission_mode: "auto".into(),
             app_server_url: None,
         };
-        let cmd = build_app_server_command(&profile, Some(Path::new("/tmp/project")), None)
+        let cmd = build_app_server_command(&profile, Some(Path::new("/tmp/project")), None, None)
             .expect("astra should support app-server command");
         assert_eq!(cmd.as_std().get_program(), "astra");
         let args: Vec<_> = cmd.as_std().get_args().collect();
@@ -1256,7 +1265,7 @@ mod tests {
             permission_mode: "auto".into(),
             app_server_url: Some("http://10.222.1.50:28000".into()),
         };
-        let cmd = build_app_server_command(&profile, None, None)
+        let cmd = build_app_server_command(&profile, None, None, None)
             .expect("astra should support app-server command");
         let envs: std::collections::HashMap<_, _> = cmd.as_std().get_envs().collect();
         assert_eq!(
@@ -1288,6 +1297,7 @@ mod tests {
                 None,
                 Some(workspace.path()),
                 Some("你是一个端到端验证助手，回答必须尽量简短。"),
+                None,
                 None,
             )
             .await

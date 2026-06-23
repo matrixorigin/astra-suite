@@ -1165,6 +1165,13 @@ impl GatewayRunner {
         } else {
             None
         };
+        let github_token = crate::github_tokens::resolve_github_token_for_user(
+            &msg.user_id,
+            &self.config.github_tokens,
+        );
+        if github_token.is_some() {
+            tracing::debug!(platform = %msg.platform, user_id = %msg.user_id, "resolved per-user GitHub token");
+        }
 
         let (progress_tx, mut progress_rx) = tokio::sync::mpsc::channel::<CliProgress>(64);
 
@@ -1219,6 +1226,7 @@ impl GatewayRunner {
             let sp = system_prompt.clone();
             let ws = workspace.clone();
             let token = access_token.clone();
+            let gh_token = github_token.clone();
             let kill_token = cancel_token.clone();
             let mcp_cfg = mcp_config_path.clone();
             let pc = provider_config.clone();
@@ -1242,6 +1250,7 @@ impl GatewayRunner {
                             ws.as_deref(),
                             Some(&sp),
                             token.as_deref(),
+                            gh_token.as_deref(),
                             mcp_cfg.as_deref(),
                             pc.as_ref(),
                         )
@@ -1439,6 +1448,7 @@ impl GatewayRunner {
             let ws = workspace.clone();
             let kill_token = cancel_token.clone();
             let token = access_token.clone();
+            let gh_token = github_token.clone();
             let pc = provider_config.clone();
 
             tokio::spawn(async move {
@@ -1453,6 +1463,7 @@ impl GatewayRunner {
                             ws.as_deref(),
                             Some(&sp),
                             pc.as_ref(),
+                            gh_token.as_deref(),
                         )
                         .await
                 };
@@ -1477,6 +1488,7 @@ impl GatewayRunner {
                             None,
                             Some(cli_timeout),
                             token.as_deref(),
+                            gh_token.as_deref(),
                             Some(kill_token.clone()),
                             pc.as_ref(),
                         )
@@ -1549,6 +1561,7 @@ impl GatewayRunner {
             let system_prompt = system_prompt.clone();
             let ws = workspace.clone();
             let token = access_token.clone();
+            let gh_token = github_token.clone();
             let kill_token = cancel_token.clone();
             let trace_id_str = trace.as_ref().map(|t| t.trace_id.to_string());
             let request_id_str = trace.as_ref().map(|t| t.request_id.to_string());
@@ -1565,6 +1578,7 @@ impl GatewayRunner {
                     request_id_str.as_deref(),
                     Some(cli_timeout),
                     token.as_deref(),
+                    gh_token.as_deref(),
                     Some(kill_token),
                     pc.as_ref(),
                 )

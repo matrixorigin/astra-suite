@@ -69,6 +69,7 @@ impl CliProcessPool {
         working_dir: Option<&Path>,
         system_prompt: Option<&str>,
         access_token: Option<&str>,
+        github_token: Option<&str>,
         mcp_config: Option<&Path>,
         provider_config: Option<&crate::config::ProviderConfig>,
     ) -> Result<mpsc::Receiver<CliProgress>, String> {
@@ -81,6 +82,7 @@ impl CliProcessPool {
                 working_dir,
                 system_prompt,
                 access_token,
+                github_token,
                 mcp_config,
                 provider_config,
             )
@@ -168,6 +170,7 @@ impl CliProcessPool {
         working_dir: Option<&Path>,
         system_prompt: Option<&str>,
         access_token: Option<&str>,
+        github_token: Option<&str>,
         mcp_config: Option<&Path>,
         provider_config: Option<&crate::config::ProviderConfig>,
     ) -> Result<(), String> {
@@ -185,6 +188,10 @@ impl CliProcessPool {
         if let Some(pc) = provider_config {
             crate::cli_bridge::apply_provider_environment(&mut cmd, pc)
                 .map_err(|e| format!("failed to prepare provider environment: {e}"))?;
+        }
+        if let Some(token) = github_token {
+            cmd.env("GH_TOKEN", token);
+            cmd.env("GITHUB_TOKEN", token);
         }
 
         cmd.stdin(std::process::Stdio::piped())

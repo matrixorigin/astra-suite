@@ -305,6 +305,7 @@ impl TestGateway {
             project_dirs: vec![],
             working_dir: None,
             system_prompt_extra: None,
+            github_tokens: Default::default(),
             api_port: None,
         }
     }
@@ -688,6 +689,7 @@ async fn runner_init_invalid_config_errors() {
         project_dirs: vec![],
         working_dir: None,
         system_prompt_extra: None,
+        github_tokens: Default::default(),
         api_port: None,
     };
 

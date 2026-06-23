@@ -106,6 +106,17 @@ cli:
 # beside this config file when that file exists. The config field wins when set.
 # system_prompt_extra: |
 #   Extra gateway instructions here.
+#
+# Optional per-user GitHub tokens. Gateway injects the matched token as
+# GH_TOKEN and GITHUB_TOKEN into CLI processes. `default` is used when the
+# WeCom user id has no explicit entry. `remark` is for operators.
+# github_tokens:
+#   default:
+#     token: ghp_xxx
+#     remark: matrix-meow
+#   wom-o3DwAALoVyBSBHfVV03KgIa8BXVw:
+#     token: ghp_xxx
+#     remark: aptend
 
 # ── Option D: Custom CLI ──
 # cli:

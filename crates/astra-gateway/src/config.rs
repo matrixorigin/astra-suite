@@ -46,6 +46,9 @@ pub struct GatewayConfig {
     /// `system_prompt_extra`, or from `system_prompt_extra.md` beside the
     /// gateway config when the config field is absent.
     pub system_prompt_extra: Option<String>,
+    /// WeCom user id -> GitHub token mapping. `remark` is for operators only;
+    /// `token` is injected into CLI process env as GH_TOKEN/GITHUB_TOKEN.
+    pub github_tokens: std::collections::BTreeMap<String, GitHubTokenConfig>,
     /// HTTP API port for message injection (e.g. 9090). Disabled when absent.
     pub api_port: Option<u16>,
 }
@@ -92,6 +95,8 @@ struct RawGatewayConfig {
     working_dir: Option<String>,
     #[serde(default)]
     system_prompt_extra: Option<String>,
+    #[serde(default)]
+    github_tokens: std::collections::BTreeMap<String, GitHubTokenConfig>,
     #[serde(default)]
     api_port: Option<u16>,
 }
@@ -159,6 +164,30 @@ pub struct AstraServerConfig {
     pub username: Option<String>,
     #[serde(default)]
     pub password: Option<String>,
+}
+
+#[derive(Clone, Default, serde::Deserialize)]
+pub struct GitHubTokenConfig {
+    #[serde(default)]
+    pub token: String,
+    #[serde(default)]
+    pub remark: Option<String>,
+}
+
+impl std::fmt::Debug for GitHubTokenConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GitHubTokenConfig")
+            .field(
+                "token",
+                &if self.token.is_empty() {
+                    "(empty)"
+                } else {
+                    "[REDACTED]"
+                },
+            )
+            .field("remark", &self.remark)
+            .finish()
+    }
 }
 
 impl std::fmt::Debug for AstraServerConfig {
@@ -349,6 +378,14 @@ impl TryFrom<RawGatewayConfig> for GatewayConfig {
             project_dirs: raw.project_dirs,
             working_dir: raw.working_dir,
             system_prompt_extra: raw.system_prompt_extra,
+            github_tokens: raw
+                .github_tokens
+                .into_iter()
+                .filter_map(|(user, entry)| {
+                    let user = user.trim().to_string();
+                    (!user.is_empty() && !entry.token.trim().is_empty()).then_some((user, entry))
+                })
+                .collect(),
             api_port: raw.api_port,
         })
     }
@@ -696,5 +733,54 @@ astra:
 
         let cfg = GatewayConfig::load(&config_path).unwrap();
         assert_eq!(cfg.system_prompt_extra.as_deref(), Some("config prompt"));
+    }
+
+    #[test]
+    fn load_github_tokens_from_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.yaml");
+        std::fs::write(
+            &config_path,
+            r#"
+github_tokens:
+  wecom-1:
+    token: ghp_secret
+    remark: aptend
+  "":
+    token: ignored
+  wecom-empty:
+    token: ""
+"#,
+        )
+        .unwrap();
+
+        let cfg = GatewayConfig::load(&config_path).unwrap();
+        let token = cfg
+            .github_tokens
+            .get("wecom-1")
+            .map(|entry| entry.token.as_str());
+        assert_eq!(token, Some("ghp_secret"));
+        assert_eq!(
+            cfg.github_tokens
+                .get("wecom-1")
+                .and_then(|entry| entry.remark.as_deref()),
+            Some("aptend")
+        );
+        assert!(!cfg.github_tokens.contains_key(""));
+        assert!(!cfg.github_tokens.contains_key("wecom-empty"));
+    }
+
+    #[test]
+    fn debug_redacts_github_tokens() {
+        let yaml = r#"
+github_tokens:
+  wecom-1:
+    token: ghp_secret
+    remark: aptend
+"#;
+        let cfg: GatewayConfig = serde_yaml_ng::from_str(yaml).unwrap();
+        let dbg = format!("{cfg:?}");
+        assert!(!dbg.contains("ghp_secret"), "github token leaked: {dbg}");
+        assert!(dbg.contains("[REDACTED]"));
     }
 }

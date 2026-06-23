@@ -1887,6 +1887,7 @@ pub async fn run_cli_with_context_trace_and_timeout(
         timeout,
         access_token,
         None,
+        None,
         provider_config,
     )
     .await
@@ -1906,6 +1907,7 @@ pub async fn run_cli_with_cancel(
     request_id: Option<&str>,
     timeout: Option<Duration>,
     access_token: Option<&str>,
+    github_token: Option<&str>,
     cancel: Option<tokio_util::sync::CancellationToken>,
     provider_config: Option<&crate::config::ProviderConfig>,
 ) -> Result<CliResult, String> {
@@ -1933,6 +1935,10 @@ pub async fn run_cli_with_cancel(
     }
     if let Some(token) = access_token {
         cmd.env("ASTRA_ACCESS_TOKEN", token);
+    }
+    if let Some(token) = github_token {
+        cmd.env("GH_TOKEN", token);
+        cmd.env("GITHUB_TOKEN", token);
     }
     let name = profile.name().to_string();
     let stream_stdout = matches!(
