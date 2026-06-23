@@ -179,6 +179,7 @@ impl CronScheduler {
                                 chat_id.clone(),
                                 body,
                                 None,
+                                Some(writer.request_id().to_string()),
                                 OutboxDelivery {
                                     outbox_id,
                                     trace_id: writer.trace_id().clone(),
@@ -322,6 +323,7 @@ impl CronScheduler {
             chat_id.to_string(),
             body.to_string(),
             reply_token,
+            Some(writer.request_id().to_string()),
             OutboxDelivery {
                 outbox_id,
                 trace_id: writer.trace_id().clone(),

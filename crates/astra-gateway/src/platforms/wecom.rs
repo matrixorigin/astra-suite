@@ -4,8 +4,8 @@
 //! Inbound: aibot_msg_callback. Outbound: aibot_send_msg / aibot_respond_msg.
 
 use super::{
-    AdapterCapability, AdapterHealthEvent, AdapterHealthEventType, ChatType, InboundMessage,
-    PlatformAdapter, emit_adapter_health,
+    AdapterCapability, AdapterHealthEvent, AdapterHealthEventType, ChatType, FeedbackEvent,
+    InboundMessage, PlatformAdapter, emit_adapter_health,
 };
 use crate::config::WeComConfig;
 use crate::dedup::MessageDeduplicator;
@@ -32,6 +32,7 @@ struct OutboundMessage {
     text: String,
     reply_token: Option<String>,
     stream_id: Option<String>,
+    feedback_id: Option<String>,
     stream_finish: bool,
 }
 
@@ -141,7 +142,7 @@ impl PlatformAdapter for WeComAdapter {
         text: &str,
         reply_token: Option<&str>,
     ) -> Result<(), String> {
-        self.send_stream_chunk(chat_id, text, reply_token, None, true)
+        self.send_stream_chunk(chat_id, text, reply_token, None, None, true)
             .await
     }
 
@@ -151,6 +152,7 @@ impl PlatformAdapter for WeComAdapter {
         text: &str,
         reply_token: Option<&str>,
         stream_id: Option<&str>,
+        feedback_id: Option<&str>,
         finish: bool,
     ) -> Result<(), String> {
         // Stream mode: no truncation here — runner handles 20480 byte limit by splitting streams.
@@ -167,6 +169,7 @@ impl PlatformAdapter for WeComAdapter {
                 text,
                 reply_token: reply_token.map(String::from),
                 stream_id: stream_id.map(String::from),
+                feedback_id: feedback_id.map(String::from),
                 stream_finish: finish,
             })
             .await
@@ -249,6 +252,8 @@ async fn run_wecom_connection(
                 tracing::debug!(
                     cmd = frame["cmd"].as_str().unwrap_or("?"),
                     finish = %frame["body"]["stream"]["finish"],
+                    feedback = frame["body"]["stream"]["feedback"]["id"].as_str().is_some()
+                        || frame["body"]["feedback"]["id"].as_str().is_some(),
                     content_len = out.text.len(),
                     "wecom outbound frame"
                 );
@@ -332,31 +337,37 @@ async fn wait_reconnect_delay(
 fn build_send_frame(bot_id: &str, out: &OutboundMessage) -> Value {
     if let (Some(req_id), Some(stream_id)) = (&out.reply_token, &out.stream_id) {
         // Streaming reply (full-replacement semantics)
+        let mut stream = json!({
+            "id": stream_id,
+            "finish": out.stream_finish,
+            "content": &out.text
+        });
+        if let Some(feedback_id) = out.feedback_id.as_deref() {
+            stream["feedback"] = json!({ "id": feedback_id });
+        }
         json!({
             "cmd": "aibot_respond_msg",
             "headers": {"req_id": req_id},
             "body": {
                 "msgtype": "stream",
-                "stream": {
-                    "id": stream_id,
-                    "finish": out.stream_finish,
-                    "content": &out.text
-                }
+                "stream": stream
             }
         })
     } else if let Some(ref req_id) = out.reply_token {
         // Non-stream reply (one-shot markdown via respond)
-        json!({
+        let mut frame = json!({
             "cmd": "aibot_respond_msg",
             "headers": {"req_id": req_id},
             "body": {
                 "msgtype": "markdown",
                 "markdown": {"content": &out.text}
             }
-        })
+        });
+        attach_body_feedback(&mut frame, out.feedback_id.as_deref());
+        frame
     } else if !out.chat_id.is_empty() {
         // Proactive send (DM or group without req_id)
-        json!({
+        let mut frame = json!({
             "cmd": "aibot_send_msg",
             "headers": {"req_id": format!("send-{}", uuid::Uuid::new_v4())},
             "body": {
@@ -365,7 +376,9 @@ fn build_send_frame(bot_id: &str, out: &OutboundMessage) -> Value {
                 "msgtype": "markdown",
                 "markdown": {"content": &out.text}
             }
-        })
+        });
+        attach_body_feedback(&mut frame, out.feedback_id.as_deref());
+        frame
     } else {
         tracing::warn!(
             text_len = out.text.len(),
@@ -375,12 +388,82 @@ fn build_send_frame(bot_id: &str, out: &OutboundMessage) -> Value {
     }
 }
 
+fn attach_body_feedback(frame: &mut Value, feedback_id: Option<&str>) {
+    if let Some(feedback_id) = feedback_id {
+        frame["body"]["feedback"] = json!({ "id": feedback_id });
+    }
+}
+
 async fn handle_wecom_message(
     data: &Value,
     msg_tx: &mpsc::Sender<InboundMessage>,
     dedup: &mut MessageDeduplicator,
 ) {
     let cmd = data["cmd"].as_str().unwrap_or("");
+    let body = &data["body"];
+    tracing::trace!(raw = %data, "wecom inbound raw");
+
+    if let Some(feedback) = parse_feedback_event(body) {
+        let msg_id = body["msgid"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| feedback.feedback_id.clone());
+        let dedup_key = format!(
+            "feedback:{}:{}:{}",
+            msg_id, feedback.feedback_id, feedback.feedback_type
+        );
+        if !dedup.check(&dedup_key) {
+            tracing::debug!(
+                feedback_id = %feedback.feedback_id,
+                feedback_type = feedback.feedback_type,
+                "wecom duplicate feedback event skipped"
+            );
+            return;
+        }
+
+        let user_id = body["from"]["userid"]
+            .as_str()
+            .unwrap_or("unknown")
+            .to_string();
+        let chat_id = body["chatid"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .unwrap_or(&user_id)
+            .to_string();
+        let chat_type = if body["chattype"].as_str() == Some("group") {
+            ChatType::Group
+        } else {
+            ChatType::DirectMessage
+        };
+        tracing::info!(
+            feedback_id = %feedback.feedback_id,
+            feedback_type = feedback.feedback_type,
+            user = %user_id,
+            chat_id = %chat_id,
+            "wecom feedback event received"
+        );
+        let msg = InboundMessage {
+            platform: "wecom",
+            chat_id,
+            user_id,
+            text: String::new(),
+            msg_id,
+            chat_type,
+            reply_token: data["headers"]["req_id"].as_str().map(String::from),
+            route_override: None,
+            feedback: Some(feedback),
+        };
+        if msg_tx.send(msg).await.is_err() {
+            tracing::warn!("wecom message channel closed, dropping feedback event");
+        }
+        return;
+    }
+
+    if let Some(eventtype) = body["event"]["eventtype"].as_str() {
+        tracing::info!(eventtype, cmd, "wecom event callback ignored");
+    }
+
     if cmd != "aibot_msg_callback" && cmd != "aibot_callback" {
         if let Some((event_type, detail)) = classify_wecom_control_message(data) {
             emit_adapter_health(AdapterHealthEvent::new("wecom", event_type, detail));
@@ -388,8 +471,6 @@ async fn handle_wecom_message(
         return;
     }
 
-    let body = &data["body"];
-    tracing::trace!(raw = %data, "wecom inbound raw");
     let msg_id = body["msgid"].as_str().unwrap_or("").to_string();
     if msg_id.is_empty() || !dedup.check(&msg_id) {
         return;
@@ -433,11 +514,37 @@ async fn handle_wecom_message(
         chat_type,
         reply_token,
         route_override: None,
+        feedback: None,
     };
 
     if msg_tx.send(msg).await.is_err() {
         tracing::warn!("wecom message channel full, dropping message");
     }
+}
+
+fn parse_feedback_event(body: &Value) -> Option<FeedbackEvent> {
+    let event = &body["event"];
+    if event["eventtype"].as_str()? != "feedback_event" {
+        return None;
+    }
+    let feedback = event
+        .get("feedback_event")
+        .or_else(|| event.get("feedback"))?;
+    let feedback_id = feedback["id"].as_str()?.trim().to_string();
+    if feedback_id.is_empty() {
+        return None;
+    }
+    let inaccurate_reason_list = feedback["inaccurate_reason_list"]
+        .as_array()
+        .map(|items| items.iter().filter_map(Value::as_i64).collect())
+        .unwrap_or_default();
+    Some(FeedbackEvent {
+        feedback_id,
+        feedback_type: feedback["type"].as_i64().unwrap_or(0),
+        content: feedback["content"].as_str().map(str::to_string),
+        inaccurate_reason_list,
+        raw: feedback.clone(),
+    })
 }
 
 fn classify_wecom_control_message(
@@ -630,6 +737,7 @@ mod tests {
             text: "hello".into(),
             reply_token: None,
             stream_id: None,
+            feedback_id: None,
             stream_finish: true,
         };
         let frame = build_send_frame("bot-1", &out);
@@ -645,6 +753,7 @@ mod tests {
             text: "response".into(),
             reply_token: Some("req-original".into()),
             stream_id: Some("stream-1".into()),
+            feedback_id: Some("feedback-1".into()),
             stream_finish: true,
         };
         let frame = build_send_frame("bot-1", &out);
@@ -652,6 +761,116 @@ mod tests {
         assert_eq!(frame["headers"]["req_id"], "req-original");
         assert_eq!(frame["body"]["stream"]["content"], "response");
         assert_eq!(frame["body"]["stream"]["finish"], true);
+        assert_eq!(frame["body"]["stream"]["feedback"]["id"], "feedback-1");
+    }
+
+    #[test]
+    fn build_send_frame_markdown_respond_with_feedback() {
+        let out = OutboundMessage {
+            chat_id: "chat-1".into(),
+            text: "response".into(),
+            reply_token: Some("req-original".into()),
+            stream_id: None,
+            feedback_id: Some("feedback-1".into()),
+            stream_finish: true,
+        };
+        let frame = build_send_frame("bot-1", &out);
+        assert_eq!(frame["cmd"], "aibot_respond_msg");
+        assert_eq!(frame["headers"]["req_id"], "req-original");
+        assert_eq!(frame["body"]["msgtype"], "markdown");
+        assert_eq!(frame["body"]["markdown"]["content"], "response");
+        assert_eq!(frame["body"]["feedback"]["id"], "feedback-1");
+    }
+
+    #[test]
+    fn parse_feedback_callback() {
+        let data: Value = serde_json::from_str(
+            r#"{
+            "cmd": "aibot_msg_callback",
+            "headers": {"req_id": "req-feedback"},
+            "body": {
+                "msgid": "feedback-msg-1",
+                "create_time": 1700000000,
+                "aibotid": "bot-1",
+                "chatid": "chat-1",
+                "chattype": "single",
+                "from": {"userid": "user-1"},
+                "msgtype": "event",
+                "event": {
+                    "eventtype": "feedback_event",
+                    "feedback_event": {
+                        "id": "request-1",
+                        "type": 1,
+                        "content": "good",
+                        "inaccurate_reason_list": [2, 4]
+                    }
+                }
+            }
+        }"#,
+        )
+        .unwrap();
+
+        let (tx, mut rx) = mpsc::channel(10);
+        let mut dedup = MessageDeduplicator::new();
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            handle_wecom_message(&data, &tx, &mut dedup).await;
+            let msg = rx.recv().await.unwrap();
+            let feedback = msg.feedback.unwrap();
+            assert_eq!(msg.platform, "wecom");
+            assert_eq!(msg.chat_id, "chat-1");
+            assert_eq!(msg.user_id, "user-1");
+            assert_eq!(feedback.feedback_id, "request-1");
+            assert_eq!(feedback.feedback_type, 1);
+            assert_eq!(feedback.content.as_deref(), Some("good"));
+            assert_eq!(feedback.inaccurate_reason_list, vec![2, 4]);
+        });
+    }
+
+    #[test]
+    fn parse_feedback_callback_before_cmd_filter() {
+        let data: Value = serde_json::from_str(
+            r#"{
+            "cmd": "aibot_event_callback",
+            "headers": {"req_id": "req-feedback"},
+            "body": {
+                "msgid": "feedback-msg-2",
+                "chatid": "chat-1",
+                "chattype": "single",
+                "from": {"userid": "user-1"},
+                "msgtype": "event",
+                "event": {
+                    "eventtype": "feedback_event",
+                    "feedback_event": {
+                        "id": "request-2",
+                        "type": 2
+                    }
+                }
+            }
+        }"#,
+        )
+        .unwrap();
+
+        let (tx, mut rx) = mpsc::channel(10);
+        let mut dedup = MessageDeduplicator::new();
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            handle_wecom_message(&data, &tx, &mut dedup).await;
+            let msg = rx.recv().await.unwrap();
+            let feedback = msg.feedback.unwrap();
+            assert_eq!(feedback.feedback_id, "request-2");
+            assert_eq!(feedback.feedback_type, 2);
+        });
     }
 
     #[test]
@@ -722,6 +941,7 @@ mod tests {
                 text: "wake now".into(),
                 reply_token: None,
                 stream_id: None,
+                feedback_id: None,
                 stream_finish: true,
             })
             .await

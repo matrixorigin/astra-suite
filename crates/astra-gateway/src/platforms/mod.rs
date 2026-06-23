@@ -173,6 +173,21 @@ pub struct InboundMessage {
     /// `_manage` virtual profile so it does NOT queue behind the user's
     /// stuck tasks). None = use resolve_cli_profile's normal result.
     pub route_override: Option<String>,
+    /// Platform-side feedback for a previous AI response. Feedback messages are
+    /// recorded by the runner and do not go through the CLI slow path.
+    pub feedback: Option<FeedbackEvent>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FeedbackEvent {
+    /// Identifier previously sent with the AI response. For WeCom this is
+    /// `stream.feedback.id`, and gateway sets it to the trace request id.
+    pub feedback_id: String,
+    /// Platform-native feedback type. WeCom: 1=positive, 2=negative, 3=cancel.
+    pub feedback_type: i64,
+    pub content: Option<String>,
+    pub inaccurate_reason_list: Vec<i64>,
+    pub raw: serde_json::Value,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -210,6 +225,7 @@ pub trait PlatformAdapter: Send + Sync + 'static {
         text: &str,
         reply_token: Option<&str>,
         _stream_id: Option<&str>,
+        _feedback_id: Option<&str>,
         _finish: bool,
     ) -> Result<(), String> {
         self.send_text(chat_id, text, reply_token).await

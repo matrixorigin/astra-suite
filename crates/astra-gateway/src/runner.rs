@@ -7,7 +7,7 @@ use crate::cli_bridge::{self, CliProfile, CliProgress, ReasoningDisplay, Reasoni
 use crate::commands::{self, CommandContext};
 use crate::config::GatewayConfig;
 use crate::gateway_context::GatewayContext;
-use crate::platforms::{InboundMessage, PlatformAdapter};
+use crate::platforms::{FeedbackEvent, InboundMessage, PlatformAdapter};
 use crate::store::{self, GatewayStore};
 use crate::trace_model::{
     ConversationKey, GatewayEventKind, GatewayRequest, OutboxId, RequestId, RequestStatus,
@@ -262,6 +262,15 @@ pub(crate) fn truncate_chars(s: &str, n: usize) -> &str {
         None => s,
     }
 }
+
+fn feedback_type_label(feedback_type: i64) -> &'static str {
+    match feedback_type {
+        1 => "positive",
+        2 => "negative",
+        3 => "cancel",
+        _ => "unknown",
+    }
+}
 const CONVERSATION_QUEUE_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Number of consecutive auth failures before the circuit breaker trips.
@@ -278,6 +287,9 @@ pub struct OutboundMessage {
     pub reply_token: Option<String>,
     /// Stream ID shared across all chunks of one reply (for streaming platforms like WeCom).
     pub stream_id: Option<String>,
+    /// Feedback ID associated with a stream response. WeCom sends this back in
+    /// feedback callbacks when users rate the AI response.
+    pub feedback_id: Option<String>,
     /// Whether this is the final chunk of a stream.
     pub stream_finish: bool,
     pub outbox: Option<OutboxDelivery>,
@@ -302,6 +314,25 @@ impl OutboundMessage {
             text: text.into(),
             reply_token: None,
             stream_id: None,
+            feedback_id: None,
+            stream_finish: true,
+            outbox: None,
+        }
+    }
+
+    pub fn plain_with_feedback(
+        platform: impl Into<String>,
+        chat_id: impl Into<String>,
+        text: impl Into<String>,
+        feedback_id: Option<String>,
+    ) -> Self {
+        Self {
+            platform: platform.into(),
+            chat_id: chat_id.into(),
+            text: text.into(),
+            reply_token: None,
+            stream_id: None,
+            feedback_id,
             stream_finish: true,
             outbox: None,
         }
@@ -313,6 +344,7 @@ impl OutboundMessage {
         text: impl Into<String>,
         reply_token: Option<String>,
         stream_id: Option<String>,
+        feedback_id: Option<String>,
         finish: bool,
     ) -> Self {
         Self {
@@ -321,6 +353,7 @@ impl OutboundMessage {
             text: text.into(),
             reply_token,
             stream_id,
+            feedback_id,
             stream_finish: finish,
             outbox: None,
         }
@@ -331,6 +364,7 @@ impl OutboundMessage {
         chat_id: impl Into<String>,
         text: impl Into<String>,
         reply_token: Option<String>,
+        feedback_id: Option<String>,
         outbox: OutboxDelivery,
     ) -> Self {
         Self {
@@ -339,6 +373,7 @@ impl OutboundMessage {
             text: text.into(),
             reply_token,
             stream_id: None,
+            feedback_id,
             stream_finish: true,
             outbox: Some(outbox),
         }
@@ -420,7 +455,7 @@ struct OutboxDeliveryTrace {
 }
 
 enum AdapterRecv {
-    Message(InboundMessage),
+    Message(Box<InboundMessage>),
     Closed(usize),
 }
 
@@ -589,6 +624,79 @@ impl GatewayRunner {
 
     pub fn set_outbound_tx(&mut self, tx: tokio::sync::mpsc::Sender<OutboundMessage>) {
         self.outbound_tx = Some(tx);
+    }
+
+    async fn record_feedback(&self, msg: &InboundMessage, feedback: &FeedbackEvent) {
+        let Some(repo) = self.trace_repo.as_ref() else {
+            tracing::info!(
+                platform = msg.platform,
+                feedback_id = %feedback.feedback_id,
+                feedback_type = feedback.feedback_type,
+                "feedback received without trace repository"
+            );
+            return;
+        };
+        let request_id = RequestId::from(feedback.feedback_id.as_str());
+        let request = match repo.get_request(&request_id).await {
+            Ok(Some(request)) => request,
+            Ok(None) => {
+                tracing::warn!(
+                    platform = msg.platform,
+                    feedback_id = %feedback.feedback_id,
+                    feedback_type = feedback.feedback_type,
+                    "feedback target request not found"
+                );
+                return;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    platform = msg.platform,
+                    feedback_id = %feedback.feedback_id,
+                    error = %e,
+                    "failed to load feedback target request"
+                );
+                return;
+            }
+        };
+
+        let writer = TraceWriter::from_existing(
+            repo.as_ref() as &dyn TraceRepository,
+            request.trace_id.clone(),
+            request.request_id.clone(),
+        );
+        if let Err(e) = writer
+            .append(
+                GatewayEventKind::Feedback,
+                serde_json::json!({
+                    "platform": msg.platform,
+                    "chat_id": &msg.chat_id,
+                    "user_id": &msg.user_id,
+                    "platform_msg_id": &msg.msg_id,
+                    "feedback_id": &feedback.feedback_id,
+                    "feedback_type": feedback.feedback_type,
+                    "feedback_label": feedback_type_label(feedback.feedback_type),
+                    "content": &feedback.content,
+                    "inaccurate_reason_list": &feedback.inaccurate_reason_list,
+                    "raw": &feedback.raw,
+                }),
+            )
+            .await
+        {
+            tracing::warn!(
+                platform = msg.platform,
+                feedback_id = %feedback.feedback_id,
+                error = %e,
+                "failed to append feedback event"
+            );
+        } else {
+            tracing::info!(
+                platform = msg.platform,
+                user = %safe_id(&msg.user_id),
+                feedback_id = %feedback.feedback_id,
+                feedback_type = feedback.feedback_type,
+                "feedback recorded"
+            );
+        }
     }
 
     /// Resolve the active CLI profile for a user (may be overridden via /cli + /model).
@@ -861,6 +969,11 @@ impl GatewayRunner {
         adapter: &dyn PlatformAdapter,
         trace: Option<OutboxDeliveryTrace>,
     ) -> Option<OutboundMessage> {
+        if let Some(feedback) = msg.feedback.as_ref() {
+            self.record_feedback(msg, feedback).await;
+            return None;
+        }
+
         // Group chat: per-user session isolation
         let effective_chat_id = if msg.chat_type == crate::platforms::ChatType::Group
             && self.config.group_sessions_per_user
@@ -1156,6 +1269,7 @@ impl GatewayRunner {
         let mut stream_id = reply_token
             .as_ref()
             .map(|_| uuid::Uuid::new_v4().to_string());
+        let feedback_id = trace.as_ref().map(|trace| trace.request_id.to_string());
         let cli_name = cli_profile.name().to_string();
         let cli_timeout = Duration::from_secs(self.config.cli_timeout_secs.max(1));
 
@@ -1648,6 +1762,7 @@ impl GatewayRunner {
                 accumulated.clone(),
                 reply_token,
                 stream_id,
+                feedback_id.clone(),
                 finish,
             ));
         };
@@ -1665,6 +1780,23 @@ impl GatewayRunner {
                 platform.to_string(),
                 chat.to_string(),
                 text,
+            ));
+        };
+        let send_plain_ai = |text: String,
+                             tx: &Option<tokio::sync::mpsc::Sender<OutboundMessage>>,
+                             platform: &str,
+                             chat: &str| {
+            let Some(tx) = tx else {
+                return;
+            };
+            if text.trim().is_empty() {
+                return;
+            }
+            let _ = tx.try_send(OutboundMessage::plain_with_feedback(
+                platform.to_string(),
+                chat.to_string(),
+                text,
+                feedback_id.clone(),
             ));
         };
         let flush_reasoning_buf = |buf: &mut String,
@@ -1698,6 +1830,7 @@ impl GatewayRunner {
                 accumulated.clone(),
                 reply_token,
                 stream_id,
+                feedback_id.clone(),
                 false,
             ));
             len
@@ -1876,6 +2009,7 @@ impl GatewayRunner {
                                     reply_token: reply_token.clone(),
                                     outbox: None,
                                     stream_id: None,
+                                    feedback_id: None,
                                     stream_finish: true,
                                 });
                             }
@@ -1933,7 +2067,7 @@ impl GatewayRunner {
                             }
                             // Send full accumulated content with finish=true to close the stream
                             if stream_cutoff_active {
-                                send_plain(
+                                send_plain_ai(
                                     post_stream_buffer.clone(),
                                     &self.outbound_tx,
                                     msg.platform,
@@ -1990,6 +2124,7 @@ impl GatewayRunner {
                                 reply_token: reply_token.clone(),
                                 outbox: None,
                                 stream_id: None,
+                                feedback_id: None,
                                 stream_finish: true,
                                                 });
                         }
@@ -2513,6 +2648,7 @@ impl GatewayRunner {
                 text,
                 reply_token,
                 stream_id: None,
+                feedback_id: None,
                 stream_finish: true,
                 outbox: None,
             };
@@ -2524,6 +2660,7 @@ impl GatewayRunner {
                 text,
                 reply_token,
                 stream_id: None,
+                feedback_id: Some(trace.request_id.to_string()),
                 stream_finish: true,
                 outbox: None,
             };
@@ -2542,6 +2679,7 @@ impl GatewayRunner {
                 chat_id.to_string(),
                 text,
                 reply_token,
+                Some(trace.request_id.to_string()),
                 OutboxDelivery {
                     outbox_id,
                     trace_id: trace.trace_id.clone(),
@@ -2556,6 +2694,7 @@ impl GatewayRunner {
                     text,
                     reply_token,
                     stream_id: None,
+                    feedback_id: Some(trace.request_id.to_string()),
                     stream_finish: true,
                     outbox: None,
                 }
@@ -3104,6 +3243,7 @@ impl GatewayRunner {
                         row.chat_id.clone(),
                         row.body.clone(),
                         row.reply_token.clone(),
+                        Some(row.request_id.to_string()),
                         OutboxDelivery {
                             outbox_id: row.outbox_id,
                             trace_id: row.trace_id,
@@ -3133,6 +3273,7 @@ impl GatewayRunner {
             &outbound.text,
             outbound.reply_token.as_deref(),
             outbound.stream_id.as_deref(),
+            outbound.feedback_id.as_deref(),
             outbound.stream_finish,
         )
         .await;
@@ -3233,10 +3374,14 @@ impl GatewayRunner {
                 inbound = recv_from_any(&adapters) => {
                     match inbound {
                         Some(AdapterRecv::Message(msg)) => {
+                            if msg.feedback.is_some() {
+                                self.handle_message_inner(&msg, &NullAdapter, None).await;
+                                continue;
+                            }
                             // Fast path: slash commands — instant, no CLI
                             match self.handle_fast(&msg).await {
                                 Ok(Some(text)) => {
-                                    let _ = send_text_to_platform(&adapters, &adapter_indices, msg.platform, &msg.chat_id, &text, msg.reply_token.as_deref(), None, true).await;
+                                    let _ = send_text_to_platform(&adapters, &adapter_indices, msg.platform, &msg.chat_id, &text, msg.reply_token.as_deref(), None, None, true).await;
                                 }
                                 Ok(None) => {}
                                 Err(msg) => {
@@ -3279,9 +3424,13 @@ impl GatewayRunner {
                 injected = inject_rx.recv() => {
                     if let Some(msg) = injected {
                         tracing::info!(platform = "inject", chat_id = %msg.chat_id, user = %msg.user_id, text = %msg.text, "injected message");
+                        if msg.feedback.is_some() {
+                            self.handle_message_inner(&msg, &NullAdapter, None).await;
+                            continue;
+                        }
                         match self.handle_fast(&msg).await {
                             Ok(Some(text)) => {
-                                let _ = send_text_to_platform(&adapters, &adapter_indices, msg.platform, &msg.chat_id, &text, msg.reply_token.as_deref(), None, true).await;
+                                let _ = send_text_to_platform(&adapters, &adapter_indices, msg.platform, &msg.chat_id, &text, msg.reply_token.as_deref(), None, None, true).await;
                             }
                             Ok(None) => {}
                             Err(msg) => {
@@ -3312,7 +3461,7 @@ async fn recv_from_any(adapters: &[Box<dyn PlatformAdapter>]) -> Option<AdapterR
         .map(|(idx, adapter)| {
             Box::pin(async move {
                 match adapter.recv().await {
-                    Some(msg) => AdapterRecv::Message(msg),
+                    Some(msg) => AdapterRecv::Message(Box::new(msg)),
                     None => AdapterRecv::Closed(idx),
                 }
             }) as Pin<Box<dyn Future<Output = AdapterRecv> + Send + '_>>
@@ -3331,6 +3480,7 @@ async fn send_text_to_platform(
     text: &str,
     reply_token: Option<&str>,
     stream_id: Option<&str>,
+    feedback_id: Option<&str>,
     stream_finish: bool,
 ) -> Result<usize, (usize, String)> {
     let Some(idx) = adapter_indices.get(platform).copied() else {
@@ -3346,7 +3496,14 @@ async fn send_text_to_platform(
     // full-replacement per frame — splitting would corrupt the display.
     if stream_id.is_some() {
         if let Err(e) = adapter
-            .send_stream_chunk(chat_id, text, reply_token, stream_id, stream_finish)
+            .send_stream_chunk(
+                chat_id,
+                text,
+                reply_token,
+                stream_id,
+                feedback_id,
+                stream_finish,
+            )
             .await
         {
             tracing::warn!(platform, chat_id = %safe_id(chat_id), error = %e, "failed to send stream chunk");
@@ -3359,8 +3516,14 @@ async fn send_text_to_platform(
     let chunks = split_message(text);
     let chunk_count = chunks.len();
     for (i, chunk) in chunks.into_iter().enumerate() {
-        let _is_last = i == chunk_count - 1;
-        if let Err(e) = adapter.send_text(chat_id, chunk, reply_token).await {
+        let result = if feedback_id.is_some() {
+            adapter
+                .send_stream_chunk(chat_id, chunk, reply_token, None, feedback_id, true)
+                .await
+        } else {
+            adapter.send_text(chat_id, chunk, reply_token).await
+        };
+        if let Err(e) = result {
             tracing::warn!(platform, chat_id = %safe_id(chat_id), error = %e, "failed to send platform message");
             return Err((i, e));
         }
@@ -5794,6 +5957,7 @@ fn cli_response_fields() {
         text: "hello".into(),
         reply_token: Some("tok".into()),
         stream_id: None,
+        feedback_id: None,
         stream_finish: true,
         outbox: None,
     };
@@ -5861,7 +6025,7 @@ async fn send_text_routes_to_matching_platform_only() {
     }
 
     let sent = send_text_to_platform(
-        &adapters, &indices, "weixin", "chat", "hello", None, None, true,
+        &adapters, &indices, "weixin", "chat", "hello", None, None, None, true,
     )
     .await
     .unwrap();
@@ -5894,6 +6058,7 @@ async fn cli_response_channel_roundtrip() {
         text: "result".into(),
         reply_token: None,
         stream_id: None,
+        feedback_id: None,
         stream_finish: true,
         outbox: None,
     })
@@ -5918,6 +6083,7 @@ async fn concurrent_cli_responses_ordered() {
             text: "response1".into(),
             reply_token: None,
             stream_id: None,
+            feedback_id: None,
             stream_finish: true,
             outbox: None,
         })
@@ -5931,6 +6097,7 @@ async fn concurrent_cli_responses_ordered() {
             text: "response2".into(),
             reply_token: None,
             stream_id: None,
+            feedback_id: None,
             stream_finish: true,
             outbox: None,
         })
@@ -6668,7 +6835,8 @@ mod stream_tests {
     #[allow(clippy::type_complexity)]
     struct StreamRecordingAdapter {
         name: &'static str,
-        frames: std::sync::Arc<tokio::sync::Mutex<Vec<(String, Option<String>, bool)>>>,
+        frames:
+            std::sync::Arc<tokio::sync::Mutex<Vec<(String, Option<String>, Option<String>, bool)>>>,
         rx: tokio::sync::Mutex<tokio::sync::mpsc::Receiver<InboundMessage>>,
     }
 
@@ -6690,7 +6858,7 @@ mod stream_tests {
             self.frames
                 .lock()
                 .await
-                .push((text.to_string(), None, true));
+                .push((text.to_string(), None, None, true));
             Ok(())
         }
         async fn send_stream_chunk(
@@ -6699,12 +6867,15 @@ mod stream_tests {
             text: &str,
             _reply_token: Option<&str>,
             stream_id: Option<&str>,
+            feedback_id: Option<&str>,
             finish: bool,
         ) -> Result<(), String> {
-            self.frames
-                .lock()
-                .await
-                .push((text.to_string(), stream_id.map(String::from), finish));
+            self.frames.lock().await.push((
+                text.to_string(),
+                stream_id.map(String::from),
+                feedback_id.map(String::from),
+                finish,
+            ));
             Ok(())
         }
         async fn recv(&self) -> Option<InboundMessage> {
@@ -6736,6 +6907,7 @@ mod stream_tests {
             &long_text,
             Some("req-1"),
             Some("stream-1"),
+            Some("feedback-1"),
             false,
         )
         .await
@@ -6749,7 +6921,8 @@ mod stream_tests {
             "full content must be sent unsplit"
         );
         assert_eq!(recorded[0].1.as_deref(), Some("stream-1"));
-        assert!(!recorded[0].2);
+        assert_eq!(recorded[0].2.as_deref(), Some("feedback-1"));
+        assert!(!recorded[0].3);
         drop(recorded);
 
         // Non-stream mode: should split
@@ -6762,6 +6935,7 @@ mod stream_tests {
             &long_text,
             Some("req-1"),
             None,
+            None,
             true,
         )
         .await
@@ -6772,6 +6946,42 @@ mod stream_tests {
             recorded.len() > 1,
             "non-stream mode must split long messages"
         );
+        assert!(recorded.iter().all(|(_, sid, _, _)| sid.is_none()));
+        assert!(recorded.iter().all(|(_, _, fid, _)| fid.is_none()));
+    }
+
+    #[tokio::test]
+    async fn non_stream_feedback_is_forwarded_to_adapter() {
+        let frames = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let (_tx, rx) = tokio::sync::mpsc::channel(1);
+        let adapters: Vec<Box<dyn PlatformAdapter>> = vec![Box::new(StreamRecordingAdapter {
+            name: "wecom",
+            frames: frames.clone(),
+            rx: tokio::sync::Mutex::new(rx),
+        })];
+        let mut indices = HashMap::new();
+        indices.insert("wecom", 0usize);
+
+        send_text_to_platform(
+            &adapters,
+            &indices,
+            "wecom",
+            "chat",
+            "final response",
+            None,
+            None,
+            Some("feedback-1"),
+            true,
+        )
+        .await
+        .unwrap();
+
+        let recorded = frames.lock().await;
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].0, "final response");
+        assert!(recorded[0].1.is_none());
+        assert_eq!(recorded[0].2.as_deref(), Some("feedback-1"));
+        assert!(recorded[0].3);
     }
 
     #[test]

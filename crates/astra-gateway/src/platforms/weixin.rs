@@ -719,6 +719,7 @@ async fn poll_updates(
                 chat_type,
                 reply_token: None,
                 route_override: None,
+                feedback: None,
             };
 
             match deliver_weixin_inbound(msg_tx, inbound) {
@@ -1370,6 +1371,7 @@ mod tests {
             chat_type: ChatType::DirectMessage,
             reply_token: None,
             route_override: None,
+            feedback: None,
         };
         tx.send(first).await.unwrap();
 
@@ -1382,6 +1384,7 @@ mod tests {
             chat_type: ChatType::DirectMessage,
             reply_token: None,
             route_override: None,
+            feedback: None,
         };
 
         assert_eq!(

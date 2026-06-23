@@ -92,6 +92,7 @@ async fn handle_connection(
                 },
                 reply_token: None,
                 route_override: None,
+                feedback: None,
             };
             let _ = tx.send(inbound).await;
             let resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"ok\":true}";
