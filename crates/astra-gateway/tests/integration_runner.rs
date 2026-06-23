@@ -9,9 +9,10 @@ use std::time::Duration;
 
 use astra_gateway::cli_bridge::CliProfile;
 use astra_gateway::config::{AstraServerConfig, GatewayConfig, PlatformConfigs};
-use astra_gateway::platforms::{ChatType, InboundMessage, PlatformAdapter};
+use astra_gateway::platforms::{ChatType, FeedbackEvent, InboundMessage, PlatformAdapter};
 use astra_gateway::runner::GatewayRunner;
 use astra_gateway::store::StorageConfig;
+use astra_gateway::trace_model::{ConversationKey, GatewayEventKind, GatewayRequest, TraceWriter};
 use async_trait::async_trait;
 use tokio::sync::{Mutex, mpsc};
 
@@ -323,6 +324,7 @@ fn msg(chat_id: &str, user_id: &str, text: &str) -> InboundMessage {
         chat_type: ChatType::DirectMessage,
         reply_token: None,
         route_override: None,
+        feedback: None,
     }
 }
 
@@ -336,6 +338,7 @@ fn group_msg(chat_id: &str, user_id: &str, text: &str) -> InboundMessage {
         chat_type: ChatType::Group,
         reply_token: None,
         route_override: None,
+        feedback: None,
     }
 }
 
@@ -365,6 +368,57 @@ async fn session_auto_created_on_first_message() {
     // same way, but the store should have been touched.
     // The key assertion: no error occurred, the message was processed.
     assert!(response.unwrap().contains("Hello from fake CLI") || session.is_some());
+}
+
+#[tokio::test]
+async fn feedback_event_records_trace_event() {
+    let gw = TestGateway::new().await;
+    let outputs = Arc::new(Mutex::new(Vec::new()));
+    let adapter = MockPlatformAdapter::new(mpsc::channel(1).1, outputs);
+
+    let repo = gw.runner.trace_repo().unwrap();
+    let conversation = ConversationKey::new(
+        "mock",
+        "chat-feedback",
+        gw.runner.cli_profile().name().to_string(),
+    );
+    let request = GatewayRequest::new(
+        conversation,
+        "platform-msg-feedback",
+        "user-feedback",
+        "hello",
+    );
+    let trace_id = request.trace_id.clone();
+    let request_id = request.request_id.clone();
+    TraceWriter::begin(repo.as_ref(), request).await.unwrap();
+
+    let feedback = InboundMessage {
+        platform: "mock",
+        chat_id: "chat-feedback".into(),
+        user_id: "user-feedback".into(),
+        text: String::new(),
+        msg_id: "feedback-msg".into(),
+        chat_type: ChatType::DirectMessage,
+        reply_token: None,
+        route_override: None,
+        feedback: Some(FeedbackEvent {
+            feedback_id: request_id.to_string(),
+            feedback_type: 1,
+            content: Some("good".into()),
+            inaccurate_reason_list: vec![],
+            raw: serde_json::json!({"id": request_id.to_string(), "type": 1}),
+        }),
+    };
+    assert_eq!(gw.runner.handle_message(&feedback, &adapter).await, None);
+
+    let events = repo.list_events_for_trace(&trace_id, 100).await.unwrap();
+    let feedback_event = events
+        .iter()
+        .find(|event| event.kind == GatewayEventKind::Feedback)
+        .expect("feedback event should be recorded");
+    assert_eq!(feedback_event.payload["feedback_type"], 1);
+    assert_eq!(feedback_event.payload["feedback_label"], "positive");
+    assert_eq!(feedback_event.payload["content"], "good");
 }
 
 #[tokio::test]
