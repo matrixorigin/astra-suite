@@ -278,6 +278,7 @@ async fn run_jsonl_reader(
                     },
                     reply_token: None,
                     route_override: None,
+                    attachments: Vec::new(),
                     feedback: None,
                 };
                 if msg_tx.send(inbound).await.is_err() {

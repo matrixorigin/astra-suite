@@ -1261,7 +1261,7 @@ impl GatewayRunner {
         };
 
         // Run CLI with rich progress heartbeats and a bounded lifetime.
-        let message_text = msg.text.clone();
+        let message_text = message_text_for_cli(msg);
         let sid = session_id.clone();
         let chat_id = effective_chat_id.clone();
         let reply_token = msg.reply_token.clone();
@@ -2275,7 +2275,7 @@ impl GatewayRunner {
             };
             result = match cli_bridge::run_cli_with_context(
                 &cli_profile,
-                &msg.text,
+                &message_text,
                 None,
                 workspace.as_deref(),
                 None,
@@ -4722,6 +4722,47 @@ fn strip_think_blocks(text: &str) -> String {
         }
     }
     result
+}
+
+fn message_text_for_cli(msg: &InboundMessage) -> String {
+    if msg.attachments.is_empty() {
+        return msg.text.clone();
+    }
+
+    let mut text = if msg.text.trim().is_empty() {
+        "The user sent attachment(s).".to_string()
+    } else {
+        msg.text.clone()
+    };
+    text.push_str("\n\nAttachments:");
+    for (idx, attachment) in msg.attachments.iter().enumerate() {
+        let kind = match attachment.kind {
+            crate::platforms::InboundAttachmentKind::Image => "image",
+            crate::platforms::InboundAttachmentKind::File => "file",
+            crate::platforms::InboundAttachmentKind::Video => "video",
+            crate::platforms::InboundAttachmentKind::Audio => "audio",
+            crate::platforms::InboundAttachmentKind::Unknown => "unknown",
+        };
+        text.push_str(&format!("\n{}. type: {}", idx + 1, kind));
+        if let Some(name) = attachment.name.as_deref() {
+            text.push_str(&format!(", name: {name}"));
+        }
+        if let Some(path) = attachment.local_path.as_deref() {
+            text.push_str(&format!(", local_path: {path}"));
+        } else if let Some(url) = attachment.url.as_deref() {
+            text.push_str(&format!(", url: {url}"));
+        }
+        if let Some(media_id) = attachment.media_id.as_deref() {
+            text.push_str(&format!(", media_id: {media_id}"));
+        }
+        if let Some(mime) = attachment.mime_type.as_deref() {
+            text.push_str(&format!(", mime_type: {mime}"));
+        }
+        if let Some(size) = attachment.size_bytes {
+            text.push_str(&format!(", size_bytes: {size}"));
+        }
+    }
+    text
 }
 
 /// Derive a short request tag like `#A7` from the first two hex digits of a

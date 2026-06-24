@@ -403,6 +403,7 @@ fn extract_text_messages(payload: &Value) -> Vec<InboundMessage> {
                     chat_type: ChatType::DirectMessage,
                     reply_token: None,
                     route_override: None,
+                    attachments: Vec::new(),
                     feedback: None,
                 });
             }

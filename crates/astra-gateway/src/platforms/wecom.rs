@@ -5,13 +5,19 @@
 
 use super::{
     AdapterCapability, AdapterHealthEvent, AdapterHealthEventType, ChatType, FeedbackEvent,
-    InboundMessage, PlatformAdapter, emit_adapter_health,
+    InboundAttachment, InboundAttachmentKind, InboundMessage, PlatformAdapter, emit_adapter_health,
 };
 use crate::config::WeComConfig;
 use crate::dedup::MessageDeduplicator;
+use aes::Aes256;
+use aes::cipher::{BlockDecrypt, KeyInit};
 use async_trait::async_trait;
+use base64::Engine;
 use futures_util::{SinkExt, StreamExt};
+use reqwest::header::CONTENT_DISPOSITION;
 use serde_json::{Value, json};
+use std::path::PathBuf;
+use std::time::Duration;
 use tokio::sync::{Mutex, mpsc};
 use tokio_tungstenite::tungstenite::Message;
 
@@ -448,6 +454,7 @@ async fn handle_wecom_message(
             chat_id,
             user_id,
             text: String::new(),
+            attachments: Vec::new(),
             msg_id,
             chat_type,
             reply_token: data["headers"]["req_id"].as_str().map(String::from),
@@ -483,8 +490,10 @@ async fn handle_wecom_message(
         .trim();
 
     let text = raw_text.to_string();
+    let mut attachments = extract_wecom_attachments(body);
+    download_wecom_attachments(&mut attachments, &msg_id).await;
 
-    if text.is_empty() {
+    if text.is_empty() && attachments.is_empty() {
         return;
     }
 
@@ -510,6 +519,7 @@ async fn handle_wecom_message(
         chat_id,
         user_id,
         text,
+        attachments,
         msg_id,
         chat_type,
         reply_token,
@@ -520,6 +530,350 @@ async fn handle_wecom_message(
     if msg_tx.send(msg).await.is_err() {
         tracing::warn!("wecom message channel full, dropping message");
     }
+}
+
+fn extract_wecom_attachments(body: &Value) -> Vec<InboundAttachment> {
+    let mut attachments = Vec::new();
+    for (key, kind) in [
+        ("image", InboundAttachmentKind::Image),
+        ("file", InboundAttachmentKind::File),
+        ("video", InboundAttachmentKind::Video),
+        ("voice", InboundAttachmentKind::Audio),
+    ] {
+        let Some(section) = body.get(key) else {
+            continue;
+        };
+        if !section.is_object() {
+            continue;
+        }
+        let attachment = InboundAttachment {
+            kind,
+            name: first_string(
+                section,
+                &[
+                    "filename",
+                    "file_name",
+                    "name",
+                    "title",
+                    "display_name",
+                    "origin_name",
+                ],
+            )
+            .or_else(|| infer_name_from_url(first_string(section, &url_keys()).as_deref())),
+            media_id: first_string(section, &["media_id", "mediaid", "file_id", "fileid"]),
+            url: first_string(section, &url_keys()),
+            local_path: None,
+            mime_type: first_string(section, &["mime_type", "mimetype", "content_type"]),
+            size_bytes: first_u64(section, &["size", "file_size", "filesize", "size_bytes"]),
+            raw: section.clone(),
+        };
+        if attachment.media_id.is_some()
+            || attachment.url.is_some()
+            || attachment.name.is_some()
+            || kind != InboundAttachmentKind::Audio
+        {
+            attachments.push(attachment);
+        }
+    }
+    attachments
+}
+
+async fn download_wecom_attachments(attachments: &mut [InboundAttachment], msg_id: &str) {
+    const MAX_ATTACHMENT_BYTES: u64 = 25 * 1024 * 1024;
+
+    if attachments.iter().all(|a| a.url.is_none()) {
+        return;
+    }
+
+    let dir = attachment_dir(msg_id);
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+    {
+        Ok(client) => client,
+        Err(e) => {
+            tracing::warn!(error = %e, "wecom attachment http client unavailable");
+            return;
+        }
+    };
+
+    for (idx, attachment) in attachments.iter_mut().enumerate() {
+        let Some(url) = attachment.url.as_deref() else {
+            continue;
+        };
+        if !url.starts_with("http://") && !url.starts_with("https://") {
+            continue;
+        }
+
+        let response = match client.get(url).send().await {
+            Ok(response) => response,
+            Err(e) => {
+                tracing::warn!(url, error = %e, "wecom attachment download failed");
+                continue;
+            }
+        };
+        if !response.status().is_success() {
+            tracing::warn!(
+                url,
+                status = %response.status(),
+                "wecom attachment download returned non-success status"
+            );
+            continue;
+        }
+        if let Some(len) = response.content_length()
+            && len > MAX_ATTACHMENT_BYTES
+        {
+            tracing::warn!(
+                url,
+                content_length = len,
+                max_bytes = MAX_ATTACHMENT_BYTES,
+                "wecom attachment too large"
+            );
+            continue;
+        }
+
+        let filename = content_disposition_filename(
+            response
+                .headers()
+                .get(CONTENT_DISPOSITION)
+                .and_then(|v| v.to_str().ok()),
+        );
+        let raw_bytes = match response.bytes().await {
+            Ok(bytes) if bytes.len() as u64 <= MAX_ATTACHMENT_BYTES => bytes,
+            Ok(bytes) => {
+                tracing::warn!(
+                    url,
+                    bytes = bytes.len(),
+                    max_bytes = MAX_ATTACHMENT_BYTES,
+                    "wecom attachment body too large"
+                );
+                continue;
+            }
+            Err(e) => {
+                tracing::warn!(url, error = %e, "wecom attachment body read failed");
+                continue;
+            }
+        };
+        let aes_key = first_string(&attachment.raw, &["aeskey", "aes_key", "aesKey"]);
+        let bytes = if let Some(aes_key) = aes_key.as_deref() {
+            match decrypt_wecom_media(&raw_bytes, aes_key) {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    tracing::warn!(url, error = %e, "wecom attachment decrypt failed");
+                    continue;
+                }
+            }
+        } else {
+            raw_bytes.to_vec()
+        };
+
+        if let Err(e) = tokio::fs::create_dir_all(&dir).await {
+            tracing::warn!(dir = %dir.display(), error = %e, "wecom attachment dir create failed");
+            return;
+        }
+        if attachment.name.is_none() {
+            attachment.name = filename;
+        }
+        let filename = attachment_filename(attachment, idx);
+        let path = dir.join(filename);
+        if let Err(e) = tokio::fs::write(&path, &bytes).await {
+            tracing::warn!(path = %path.display(), error = %e, "wecom attachment write failed");
+            continue;
+        }
+        attachment.size_bytes.get_or_insert(bytes.len() as u64);
+        attachment.local_path = Some(path.to_string_lossy().to_string());
+    }
+}
+
+fn decrypt_wecom_media(encrypted: &[u8], aes_key: &str) -> Result<Vec<u8>, String> {
+    if encrypted.is_empty() {
+        return Err("empty encrypted body".into());
+    }
+    if !encrypted.len().is_multiple_of(16) {
+        return Err(format!(
+            "encrypted body length {} is not AES block aligned",
+            encrypted.len()
+        ));
+    }
+
+    let key = decode_wecom_aes_key(aes_key)?;
+    if key.len() != 32 {
+        return Err(format!(
+            "aeskey decoded to {} bytes, expected 32",
+            key.len()
+        ));
+    }
+
+    let cipher = Aes256::new_from_slice(&key).map_err(|e| format!("invalid aes key: {e}"))?;
+    let mut prev = key[..16].to_vec();
+    let mut out = Vec::with_capacity(encrypted.len());
+    for chunk in encrypted.chunks_exact(16) {
+        let mut block = aes::cipher::generic_array::GenericArray::clone_from_slice(chunk);
+        cipher.decrypt_block(&mut block);
+        for i in 0..16 {
+            out.push(block[i] ^ prev[i]);
+        }
+        prev.copy_from_slice(chunk);
+    }
+
+    let pad_len = *out
+        .last()
+        .ok_or_else(|| "decrypted body is empty".to_string())? as usize;
+    if pad_len == 0 || pad_len > 32 || pad_len > out.len() {
+        return Err(format!("invalid PKCS#7 padding value: {pad_len}"));
+    }
+    if out[out.len() - pad_len..]
+        .iter()
+        .any(|byte| *byte as usize != pad_len)
+    {
+        return Err("invalid PKCS#7 padding bytes".into());
+    }
+    out.truncate(out.len() - pad_len);
+    Ok(out)
+}
+
+fn decode_wecom_aes_key(aes_key: &str) -> Result<Vec<u8>, String> {
+    for engine in [
+        &base64::engine::general_purpose::STANDARD,
+        &base64::engine::general_purpose::STANDARD_NO_PAD,
+        &base64::engine::general_purpose::URL_SAFE,
+        &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+    ] {
+        if let Ok(key) = engine.decode(aes_key) {
+            return Ok(key);
+        }
+    }
+
+    let mut padded = aes_key.trim().to_string();
+    let remainder = padded.len() % 4;
+    if remainder != 0 {
+        padded.extend(std::iter::repeat_n('=', 4 - remainder));
+    }
+    base64::engine::general_purpose::STANDARD
+        .decode(&padded)
+        .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(&padded))
+        .map_err(|e| format!("invalid base64 aeskey: {e}"))
+}
+
+fn attachment_dir(msg_id: &str) -> PathBuf {
+    run_dir()
+        .join(".attachments")
+        .join(sanitize_path_part(msg_id))
+}
+
+fn run_dir() -> PathBuf {
+    std::env::var_os("GATEWAY_RUN_DIR")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".astra-gateway")))
+        .unwrap_or_else(|| PathBuf::from(".astra-gateway"))
+}
+
+fn attachment_filename(attachment: &InboundAttachment, idx: usize) -> String {
+    let inferred_name = infer_name_from_url(attachment.url.as_deref());
+    let base = attachment
+        .name
+        .as_deref()
+        .or(inferred_name.as_deref())
+        .map(sanitize_path_part)
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| format!("attachment-{idx}"));
+    if base.contains('.') {
+        return base;
+    }
+    match attachment.kind {
+        InboundAttachmentKind::Image => format!("{base}.image"),
+        InboundAttachmentKind::File => base,
+        InboundAttachmentKind::Video => format!("{base}.video"),
+        InboundAttachmentKind::Audio => format!("{base}.audio"),
+        InboundAttachmentKind::Unknown => base,
+    }
+}
+
+fn sanitize_path_part(input: &str) -> String {
+    input
+        .chars()
+        .map(|ch| match ch {
+            'a'..='z' | 'A'..='Z' | '0'..='9' | '.' | '-' | '_' => ch,
+            _ => '_',
+        })
+        .collect::<String>()
+        .trim_matches('_')
+        .to_string()
+}
+
+fn first_string(value: &Value, keys: &[&str]) -> Option<String> {
+    for key in keys {
+        if let Some(s) = value.get(*key).and_then(Value::as_str) {
+            let s = s.trim();
+            if !s.is_empty() {
+                return Some(s.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn first_u64(value: &Value, keys: &[&str]) -> Option<u64> {
+    for key in keys {
+        if let Some(n) = value.get(*key).and_then(Value::as_u64) {
+            return Some(n);
+        }
+        if let Some(s) = value.get(*key).and_then(Value::as_str)
+            && let Ok(n) = s.trim().parse()
+        {
+            return Some(n);
+        }
+    }
+    None
+}
+
+fn url_keys() -> [&'static str; 7] {
+    [
+        "url",
+        "download_url",
+        "file_url",
+        "full_url",
+        "pic_url",
+        "picurl",
+        "image_url",
+    ]
+}
+
+fn infer_name_from_url(url: Option<&str>) -> Option<String> {
+    let url = url?;
+    let path = url.split('?').next().unwrap_or(url);
+    let name = path.rsplit('/').next()?.trim();
+    if name.is_empty() {
+        None
+    } else {
+        Some(name.to_string())
+    }
+}
+
+fn content_disposition_filename(value: Option<&str>) -> Option<String> {
+    let value = value?;
+    if let Some(rest) = value.split("filename*=UTF-8''").nth(1) {
+        let encoded = rest.split(';').next().unwrap_or(rest).trim();
+        if !encoded.is_empty() {
+            return urlencoding::decode(encoded)
+                .ok()
+                .map(|s| s.trim_matches('"').to_string())
+                .filter(|s| !s.is_empty());
+        }
+    }
+    for part in value.split(';') {
+        let part = part.trim();
+        if let Some(name) = part.strip_prefix("filename=") {
+            let name = name.trim().trim_matches('"');
+            if !name.is_empty() {
+                return urlencoding::decode(name)
+                    .ok()
+                    .map(|s| s.to_string())
+                    .filter(|s| !s.is_empty());
+            }
+        }
+    }
+    None
 }
 
 fn parse_feedback_event(body: &Value) -> Option<FeedbackEvent> {
@@ -1006,6 +1360,115 @@ mod tests {
             let msg = rx.recv().await.unwrap();
             assert_eq!(msg.text, "transcribed text from voice");
         });
+    }
+
+    #[test]
+    fn parse_image_attachment_message() {
+        let data: Value = serde_json::from_str(
+            r#"{
+            "cmd": "aibot_msg_callback",
+            "headers": {"req_id": "req-image"},
+            "body": {
+                "msgid": "image-1",
+                "from": {"userid": "u1"},
+                "chatid": "c1",
+                "chattype": "single",
+                "msgtype": "image",
+                "image": {"media_id": "media-image-1", "filename": "shot.png", "mime_type": "image/png"}
+            }
+        }"#,
+        )
+        .unwrap();
+
+        let (tx, mut rx) = mpsc::channel(10);
+        let mut dedup = MessageDeduplicator::new();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            handle_wecom_message(&data, &tx, &mut dedup).await;
+            let msg = rx.recv().await.unwrap();
+            assert!(msg.text.is_empty());
+            assert_eq!(msg.attachments.len(), 1);
+            let attachment = &msg.attachments[0];
+            assert_eq!(attachment.kind, InboundAttachmentKind::Image);
+            assert_eq!(attachment.media_id.as_deref(), Some("media-image-1"));
+            assert_eq!(attachment.name.as_deref(), Some("shot.png"));
+            assert_eq!(attachment.mime_type.as_deref(), Some("image/png"));
+        });
+    }
+
+    #[test]
+    fn parse_file_attachment_with_text() {
+        let data: Value = serde_json::from_str(
+            r#"{
+            "cmd": "aibot_msg_callback",
+            "headers": {"req_id": "req-file"},
+            "body": {
+                "msgid": "file-1",
+                "from": {"userid": "u1"},
+                "chatid": "c1",
+                "chattype": "single",
+                "msgtype": "file",
+                "text": {"content": "please read this"},
+                "file": {"fileid": "file-media-1", "file_name": "report.pdf", "file_size": "1024"}
+            }
+        }"#,
+        )
+        .unwrap();
+
+        let (tx, mut rx) = mpsc::channel(10);
+        let mut dedup = MessageDeduplicator::new();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            handle_wecom_message(&data, &tx, &mut dedup).await;
+            let msg = rx.recv().await.unwrap();
+            assert_eq!(msg.text, "please read this");
+            assert_eq!(msg.attachments.len(), 1);
+            let attachment = &msg.attachments[0];
+            assert_eq!(attachment.kind, InboundAttachmentKind::File);
+            assert_eq!(attachment.media_id.as_deref(), Some("file-media-1"));
+            assert_eq!(attachment.name.as_deref(), Some("report.pdf"));
+            assert_eq!(attachment.size_bytes, Some(1024));
+        });
+    }
+
+    #[test]
+    fn decrypt_wecom_media_uses_aes_256_cbc_and_32_byte_pkcs7_padding() {
+        use aes::cipher::BlockEncrypt;
+
+        let key = [7u8; 32];
+        let aes_key = base64::engine::general_purpose::STANDARD.encode(key);
+        let plaintext = b"%PDF-test\n";
+        let mut padded = plaintext.to_vec();
+        let pad_len = 32 - (padded.len() % 32);
+        padded.extend(std::iter::repeat_n(pad_len as u8, pad_len));
+
+        let cipher = Aes256::new_from_slice(&key).unwrap();
+        let mut prev = key[..16].to_vec();
+        let mut encrypted = Vec::new();
+        for chunk in padded.chunks_exact(16) {
+            let mut block_bytes = [0u8; 16];
+            for i in 0..16 {
+                block_bytes[i] = chunk[i] ^ prev[i];
+            }
+            let mut block =
+                aes::cipher::generic_array::GenericArray::clone_from_slice(&block_bytes);
+            cipher.encrypt_block(&mut block);
+            encrypted.extend_from_slice(&block);
+            prev.copy_from_slice(&block);
+        }
+
+        let decrypted = decrypt_wecom_media(&encrypted, &aes_key).unwrap();
+        assert_eq!(decrypted, plaintext);
+
+        let no_pad_key = aes_key.trim_end_matches('=');
+        let decrypted = decrypt_wecom_media(&encrypted, no_pad_key).unwrap();
+        assert_eq!(decrypted, plaintext);
     }
 
     #[test]
