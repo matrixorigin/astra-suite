@@ -4463,7 +4463,7 @@ async fn find_and_delete_job(
     }
 }
 
-/// Streaming filter for `<think>...</think>` blocks.
+/// Streaming filter for `<think>...</think>` / `<thinking>...</thinking>` blocks.
 ///
 /// Buffers partial tag fragments across token boundaries so that a `<think>`
 /// split across two chunks (e.g. `"<thi"` + `"nk>..."`) is correctly detected
@@ -4481,8 +4481,8 @@ impl ThinkTagStreamFilter {
 
         loop {
             if self.in_think {
-                if let Some(end) = self.pending.find("</think>") {
-                    self.pending.drain(..end + 8);
+                if let Some((end, close)) = find_next_think_close(&self.pending) {
+                    self.pending.drain(..end + close.len());
                     self.in_think = false;
                     continue;
                 }
@@ -4491,9 +4491,9 @@ impl ThinkTagStreamFilter {
                 break;
             }
 
-            if let Some(start) = self.pending.find("<think>") {
+            if let Some((start, tag)) = find_next_think_open(&self.pending) {
                 out.push_str(&self.pending[..start]);
-                self.pending.drain(..start + 7);
+                self.pending.drain(..start + tag.open.len());
                 self.in_think = true;
                 continue;
             }
@@ -4510,7 +4510,7 @@ impl ThinkTagStreamFilter {
 
     fn finish(&mut self) -> String {
         if self.in_think {
-            // Unclosed <think> — return accumulated content so it's not lost
+            // Unclosed think tag — return accumulated content so it's not lost.
             let leftover = std::mem::take(&mut self.pending);
             self.in_think = false;
             leftover
@@ -4520,9 +4520,44 @@ impl ThinkTagStreamFilter {
     }
 }
 
-/// Suffix of `text` that could be a prefix of `<think>` (when outside a think block).
+#[derive(Clone, Copy)]
+struct ThinkTag {
+    open: &'static str,
+    close: &'static str,
+}
+
+const THINK_TAGS: [ThinkTag; 2] = [
+    ThinkTag {
+        open: "<think>",
+        close: "</think>",
+    },
+    ThinkTag {
+        open: "<thinking>",
+        close: "</thinking>",
+    },
+];
+
+fn find_next_think_open(text: &str) -> Option<(usize, ThinkTag)> {
+    THINK_TAGS
+        .iter()
+        .filter_map(|tag| text.find(tag.open).map(|pos| (pos, *tag)))
+        .min_by_key(|(pos, _)| *pos)
+}
+
+fn find_next_think_close(text: &str) -> Option<(usize, &'static str)> {
+    THINK_TAGS
+        .iter()
+        .filter_map(|tag| text.find(tag.close).map(|pos| (pos, tag.close)))
+        .min_by_key(|(pos, _)| *pos)
+}
+
+/// Suffix of `text` that could be a prefix of a think opening tag.
 fn open_think_prefix_len(text: &str) -> usize {
-    tag_suffix_prefix_len(text, "<think>")
+    THINK_TAGS
+        .iter()
+        .map(|tag| tag_suffix_prefix_len(text, tag.open))
+        .max()
+        .unwrap_or(0)
 }
 
 fn tag_suffix_prefix_len(text: &str, tag: &str) -> usize {
@@ -4542,16 +4577,16 @@ fn filter_think_tags(text: &str, in_think: &mut bool) -> String {
 
     while !remaining.is_empty() {
         if *in_think {
-            if let Some(end) = remaining.find("</think>") {
+            if let Some((end, close)) = find_next_think_close(remaining) {
                 *in_think = false;
-                remaining = &remaining[end + 8..];
+                remaining = &remaining[end + close.len()..];
             } else {
                 break;
             }
-        } else if let Some(start) = remaining.find("<think>") {
+        } else if let Some((start, tag)) = find_next_think_open(remaining) {
             result.push_str(&remaining[..start]);
             *in_think = true;
-            remaining = &remaining[start + 7..];
+            remaining = &remaining[start + tag.open.len()..];
         } else {
             result.push_str(remaining);
             break;
@@ -4663,14 +4698,19 @@ fn build_final_message(
     }
 }
 
-/// Strip `<think>...</think>` blocks from complete text.
-/// Unclosed `<think>` at EOF: the tag is removed but content after it is
+/// Strip `<think>...</think>` / `<thinking>...</thinking>` blocks from complete text.
+/// Unclosed think tags at EOF: the tag is removed but content after it is
 /// preserved — a malicious or buggy model cannot suppress all output.
 fn strip_think_blocks(text: &str) -> String {
     let mut in_think = false;
     let mut result = filter_think_tags(text, &mut in_think);
-    if in_think && let Some(pos) = text.rfind("<think>") {
-        let after = &text[pos + 7..];
+    if in_think
+        && let Some((pos, tag)) = THINK_TAGS
+            .iter()
+            .filter_map(|tag| text.rfind(tag.open).map(|pos| (pos, *tag)))
+            .max_by_key(|(pos, _)| *pos)
+    {
+        let after = &text[pos + tag.open.len()..];
         if !after.is_empty() {
             if !result.is_empty() {
                 result.push('\n');
@@ -4926,6 +4966,14 @@ mod tests {
     }
 
     #[test]
+    fn filter_think_tags_strips_complete_thinking_block() {
+        let mut state = false;
+        let result = filter_think_tags("<thinking>internal reasoning</thinking>Hello!", &mut state);
+        assert_eq!(result, "Hello!");
+        assert!(!state);
+    }
+
+    #[test]
     fn filter_think_tags_handles_streaming_chunks() {
         let mut state = false;
         // Chunk 1: start of think block
@@ -4943,6 +4991,28 @@ mod tests {
     }
 
     #[test]
+    fn filter_think_tags_handles_streaming_thinking_chunks() {
+        let mut state = false;
+        let r1 = filter_think_tags("Hi <thinking>reasoning", &mut state);
+        assert_eq!(r1, "Hi ");
+        assert!(state);
+        let r2 = filter_think_tags(" more thinking", &mut state);
+        assert_eq!(r2, "");
+        assert!(state);
+        let r3 = filter_think_tags("</thinking>Visible", &mut state);
+        assert_eq!(r3, "Visible");
+        assert!(!state);
+    }
+
+    #[test]
+    fn filter_think_tags_allows_mismatched_close_tags() {
+        let mut state = false;
+        let result = filter_think_tags("<thinking>hidden</think>Visible", &mut state);
+        assert_eq!(result, "Visible");
+        assert!(!state);
+    }
+
+    #[test]
     fn filter_think_tags_no_think_passthrough() {
         let mut state = false;
         let result = filter_think_tags("Just normal text", &mut state);
@@ -4952,6 +5022,12 @@ mod tests {
     #[test]
     fn strip_think_blocks_removes_all() {
         let text = "<think>hmm</think>Answer is 42<think>double check</think>.";
+        assert_eq!(strip_think_blocks(text), "Answer is 42.");
+    }
+
+    #[test]
+    fn strip_think_blocks_removes_thinking_blocks() {
+        let text = "<thinking>hmm</thinking>Answer is 42<thinking>double check</thinking>.";
         assert_eq!(strip_think_blocks(text), "Answer is 42.");
     }
 
@@ -4977,6 +5053,16 @@ mod tests {
         assert!(
             result.contains("all content here"),
             "unclosed think at start suppressed everything: {result}"
+        );
+    }
+
+    #[test]
+    fn strip_think_blocks_unclosed_thinking_at_start() {
+        let text = "<thinking>all content here, no close tag";
+        let result = strip_think_blocks(text);
+        assert!(
+            result.contains("all content here"),
+            "unclosed thinking at start suppressed everything: {result}"
         );
     }
 
@@ -5153,6 +5239,13 @@ mod tests {
     }
 
     #[test]
+    fn think_stream_filter_complete_thinking_block() {
+        let mut f = ThinkTagStreamFilter::default();
+        assert_eq!(f.push("<thinking>reasoning</thinking>Hello!"), "Hello!");
+        assert_eq!(f.finish(), "");
+    }
+
+    #[test]
     fn think_stream_filter_split_open_tag() {
         let mut f = ThinkTagStreamFilter::default();
         let r1 = f.push("before<thi");
@@ -5162,10 +5255,33 @@ mod tests {
     }
 
     #[test]
+    fn think_stream_filter_split_thinking_open_tag() {
+        let mut f = ThinkTagStreamFilter::default();
+        let r1 = f.push("before<thinki");
+        assert_eq!(r1, "before");
+        let r2 = f.push("ng>hidden</thinking>visible");
+        assert_eq!(r2, "visible");
+    }
+
+    #[test]
     fn think_stream_filter_split_close_tag() {
         let mut f = ThinkTagStreamFilter::default();
         assert_eq!(f.push("<think>hidden</thi"), "");
         assert_eq!(f.push("nk>after"), "after");
+    }
+
+    #[test]
+    fn think_stream_filter_split_thinking_close_tag() {
+        let mut f = ThinkTagStreamFilter::default();
+        assert_eq!(f.push("<thinking>hidden</think"), "");
+        assert_eq!(f.push("ing>after"), "after");
+    }
+
+    #[test]
+    fn think_stream_filter_allows_mismatched_close_tags() {
+        let mut f = ThinkTagStreamFilter::default();
+        assert_eq!(f.push("<thinking>hidden</think>visible"), "visible");
+        assert_eq!(f.finish(), "");
     }
 
     #[test]
@@ -5179,6 +5295,14 @@ mod tests {
     fn think_stream_filter_unclosed_at_finish_preserves_content() {
         let mut f = ThinkTagStreamFilter::default();
         assert_eq!(f.push("before<think>hidden"), "before");
+        let tail = f.finish();
+        assert_eq!(tail, "hidden");
+    }
+
+    #[test]
+    fn think_stream_filter_unclosed_thinking_at_finish_preserves_content() {
+        let mut f = ThinkTagStreamFilter::default();
+        assert_eq!(f.push("before<thinking>hidden"), "before");
         let tail = f.finish();
         assert_eq!(tail, "hidden");
     }
@@ -5211,6 +5335,8 @@ mod tests {
         assert_eq!(open_think_prefix_len("hello<thi"), 4);
         assert_eq!(open_think_prefix_len("hello<thin"), 5);
         assert_eq!(open_think_prefix_len("hello<think"), 6);
+        assert_eq!(open_think_prefix_len("hello<thinki"), 7);
+        assert_eq!(open_think_prefix_len("hello<thinkin"), 8);
     }
 
     #[test]
