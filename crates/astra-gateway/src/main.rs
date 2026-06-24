@@ -731,6 +731,22 @@ async fn main() {
         adapters.push(Box::new(adapter));
     }
 
+    if let Some(whatsapp_cfg) = config.platforms.whatsapp
+        && whatsapp_cfg.enabled
+    {
+        adapters.push(Box::new(
+            astra_gateway::platforms::whatsapp::WhatsAppAdapter::new(whatsapp_cfg),
+        ));
+    }
+
+    if let Some(whatsapp_web_cfg) = config.platforms.whatsapp_web
+        && whatsapp_web_cfg.enabled
+    {
+        adapters.push(Box::new(
+            astra_gateway::platforms::whatsapp_web::WhatsAppWebAdapter::new(whatsapp_web_cfg),
+        ));
+    }
+
     if adapters.is_empty() {
         tracing::error!("no platforms enabled");
         std::process::exit(1);

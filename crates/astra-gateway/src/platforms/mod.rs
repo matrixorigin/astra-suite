@@ -1,5 +1,7 @@
 pub mod wecom;
 pub mod weixin;
+pub mod whatsapp;
+pub mod whatsapp_web;
 
 use async_trait::async_trait;
 

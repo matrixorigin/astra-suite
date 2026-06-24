@@ -48,6 +48,9 @@ libc = { workspace = true }
 regex = { workspace = true }
 thiserror = { workspace = true }
 uuid = { workspace = true }
+hmac = "0.12"
+sha2 = "0.10"
+subtle = "2"
 
 # WeChat media encryption
 aes = "0.8"

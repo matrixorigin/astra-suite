@@ -286,3 +286,24 @@ platforms:
   #   bot_id: ""              # 企微 AI Bot ID or WECOM_BOT_ID env var
   #   secret: ""              # 企微 AI Bot Secret or WECOM_SECRET env var
   #   # websocket_url: "wss://openws.work.weixin.qq.com"  # default, rarely needs changing
+
+  # ── WhatsApp Business Cloud API ──
+  # For local development, expose bind with ngrok/cloudflared and configure
+  # the resulting HTTPS URL as the Meta webhook callback.
+  # whatsapp:
+  #   enabled: true
+  #   bind: "0.0.0.0:8080"                    # or WHATSAPP_BIND
+  #   webhook_path: "/webhook/whatsapp"       # or WHATSAPP_WEBHOOK_PATH
+  #   verify_token: ""                        # or WHATSAPP_VERIFY_TOKEN
+  #   app_secret: ""                          # or WHATSAPP_APP_SECRET
+  #   access_token: ""                        # or WHATSAPP_ACCESS_TOKEN
+  #   phone_number_id: ""                     # or WHATSAPP_PHONE_NUMBER_ID
+  #   graph_base_url: "https://graph.facebook.com/v23.0"
+
+  # ── WhatsApp Web via Baileys sidecar (experimental / unofficial) ──
+  # Run `bridges/whatsapp-baileys` separately, scan its QR code, and set
+  # api_port above so the bridge can inject inbound messages into gateway.
+  # whatsapp_web:
+  #   enabled: true
+  #   bridge_url: "http://127.0.0.1:8787"      # or WHATSAPP_WEB_BRIDGE_URL
+  #   auth_token: ""                          # optional, or WHATSAPP_WEB_AUTH_TOKEN

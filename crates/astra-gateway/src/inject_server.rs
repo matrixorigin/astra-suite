@@ -76,6 +76,8 @@ async fn handle_connection(
             let platform: &'static str = match req.platform.as_str() {
                 "wecom" => "wecom",
                 "weixin" => "weixin",
+                "whatsapp" => "whatsapp",
+                "whatsapp_web" => "whatsapp_web",
                 "telegram" => "telegram",
                 _ => "wecom",
             };
