@@ -1,4 +1,4 @@
-.PHONY: help build release test test-live check format lint prepare-release prepare-release-push clean run stop restart log init setup login-weixin
+.PHONY: help build release test test-live check format lint prepare-release prepare-release-push clean run stop restart log init setup
 
 GATEWAY_BIN = target/release/astra-gateway
 GATEWAY_PID = /tmp/astra-gateway.pid
@@ -87,9 +87,6 @@ restart: stop ## Restart gateway
 
 log: ## Tail gateway log
 	@tail -f $(GATEWAY_LOG)
-
-login-weixin: release ## Login via WeChat
-	$(GATEWAY_BIN) login-weixin
 
 setup: ## Run gateway setup script
 	bash crates/astra-gateway/setup.sh

@@ -274,7 +274,7 @@ action_policy:
 
 platforms:
   # ── 微信个人号 (iLink Bot API) ──
-  # First time: `astra-gateway login-weixin` to scan QR and obtain a token.
+  # First time: `astra-gateway weixin login` to scan QR and obtain a token.
   weixin:
     enabled: true
     token: ""                 # paste here or set WEIXIN_TOKEN env var
@@ -301,9 +301,7 @@ platforms:
   #   graph_base_url: "https://graph.facebook.com/v23.0"
 
   # ── WhatsApp Web via Baileys sidecar (experimental / unofficial) ──
-  # Run `bridges/whatsapp-baileys` separately, scan its QR code, and set
-  # api_port above so the bridge can inject inbound messages into gateway.
+  # Run `astra-gateway whatsapp login` once to scan QR and persist auth state.
+  # The gateway talks to the sidecar over a run-dir scoped Unix socket JSONL protocol.
   # whatsapp_web:
   #   enabled: true
-  #   bridge_url: "http://127.0.0.1:8787"      # or WHATSAPP_WEB_BRIDGE_URL
-  #   auth_token: ""                          # optional, or WHATSAPP_WEB_AUTH_TOKEN

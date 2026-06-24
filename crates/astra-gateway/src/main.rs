@@ -35,9 +35,16 @@ enum Command {
         #[arg(long)]
         force: bool,
     },
-    /// QR code login for WeChat (iLink Bot API)
-    #[command(name = "login-weixin")]
-    LoginWeixin,
+    /// WeChat personal account helpers.
+    Weixin {
+        #[command(subcommand)]
+        command: WeixinCommand,
+    },
+    /// WhatsApp Web sidecar helpers.
+    Whatsapp {
+        #[command(subcommand)]
+        command: WhatsappCommand,
+    },
     /// Start the gateway as a background daemon
     Start,
     /// Stop the running gateway daemon (graceful SIGTERM, then SIGKILL after 15s)
@@ -81,6 +88,28 @@ enum Command {
     },
 }
 
+#[derive(Subcommand)]
+enum WhatsappCommand {
+    /// Start Baileys QR login and persist WhatsApp Web auth state.
+    Login {
+        /// Optional proxy for WhatsApp Web traffic.
+        #[arg(long)]
+        proxy: Option<String>,
+        /// Remove existing WhatsApp auth state before login.
+        #[arg(long)]
+        force: bool,
+        /// Skip dependency installation even if node_modules is missing.
+        #[arg(long)]
+        no_install: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum WeixinCommand {
+    /// QR code login for WeChat (iLink Bot API).
+    Login,
+}
+
 fn data_dir() -> PathBuf {
     std::env::var_os("HOME")
         .map(PathBuf::from)
@@ -92,10 +121,21 @@ fn default_config_path() -> PathBuf {
     default_run_dir().join("config.yaml")
 }
 
+fn absolutize_path(path: PathBuf) -> PathBuf {
+    if path.is_absolute() {
+        path
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(path)
+    }
+}
+
 fn default_run_dir() -> PathBuf {
-    std::env::var_os("GATEWAY_RUN_DIR")
+    let path = std::env::var_os("GATEWAY_RUN_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(data_dir)
+        .unwrap_or_else(data_dir);
+    absolutize_path(path)
 }
 
 fn pid_path() -> PathBuf {
@@ -465,6 +505,125 @@ fn cmd_status(config: &Path) {
     }
 }
 
+fn run_whatsapp_login(proxy: Option<String>, force: bool, no_install: bool) -> Result<(), String> {
+    let run_dir = astra_gateway::whatsapp_bridge::run_dir();
+    let runtime_dir = astra_gateway::whatsapp_bridge::prepare_runtime(no_install)?;
+    let auth_dir = astra_gateway::whatsapp_bridge::auth_dir();
+    let qr_dir = astra_gateway::whatsapp_bridge::qr_dir();
+
+    if force {
+        astra_gateway::whatsapp_bridge::remove_path_if_exists(&auth_dir)?;
+        astra_gateway::whatsapp_bridge::remove_path_if_exists(&qr_dir)?;
+        println!("Removed existing WhatsApp auth state.");
+    }
+
+    println!("Starting WhatsApp login sidecar.");
+    println!("  bridge: {}", runtime_dir.display());
+    println!("  auth:   {}", auth_dir.display());
+    println!("  QR:     {}", qr_dir.display());
+    println!();
+    println!("Scan the QR from the terminal, or open:");
+    println!("  {}", qr_dir.join("qr.png").display());
+    println!();
+    println!("The command exits automatically after WhatsApp connects.");
+
+    let mut cmd = std::process::Command::new("node");
+    cmd.arg("index.js")
+        .arg("login")
+        .current_dir(&runtime_dir)
+        .env("GATEWAY_RUN_DIR", &run_dir)
+        .stdin(std::process::Stdio::inherit())
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit());
+    if let Some(proxy) = proxy {
+        cmd.env("WHATSAPP_PROXY", proxy);
+    }
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("failed to start node sidecar: {e}"))?;
+
+    let status = child
+        .wait()
+        .map_err(|e| format!("failed waiting for node sidecar: {e}"))?;
+    if !status.success() {
+        return Err(format!("WhatsApp login sidecar exited with {status}"));
+    }
+    Ok(())
+}
+
+async fn run_weixin_login(config_path: PathBuf) -> Result<(), String> {
+    match astra_gateway::platforms::weixin::qr_login().await {
+        Ok((token, account_id)) => {
+            // Save to store if config is loadable.
+            let db_saved = if config_path.exists() {
+                if let Ok(cfg) = astra_gateway::config::GatewayConfig::load(&config_path) {
+                    let storage_config = cfg.resolve_storage();
+                    match astra_gateway::store::open_store_bundle(&storage_config).await {
+                        Ok(Some(bundle)) => {
+                            let creds = serde_json::json!({
+                                "token": token,
+                                "account_id": account_id,
+                            });
+                            match bundle
+                                .store
+                                .save_credential("weixin", "default", "bot_token", &creds, None)
+                                .await
+                            {
+                                Ok(()) => {
+                                    println!("✅ 凭证已保存到存储 (换机器无需重新扫码)");
+                                    true
+                                }
+                                Err(e) => {
+                                    tracing::warn!(error = %e, "store save failed, falling back to config file");
+                                    false
+                                }
+                            }
+                        }
+                        _ => false,
+                    }
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+
+            if !db_saved {
+                // Fallback: write to yaml.
+                if config_path.exists() {
+                    if let Ok(content) = std::fs::read_to_string(&config_path) {
+                        use regex::Regex;
+                        let token_re = Regex::new(r#"(?m)(    token: )"[^"]*""#).unwrap();
+                        let account_re = Regex::new(r#"(?m)(    account_id: )"[^"]*""#).unwrap();
+                        let patched = token_re
+                            .replace(&content, &format!("${{1}}\"{token}\""))
+                            .to_string();
+                        let patched = account_re
+                            .replace(&patched, &format!("${{1}}\"{account_id}\""))
+                            .to_string();
+                        if patched != content {
+                            std::fs::write(&config_path, &patched).ok();
+                            println!("✅ 已自动写入 {}", config_path.display());
+                        }
+                    }
+                } else {
+                    println!("将以下内容写入 {}:", config_path.display());
+                    println!();
+                    println!("platforms:");
+                    println!("  weixin:");
+                    println!("    enabled: true");
+                    println!("    token: \"{token}\"");
+                    println!("    account_id: \"{account_id}\"");
+                }
+            }
+            println!();
+            println!("现在可以运行: astra-gateway start");
+            Ok(())
+        }
+        Err(e) => Err(format!("WeChat login failed: {e}")),
+    }
+}
+
 #[tokio::main]
 async fn main() {
     // Load .env file if present (before logging init so RUST_LOG works)
@@ -515,6 +674,34 @@ async fn main() {
                 std::process::exit(1);
             }
         }
+    }
+
+    if let Some(Command::Whatsapp { command }) = cli.command {
+        let result = match command {
+            WhatsappCommand::Login {
+                proxy,
+                force,
+                no_install,
+            } => run_whatsapp_login(proxy, force, no_install),
+        };
+        if let Err(e) = result {
+            eprintln!("❌ {e}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
+    if let Some(Command::Weixin {
+        command: WeixinCommand::Login,
+    }) = cli.command
+    {
+        let config_path = cli.effective_config();
+        if let Err(e) = run_weixin_login(config_path).await {
+            tracing::error!(error = %e, "WeChat login failed");
+            eprintln!("❌ {e}");
+            std::process::exit(1);
+        }
+        return;
     }
 
     if let Some(Command::Status) = cli.command {
@@ -583,84 +770,6 @@ async fn main() {
         println!("  2. astra-gateway start          # run as background daemon");
         println!("     astra-gateway status         # check it's up");
         println!("     astra-gateway stop           # stop it");
-        return;
-    }
-
-    if let Some(Command::LoginWeixin) = cli.command {
-        let config_path = cli.effective_config();
-        match astra_gateway::platforms::weixin::qr_login().await {
-            Ok((token, account_id)) => {
-                // Save to store if config is loadable
-                let db_saved = if config_path.exists() {
-                    if let Ok(cfg) = astra_gateway::config::GatewayConfig::load(&config_path) {
-                        let storage_config = cfg.resolve_storage();
-                        match astra_gateway::store::open_store_bundle(&storage_config).await {
-                            Ok(Some(bundle)) => {
-                                let creds = serde_json::json!({
-                                    "token": token,
-                                    "account_id": account_id,
-                                });
-                                match bundle
-                                    .store
-                                    .save_credential("weixin", "default", "bot_token", &creds, None)
-                                    .await
-                                {
-                                    Ok(()) => {
-                                        println!("✅ 凭证已保存到存储 (换机器无需重新扫码)");
-                                        true
-                                    }
-                                    Err(e) => {
-                                        tracing::warn!(error = %e, "store save failed, falling back to config file");
-                                        false
-                                    }
-                                }
-                            }
-                            _ => false,
-                        }
-                    } else {
-                        false
-                    }
-                } else {
-                    false
-                };
-
-                if !db_saved {
-                    // Fallback: write to yaml
-                    if config_path.exists() {
-                        if let Ok(content) = std::fs::read_to_string(&config_path) {
-                            use regex::Regex;
-                            let token_re = Regex::new(r#"(?m)(    token: )"[^"]*""#).unwrap();
-                            let account_re =
-                                Regex::new(r#"(?m)(    account_id: )"[^"]*""#).unwrap();
-                            let patched = token_re
-                                .replace(&content, &format!("${{1}}\"{token}\""))
-                                .to_string();
-                            let patched = account_re
-                                .replace(&patched, &format!("${{1}}\"{account_id}\""))
-                                .to_string();
-                            if patched != content {
-                                std::fs::write(&config_path, &patched).ok();
-                                println!("✅ 已自动写入 {}", config_path.display());
-                            }
-                        }
-                    } else {
-                        println!("将以下内容写入 {}:", config_path.display());
-                        println!();
-                        println!("platforms:");
-                        println!("  weixin:");
-                        println!("    enabled: true");
-                        println!("    token: \"{token}\"");
-                        println!("    account_id: \"{account_id}\"");
-                    }
-                }
-                println!();
-                println!("现在可以运行: astra-gateway start");
-            }
-            Err(e) => {
-                tracing::error!(error = %e, "WeChat login failed");
-                std::process::exit(1);
-            }
-        }
         return;
     }
 

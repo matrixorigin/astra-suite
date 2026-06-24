@@ -564,17 +564,6 @@ cli_profiles:
         assert!(!dbg.contains("verify-secret"), "verify token leaked: {dbg}");
         assert!(!dbg.contains("app-secret"), "app secret leaked: {dbg}");
         assert!(!dbg.contains("access-secret"), "access token leaked: {dbg}");
-
-        let wa_web = crate::platforms::whatsapp_web::WhatsAppWebConfig {
-            enabled: true,
-            bridge_url: "http://127.0.0.1:8787".into(),
-            auth_token: "bridge-secret".into(),
-        };
-        let dbg = format!("{wa_web:?}");
-        assert!(
-            !dbg.contains("bridge-secret"),
-            "bridge auth token leaked: {dbg}"
-        );
     }
 
     // ── resolve_storage tests ────────────────────────────────────────────

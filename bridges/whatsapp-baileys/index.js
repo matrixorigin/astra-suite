@@ -1,19 +1,24 @@
 import makeWASocket, {
   DisconnectReason,
-  fetchLatestBaileysVersion,
   useMultiFileAuthState
 } from '@whiskeysockets/baileys'
+import { DEFAULT_CONNECTION_CONFIG } from '@whiskeysockets/baileys'
 import { HttpsProxyAgent } from 'https-proxy-agent'
-import http from 'node:http'
+import fs from 'node:fs/promises'
+import net from 'node:net'
+import os from 'node:os'
+import path from 'node:path'
 import process from 'node:process'
 import P from 'pino'
+import QRCode from 'qrcode'
 import qrcode from 'qrcode-terminal'
 
-const bridgePort = Number(process.env.BRIDGE_PORT || '8787')
-const gatewayInjectUrl = process.env.GATEWAY_INJECT_URL || 'http://127.0.0.1:9090/inject'
-const authDir = process.env.BAILEYS_AUTH_DIR || './auth'
-const authToken = process.env.BRIDGE_AUTH_TOKEN || ''
-const logLevel = process.env.LOG_LEVEL || 'info'
+const runDir = process.env.GATEWAY_RUN_DIR || path.join(os.homedir(), '.astra-gateway')
+const socketPath = path.join(runDir, 'whatsapp-baileys.sock')
+const authDir = path.join(runDir, 'whatsapp-auth')
+const qrDir = path.join(runDir, 'whatsapp-qr')
+const logLevel = process.env.LOG_LEVEL || 'silent'
+const loginOnce = process.argv.slice(2).includes('login')
 const proxyUrl =
   process.env.WHATSAPP_PROXY ||
   process.env.HTTPS_PROXY ||
@@ -21,10 +26,16 @@ const proxyUrl =
   process.env.HTTP_PROXY ||
   process.env.http_proxy ||
   ''
+const baileysVersion = (process.env.BAILEYS_VERSION || '')
+  .split(',')
+  .map((part) => Number(part.trim()))
+  .filter((part) => Number.isFinite(part))
 
 const logger = P({ level: logLevel })
 let sock = null
 const proxyAgent = proxyUrl ? new HttpsProxyAgent(proxyUrl) : undefined
+const jsonlClients = new Set()
+let qrCount = 0
 
 function normalizeJid(to) {
   if (!to) return ''
@@ -49,40 +60,55 @@ function extractText(message) {
   ).trim()
 }
 
-async function postJson(url, body) {
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify(body)
-  })
-  if (!res.ok) {
-    const text = await res.text().catch(() => '')
-    throw new Error(`POST ${url} failed: ${res.status} ${text}`)
+async function pushInbound(message) {
+  const event = inboundEvent(message)
+  if (!event) return
+
+  if (jsonlClients.size === 0) {
+    logger.debug({ chatId: event.chat_id, userId: event.user_id }, 'dropping inbound message: no JSONL client connected')
+    return
   }
+
+  broadcastJsonl(event)
+  logger.info({ chatId: event.chat_id, userId: event.user_id, group: event.group }, 'pushed inbound message')
 }
 
-async function injectInbound(message) {
+function inboundEvent(message) {
   const remoteJid = message.key?.remoteJid || ''
   const participant = message.key?.participant || remoteJid
   const group = remoteJid.endsWith('@g.us')
   const text = extractText(message)
-  if (!remoteJid || !text || message.key?.fromMe) return
+  if (!remoteJid || !text || message.key?.fromMe) return null
 
-  const chatId = group ? remoteJid : senderFromJid(remoteJid)
-  const userId = senderFromJid(participant)
-  await postJson(gatewayInjectUrl, {
-    platform: 'whatsapp_web',
-    chat_id: chatId,
-    user_id: userId,
+  return {
+    type: 'inbound_message',
+    chat_id: remoteJid,
+    user_id: senderFromJid(participant),
     text,
-    group
+    group,
+    msg_id: message.key?.id || ''
+  }
+}
+
+async function writeQrFiles(qr) {
+  await fs.mkdir(qrDir, { recursive: true })
+  const txtPath = path.join(qrDir, 'qr.txt')
+  const pngPath = path.join(qrDir, 'qr.png')
+  await fs.writeFile(txtPath, `${qr}\n`, 'utf8')
+  await QRCode.toFile(pngPath, qr, {
+    type: 'png',
+    margin: 2,
+    width: 512
   })
-  logger.info({ chatId, userId, group }, 'injected inbound message')
+  console.error(`QR written to ${pngPath}`)
 }
 
 async function startWhatsApp() {
   const { state, saveCreds } = await useMultiFileAuthState(authDir)
-  const { version } = await fetchLatestBaileysVersion()
+  const version = baileysVersion.length === 3
+    ? baileysVersion
+    : DEFAULT_CONNECTION_CONFIG.version
+  logger.info({ version }, 'using WhatsApp Web version')
   sock = makeWASocket({
     version,
     auth: state,
@@ -95,16 +121,24 @@ async function startWhatsApp() {
   sock.ev.on('creds.update', saveCreds)
   sock.ev.on('connection.update', ({ connection, lastDisconnect, qr }) => {
     if (qr) {
+      qrCount += 1
+      console.error(`WhatsApp QR ${qrCount === 1 ? 'received' : 'refreshed'}.`)
       qrcode.generate(qr, { small: true })
-      logger.info('scan the QR code with the WhatsApp account used as the bot')
+      writeQrFiles(qr).catch((err) => logger.error({ err }, 'failed to write QR files'))
+      console.error('Scan the QR code with the WhatsApp account used as the bot.')
     }
     if (connection === 'open') {
-      logger.info('whatsapp connected')
+      broadcastJsonl({ type: 'connection', state: 'open' })
+      console.error(loginOnce ? 'WhatsApp connected. Login complete.' : 'WhatsApp connected.')
+      if (loginOnce) {
+        process.exit(0)
+      }
     }
     if (connection === 'close') {
       const statusCode = lastDisconnect?.error?.output?.statusCode
       const shouldReconnect = statusCode !== DisconnectReason.loggedOut
       logger.warn({ statusCode, shouldReconnect }, 'whatsapp connection closed')
+      broadcastJsonl({ type: 'connection', state: 'close', status_code: statusCode, reconnect: shouldReconnect })
       if (shouldReconnect) {
         startWhatsApp().catch((err) => logger.error({ err }, 'reconnect failed'))
       } else {
@@ -117,90 +151,138 @@ async function startWhatsApp() {
     if (type !== 'notify') return
     for (const message of messages) {
       try {
-        await injectInbound(message)
+        await pushInbound(message)
       } catch (err) {
-        logger.error({ err }, 'failed to inject inbound message')
+        logger.error({ err }, 'failed to push inbound message')
       }
     }
   })
 }
 
-function readJson(req) {
-  return new Promise((resolve, reject) => {
-    let body = ''
-    req.setEncoding('utf8')
-    req.on('data', (chunk) => {
-      body += chunk
-      if (body.length > 1024 * 1024) {
-        req.destroy()
-        reject(new Error('request body too large'))
-      }
-    })
-    req.on('end', () => {
-      try {
-        resolve(body ? JSON.parse(body) : {})
-      } catch (err) {
-        reject(err)
-      }
-    })
-    req.on('error', reject)
-  })
+function writeLine(stream, value) {
+  stream.write(`${JSON.stringify(value)}\n`)
 }
 
-function writeJson(res, status, body) {
-  const encoded = JSON.stringify(body)
-  res.writeHead(status, {
-    'content-type': 'application/json',
-    'content-length': Buffer.byteLength(encoded)
-  })
-  res.end(encoded)
+function broadcastJsonl(value) {
+  for (const client of jsonlClients) {
+    writeLine(client, value)
+  }
 }
 
-function authorized(req) {
-  if (!authToken) return true
-  return req.headers.authorization === `Bearer ${authToken}`
-}
-
-function startHttpServer() {
-  const server = http.createServer(async (req, res) => {
-    if (req.method === 'GET' && req.url === '/health') {
-      writeJson(res, 200, { ok: true, connected: Boolean(sock?.user) })
-      return
-    }
-    if (req.method !== 'POST' || req.url !== '/send') {
-      writeJson(res, 404, { ok: false, error: 'not found' })
-      return
-    }
-    if (!authorized(req)) {
-      writeJson(res, 401, { ok: false, error: 'unauthorized' })
+async function handleJsonlCommand(stream, command) {
+  const id = command.id
+  try {
+    if (command.type === 'subscribe') {
+      jsonlClients.add(stream)
+      writeLine(stream, { type: 'response', id, ok: true, connected: Boolean(sock?.user) })
       return
     }
     if (!sock) {
-      writeJson(res, 503, { ok: false, error: 'whatsapp socket not ready' })
+      writeLine(stream, { type: 'response', id, ok: false, error: 'whatsapp socket not ready' })
       return
     }
-    try {
-      const body = await readJson(req)
-      const jid = normalizeJid(body.to)
-      const text = String(body.text || '')
+    if (command.type === 'send_text') {
+      const jid = normalizeJid(command.to)
+      const text = String(command.text || '')
       if (!jid || !text) {
-        writeJson(res, 400, { ok: false, error: 'to and text are required' })
+        writeLine(stream, { type: 'response', id, ok: false, error: 'to and text are required' })
         return
       }
-      await sock.sendMessage(jid, { text })
-      writeJson(res, 200, { ok: true })
-    } catch (err) {
-      logger.error({ err }, 'send failed')
-      writeJson(res, 500, { ok: false, error: String(err.message || err) })
+      const result = await sock.sendMessage(jid, { text })
+      writeLine(stream, { type: 'response', id, ok: true, message_id: result?.key?.id || '' })
+      return
     }
+    if (command.type === 'typing') {
+      const jid = normalizeJid(command.to)
+      const state = command.state === 'paused' ? 'paused' : 'composing'
+      if (!jid) {
+        writeLine(stream, { type: 'response', id, ok: false, error: 'to is required' })
+        return
+      }
+      await sock.sendPresenceUpdate(state, jid)
+      writeLine(stream, { type: 'response', id, ok: true })
+      return
+    }
+    writeLine(stream, { type: 'response', id, ok: false, error: `unknown command type: ${command.type}` })
+  } catch (err) {
+    logger.error({ err, commandType: command.type }, 'JSONL command failed')
+    writeLine(stream, { type: 'response', id, ok: false, error: String(err.message || err) })
+  }
+}
+
+async function startJsonlServer() {
+  await prepareSocketPath(socketPath)
+
+  const server = net.createServer((stream) => {
+    let buffer = ''
+    stream.setEncoding('utf8')
+    stream.on('data', (chunk) => {
+      buffer += chunk
+      let index
+      while ((index = buffer.indexOf('\n')) >= 0) {
+        const line = buffer.slice(0, index).trim()
+        buffer = buffer.slice(index + 1)
+        if (!line) continue
+        try {
+          const command = JSON.parse(line)
+          handleJsonlCommand(stream, command)
+        } catch (err) {
+          logger.warn({ err }, 'invalid JSONL command')
+          writeLine(stream, { type: 'response', ok: false, error: 'invalid json' })
+        }
+      }
+    })
+    stream.on('close', () => jsonlClients.delete(stream))
+    stream.on('error', (err) => {
+      jsonlClients.delete(stream)
+      logger.debug({ err }, 'JSONL client error')
+    })
   })
-  server.listen(bridgePort, '127.0.0.1', () => {
-    logger.info({ bridgePort, gatewayInjectUrl, authDir }, 'baileys bridge listening')
+
+  await new Promise((resolve, reject) => {
+    server.once('error', reject)
+    server.listen(socketPath, () => {
+      server.off('error', reject)
+      logger.info({ socketPath }, 'baileys JSONL socket listening')
+      resolve()
+    })
   })
 }
 
-startHttpServer()
-startWhatsApp().catch((err) => {
-  logger.error({ err }, 'failed to start whatsapp bridge')
+function canConnectSocket(target) {
+  return new Promise((resolve) => {
+    const client = net.createConnection(target)
+    client.once('connect', () => {
+      client.end()
+      resolve(true)
+    })
+    client.once('error', () => resolve(false))
+  })
+}
+
+async function prepareSocketPath(target) {
+  await fs.mkdir(path.dirname(target), { recursive: true })
+  const stat = await fs.lstat(target).catch((err) => {
+    if (err.code === 'ENOENT') return null
+    throw err
+  })
+  if (!stat) return
+  if (!stat.isSocket()) {
+    throw new Error(`socket path exists and is not a socket: ${target}`)
+  }
+  if (await canConnectSocket(target)) {
+    throw new Error(`socket already in use: ${target}`)
+  }
+  await fs.unlink(target)
+  logger.debug({ socketPath: target }, 'removed stale socket file')
+}
+
+async function main() {
+  await startJsonlServer()
+  await startWhatsApp()
+}
+
+main().catch((err) => {
+  console.error(`Failed to start WhatsApp bridge: ${err?.message || err}`)
   process.exit(1)
 })

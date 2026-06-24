@@ -86,7 +86,6 @@ make run            # start gateway (auto-inits config if missing)
 make stop           # graceful shutdown
 make restart        # stop + start
 make log            # tail -f gateway log
-make login-weixin   # WeChat QR login
 make setup          # run gateway setup script
 make clean          # remove all build artifacts
 ```

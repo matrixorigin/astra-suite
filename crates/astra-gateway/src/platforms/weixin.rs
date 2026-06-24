@@ -165,7 +165,7 @@ impl WeixinAdapter {
                 return Ok(());
             }
         }
-        Err("weixin: token required — run `astra-gateway login-weixin` to scan QR code".into())
+        Err("weixin: token required — run `astra-gateway weixin login` to scan QR code".into())
     }
 }
 
