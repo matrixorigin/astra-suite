@@ -32,7 +32,7 @@ astra-gateway init
 # Edit the file: fill AWS_BEARER_TOKEN_BEDROCK + wecom.bot_id + wecom.secret.
 
 # 3. (WeChat personal account only) Scan QR to log in
-astra-gateway login-weixin
+astra-gateway weixin login
 
 # 4. Run as a background daemon
 astra-gateway start
@@ -45,7 +45,7 @@ astra-gateway stop
 | Command                   | Description |
 |---------------------------|-------------|
 | `astra-gateway init`      | Write `~/.astra-gateway/config.yaml` (WeCom + Claude/Bedrock + SQLite, 0600) |
-| `astra-gateway login-weixin` | QR-code login for WeChat personal accounts |
+| `astra-gateway weixin login` | QR-code login for WeChat personal accounts |
 | `astra-gateway start`     | Daemonize and run in background (idempotent) |
 | `astra-gateway status`    | Show whether the daemon is running, plus paths |
 | `astra-gateway stop`      | Graceful SIGTERM, escalates to SIGKILL after 15s |

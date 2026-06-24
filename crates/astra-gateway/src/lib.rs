@@ -21,4 +21,5 @@ pub(crate) mod text;
 
 pub mod trace_model;
 pub mod weixin_media;
+pub mod whatsapp_bridge;
 pub mod workspace;

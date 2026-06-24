@@ -262,6 +262,8 @@ impl std::fmt::Debug for ProviderConfig {
 pub struct PlatformConfigs {
     pub wecom: Option<WeComConfig>,
     pub weixin: Option<crate::platforms::weixin::WeixinConfig>,
+    pub whatsapp: Option<crate::platforms::whatsapp::WhatsAppConfig>,
+    pub whatsapp_web: Option<crate::platforms::whatsapp_web::WhatsAppWebConfig>,
     pub telegram: Option<TelegramConfig>,
 }
 
@@ -547,6 +549,21 @@ cli_profiles:
             !dbg.contains("bot123:AABBCC"),
             "telegram token leaked: {dbg}"
         );
+
+        let wa = crate::platforms::whatsapp::WhatsAppConfig {
+            enabled: true,
+            bind: "0.0.0.0:8080".into(),
+            webhook_path: "/webhook/whatsapp".into(),
+            verify_token: "verify-secret".into(),
+            app_secret: "app-secret".into(),
+            access_token: "access-secret".into(),
+            phone_number_id: "123456".into(),
+            graph_base_url: "https://graph.facebook.com/v23.0".into(),
+        };
+        let dbg = format!("{wa:?}");
+        assert!(!dbg.contains("verify-secret"), "verify token leaked: {dbg}");
+        assert!(!dbg.contains("app-secret"), "app secret leaked: {dbg}");
+        assert!(!dbg.contains("access-secret"), "access token leaked: {dbg}");
     }
 
     // ── resolve_storage tests ────────────────────────────────────────────

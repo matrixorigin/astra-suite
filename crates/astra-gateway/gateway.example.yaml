@@ -274,7 +274,7 @@ action_policy:
 
 platforms:
   # ── 微信个人号 (iLink Bot API) ──
-  # First time: `astra-gateway login-weixin` to scan QR and obtain a token.
+  # First time: `astra-gateway weixin login` to scan QR and obtain a token.
   weixin:
     enabled: true
     token: ""                 # paste here or set WEIXIN_TOKEN env var
@@ -286,3 +286,22 @@ platforms:
   #   bot_id: ""              # 企微 AI Bot ID or WECOM_BOT_ID env var
   #   secret: ""              # 企微 AI Bot Secret or WECOM_SECRET env var
   #   # websocket_url: "wss://openws.work.weixin.qq.com"  # default, rarely needs changing
+
+  # ── WhatsApp Business Cloud API ──
+  # For local development, expose bind with ngrok/cloudflared and configure
+  # the resulting HTTPS URL as the Meta webhook callback.
+  # whatsapp:
+  #   enabled: true
+  #   bind: "0.0.0.0:8080"                    # or WHATSAPP_BIND
+  #   webhook_path: "/webhook/whatsapp"       # or WHATSAPP_WEBHOOK_PATH
+  #   verify_token: ""                        # or WHATSAPP_VERIFY_TOKEN
+  #   app_secret: ""                          # or WHATSAPP_APP_SECRET
+  #   access_token: ""                        # or WHATSAPP_ACCESS_TOKEN
+  #   phone_number_id: ""                     # or WHATSAPP_PHONE_NUMBER_ID
+  #   graph_base_url: "https://graph.facebook.com/v23.0"
+
+  # ── WhatsApp Web via Baileys sidecar (experimental / unofficial) ──
+  # Run `astra-gateway whatsapp login` once to scan QR and persist auth state.
+  # The gateway talks to the sidecar over a run-dir scoped Unix socket JSONL protocol.
+  # whatsapp_web:
+  #   enabled: true
