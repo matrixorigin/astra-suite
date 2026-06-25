@@ -2542,6 +2542,9 @@ impl GatewayRunner {
         if cost > 0.001 {
             stats_parts.push(format!("${cost:.3}"));
         }
+        if !self.config.response_footer {
+            stats_parts.clear();
+        }
         let progressive_delivery_len = if progressive_text_len > 0 || post_stream_final_sent {
             progressive_text_len.max(1)
         } else {
