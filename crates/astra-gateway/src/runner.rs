@@ -2598,12 +2598,6 @@ impl GatewayRunner {
             tracing::warn!(error = %e, "failed to record usage");
         }
 
-        let text = if text.is_empty() {
-            "(无回复)".to_string()
-        } else {
-            text
-        };
-
         // When progressive streaming already delivered the main content, the
         // final message is just a stats footer + action results.  Sending it
         // as a plain message (no durable outbox) avoids retry storms: if this
@@ -2614,6 +2608,9 @@ impl GatewayRunner {
             if let Some(writer) = trace_writer.as_ref() {
                 let _ = writer.complete_request().await;
             }
+            if text.is_empty() {
+                return None;
+            }
             // Delay stats footer so it doesn't visually collide with the stream closing
             tokio::time::sleep(Duration::from_secs(2)).await;
             // Stream already closed by final flush; send stats as a separate plain message
@@ -2623,6 +2620,11 @@ impl GatewayRunner {
                 text,
             ))
         } else {
+            let text = if text.is_empty() {
+                "(无回复)".to_string()
+            } else {
+                text
+            };
             Some(
                 self.outbound_response(
                     trace.as_ref(),
