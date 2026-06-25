@@ -18,6 +18,8 @@ pub struct GatewayConfig {
     pub providers: std::collections::HashMap<String, ProviderConfig>,
     /// Maximum seconds a spawned CLI may run for one gateway message.
     pub cli_timeout_secs: u64,
+    /// Whether to append token/tool/time/cost stats to chat responses.
+    pub response_footer: bool,
     pub platforms: PlatformConfigs,
     /// Directory containing user-defined skill markdown files.
     pub skills_dir: Option<String>,
@@ -69,6 +71,8 @@ struct RawGatewayConfig {
     providers: std::collections::HashMap<String, ProviderConfig>,
     #[serde(default = "default_cli_timeout_secs")]
     cli_timeout_secs: u64,
+    #[serde(default)]
+    response_footer: bool,
     #[serde(default)]
     platforms: PlatformConfigs,
     #[serde(default)]
@@ -367,6 +371,7 @@ impl TryFrom<RawGatewayConfig> for GatewayConfig {
             cli_profiles: raw.cli_profiles,
             providers: raw.providers,
             cli_timeout_secs: raw.cli_timeout_secs,
+            response_footer: raw.response_footer,
             platforms: raw.platforms,
             skills_dir: raw.skills_dir,
             session_reset: raw.session_reset,

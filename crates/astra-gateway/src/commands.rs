@@ -2817,6 +2817,7 @@ mod tests {
             cli_profiles: Default::default(),
             providers: Default::default(),
             cli_timeout_secs: 3600,
+            response_footer: false,
             platforms: Default::default(),
             skills_dir: None,
             session_reset: Default::default(),
