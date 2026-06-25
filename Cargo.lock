@@ -137,6 +137,7 @@ dependencies = [
  "hex",
  "hmac",
  "libc",
+ "md-5",
  "rand 0.9.4",
  "regex",
  "reqwest",

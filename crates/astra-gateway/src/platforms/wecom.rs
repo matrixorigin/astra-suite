@@ -5,7 +5,8 @@
 
 use super::{
     AdapterCapability, AdapterHealthEvent, AdapterHealthEventType, ChatType, FeedbackEvent,
-    InboundAttachment, InboundAttachmentKind, InboundMessage, PlatformAdapter, emit_adapter_health,
+    InboundAttachment, InboundAttachmentKind, InboundMessage, OutboundAttachment, PlatformAdapter,
+    emit_adapter_health,
 };
 use crate::config::WeComConfig;
 use crate::dedup::MessageDeduplicator;
@@ -13,21 +14,28 @@ use aes::Aes256;
 use aes::cipher::{BlockDecrypt, KeyInit};
 use async_trait::async_trait;
 use base64::Engine;
+use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
-use reqwest::header::CONTENT_DISPOSITION;
+use md5::{Digest, Md5};
+use reqwest::header::{CONTENT_DISPOSITION, CONTENT_TYPE};
 use serde_json::{Value, json};
 use std::path::PathBuf;
 use std::time::Duration;
+use tokio::net::TcpStream;
 use tokio::sync::{Mutex, mpsc};
 use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 const HEARTBEAT_INTERVAL_SECS: u64 = 30;
 const PONG_TIMEOUT_SECS: u64 = 60;
 const MAX_TEXT_LENGTH: usize = 4000;
+const MEDIA_UPLOAD_CHUNK_BYTES: usize = 512 * 1024;
+const MEDIA_UPLOAD_MAX_CHUNKS: usize = 100;
 const RECONNECT_DELAYS: &[u64] = &[2, 5, 10, 30, 60];
 const WECOM_CAPABILITIES: &[AdapterCapability] = &[
     AdapterCapability::ReceiveText,
     AdapterCapability::SendText,
+    AdapterCapability::SendAttachment,
     AdapterCapability::GroupReply,
     AdapterCapability::WebSocket,
 ];
@@ -36,11 +44,16 @@ const WECOM_CAPABILITIES: &[AdapterCapability] = &[
 struct OutboundMessage {
     chat_id: String,
     text: String,
+    attachment: Option<OutboundAttachment>,
     reply_token: Option<String>,
     stream_id: Option<String>,
     feedback_id: Option<String>,
     stream_finish: bool,
 }
+
+type WeComWs = WebSocketStream<MaybeTlsStream<TcpStream>>;
+type WeComWsWrite = SplitSink<WeComWs, Message>;
+type WeComWsRead = SplitStream<WeComWs>;
 
 pub struct WeComAdapter {
     config: WeComConfig,
@@ -173,10 +186,31 @@ impl PlatformAdapter for WeComAdapter {
             .send(OutboundMessage {
                 chat_id: chat_id.to_string(),
                 text,
+                attachment: None,
                 reply_token: reply_token.map(String::from),
                 stream_id: stream_id.map(String::from),
                 feedback_id: feedback_id.map(String::from),
                 stream_finish: finish,
+            })
+            .await
+            .map_err(|e| format!("outbound channel send failed: {e}"))
+    }
+
+    async fn send_attachment(
+        &self,
+        chat_id: &str,
+        attachment: &OutboundAttachment,
+        reply_token: Option<&str>,
+    ) -> Result<(), String> {
+        self.out_tx
+            .send(OutboundMessage {
+                chat_id: chat_id.to_string(),
+                text: String::new(),
+                attachment: Some(attachment.clone()),
+                reply_token: reply_token.map(String::from),
+                stream_id: None,
+                feedback_id: None,
+                stream_finish: true,
             })
             .await
             .map_err(|e| format!("outbound channel send failed: {e}"))
@@ -254,21 +288,12 @@ async fn run_wecom_connection(
                     ));
                     return Err("wecom outbound channel closed".into());
                 };
-                let frame = build_send_frame(&bot_id, &out);
-                tracing::debug!(
-                    cmd = frame["cmd"].as_str().unwrap_or("?"),
-                    finish = %frame["body"]["stream"]["finish"],
-                    feedback = frame["body"]["stream"]["feedback"]["id"].as_str().is_some()
-                        || frame["body"]["feedback"]["id"].as_str().is_some(),
-                    content_len = out.text.len(),
-                    "wecom outbound frame"
-                );
-                match ws_write.send(Message::Text(frame.to_string().into())).await {
-                    Ok(()) => {
+                match send_wecom_outbound(&bot_id, out, &mut ws_write, &mut ws_read, msg_tx, &mut dedup, &mut last_recv).await {
+                    Ok(detail) => {
                         emit_adapter_health(AdapterHealthEvent::new(
                             "wecom",
                             AdapterHealthEventType::SendAck,
-                            Some(out.chat_id),
+                            Some(detail),
                         ));
                     }
                     Err(e) => {
@@ -330,6 +355,217 @@ async fn run_wecom_connection(
     }
 }
 
+async fn send_wecom_outbound(
+    bot_id: &str,
+    mut out: OutboundMessage,
+    ws_write: &mut WeComWsWrite,
+    ws_read: &mut WeComWsRead,
+    msg_tx: &mpsc::Sender<InboundMessage>,
+    dedup: &mut MessageDeduplicator,
+    last_recv: &mut tokio::time::Instant,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    if let Some(attachment) = out.attachment.as_mut()
+        && attachment.media_id.is_none()
+    {
+        let media_id =
+            upload_wecom_media(attachment, ws_write, ws_read, msg_tx, dedup, last_recv).await?;
+        attachment.media_id = Some(media_id);
+    }
+
+    let frame = build_send_frame(bot_id, &out);
+    tracing::debug!(
+        cmd = frame["cmd"].as_str().unwrap_or("?"),
+        finish = %frame["body"]["stream"]["finish"],
+        feedback = frame["body"]["stream"]["feedback"]["id"].as_str().is_some()
+            || frame["body"]["feedback"]["id"].as_str().is_some(),
+        content_len = out.text.len(),
+        attachment = out.attachment.is_some(),
+        "wecom outbound frame"
+    );
+    ws_write
+        .send(Message::Text(frame.to_string().into()))
+        .await?;
+    Ok(out.chat_id)
+}
+
+async fn upload_wecom_media(
+    attachment: &OutboundAttachment,
+    ws_write: &mut WeComWsWrite,
+    ws_read: &mut WeComWsRead,
+    msg_tx: &mpsc::Sender<InboundMessage>,
+    dedup: &mut MessageDeduplicator,
+    last_recv: &mut tokio::time::Instant,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let path = attachment
+        .local_path
+        .as_deref()
+        .ok_or("attachment has no media_id or local_path")?;
+    let bytes = tokio::fs::read(path).await?;
+    let filename = attachment
+        .name
+        .clone()
+        .or_else(|| {
+            std::path::Path::new(path)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| "attachment".to_string());
+    let filename = ensure_attachment_extension(
+        &filename,
+        attachment.mime_type.as_deref(),
+        attachment.kind,
+        &bytes,
+    );
+    let media_type = wecom_media_type(attachment.kind);
+    let total_chunks = bytes.len().div_ceil(MEDIA_UPLOAD_CHUNK_BYTES);
+    if total_chunks == 0 {
+        return Err("cannot upload empty attachment".into());
+    }
+    if total_chunks > MEDIA_UPLOAD_MAX_CHUNKS {
+        return Err(format!("attachment too large for WeCom upload: {total_chunks} chunks").into());
+    }
+    let md5 = hex::encode(Md5::digest(&bytes));
+    tracing::info!(
+        media_type,
+        filename,
+        bytes = bytes.len(),
+        chunks = total_chunks,
+        "uploading wecom media"
+    );
+
+    let init_req_id = format!("aibot_upload_media_init-{}", uuid::Uuid::new_v4());
+    let init = json!({
+        "cmd": "aibot_upload_media_init",
+        "headers": {"req_id": init_req_id},
+        "body": {
+            "type": media_type,
+            "filename": &filename,
+            "total_size": bytes.len(),
+            "total_chunks": total_chunks,
+            "md5": md5,
+        }
+    });
+    let init_reply = send_frame_and_wait(
+        ws_write,
+        ws_read,
+        init,
+        &init_req_id,
+        msg_tx,
+        dedup,
+        last_recv,
+    )
+    .await?;
+    let upload_id = init_reply["upload_id"]
+        .as_str()
+        .ok_or_else(|| format!("upload init missing upload_id: {init_reply}"))?
+        .to_string();
+
+    for (chunk_index, chunk) in bytes.chunks(MEDIA_UPLOAD_CHUNK_BYTES).enumerate() {
+        let req_id = format!("aibot_upload_media_chunk-{}", uuid::Uuid::new_v4());
+        let frame = json!({
+            "cmd": "aibot_upload_media_chunk",
+            "headers": {"req_id": req_id},
+            "body": {
+                "upload_id": upload_id,
+                "chunk_index": chunk_index,
+                "base64_data": base64::engine::general_purpose::STANDARD.encode(chunk),
+            }
+        });
+        let _ = send_frame_and_wait(ws_write, ws_read, frame, &req_id, msg_tx, dedup, last_recv)
+            .await?;
+    }
+
+    let finish_req_id = format!("aibot_upload_media_finish-{}", uuid::Uuid::new_v4());
+    let finish = json!({
+        "cmd": "aibot_upload_media_finish",
+        "headers": {"req_id": finish_req_id},
+        "body": {"upload_id": upload_id}
+    });
+    let finish_reply = send_frame_and_wait(
+        ws_write,
+        ws_read,
+        finish,
+        &finish_req_id,
+        msg_tx,
+        dedup,
+        last_recv,
+    )
+    .await?;
+    let media_id = finish_reply["media_id"]
+        .as_str()
+        .ok_or_else(|| format!("upload finish missing media_id: {finish_reply}"))?
+        .to_string();
+    tracing::info!(media_type, "wecom media upload complete");
+    Ok(media_id)
+}
+
+async fn send_frame_and_wait(
+    ws_write: &mut WeComWsWrite,
+    ws_read: &mut WeComWsRead,
+    frame: Value,
+    target_req_id: &str,
+    msg_tx: &mpsc::Sender<InboundMessage>,
+    dedup: &mut MessageDeduplicator,
+    last_recv: &mut tokio::time::Instant,
+) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+    let cmd = frame["cmd"].as_str().unwrap_or("?").to_string();
+    ws_write
+        .send(Message::Text(frame.to_string().into()))
+        .await?;
+
+    let deadline = tokio::time::sleep(Duration::from_secs(30));
+    tokio::pin!(deadline);
+    loop {
+        tokio::select! {
+            _ = &mut deadline => {
+                return Err(format!("wecom {cmd} timed out waiting for req_id {target_req_id}").into());
+            }
+            msg = ws_read.next() => {
+                match msg {
+                    Some(Ok(Message::Text(text))) => {
+                        *last_recv = tokio::time::Instant::now();
+                        let Ok(data) = serde_json::from_str::<Value>(&text) else {
+                            continue;
+                        };
+                        let req_id = data["headers"]["req_id"].as_str().unwrap_or("");
+                        if req_id == target_req_id {
+                            let body = data["body"].clone();
+                            let errcode = body["errcode"]
+                                .as_i64()
+                                .or_else(|| data["errcode"].as_i64())
+                                .unwrap_or(0);
+                            if errcode != 0 {
+                                let errmsg = body["errmsg"]
+                                    .as_str()
+                                    .or_else(|| data["errmsg"].as_str())
+                                    .unwrap_or("unknown");
+                                return Err(format!("wecom {cmd} failed: {errcode}: {errmsg}").into());
+                            }
+                            return Ok(body);
+                        }
+                        handle_wecom_message(&data, msg_tx, dedup).await;
+                    }
+                    Some(Ok(Message::Close(_))) | None => {
+                        return Err("wecom websocket closed while waiting for upload ack".into());
+                    }
+                    Some(Err(e)) => return Err(format!("wecom ws error while waiting for upload ack: {e}").into()),
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
+fn wecom_media_type(kind: InboundAttachmentKind) -> &'static str {
+    match kind {
+        InboundAttachmentKind::Image => "image",
+        InboundAttachmentKind::File | InboundAttachmentKind::Unknown => "file",
+        InboundAttachmentKind::Video => "video",
+        InboundAttachmentKind::Audio => "voice",
+    }
+}
+
 async fn wait_reconnect_delay(
     delay: std::time::Duration,
     shutdown: &mut tokio::sync::broadcast::Receiver<()>,
@@ -341,6 +577,9 @@ async fn wait_reconnect_delay(
 }
 
 fn build_send_frame(bot_id: &str, out: &OutboundMessage) -> Value {
+    if let Some(attachment) = out.attachment.as_ref() {
+        return build_attachment_send_frame(bot_id, out, attachment);
+    }
     if let (Some(req_id), Some(stream_id)) = (&out.reply_token, &out.stream_id) {
         // Streaming reply (full-replacement semantics)
         let mut stream = json!({
@@ -390,6 +629,52 @@ fn build_send_frame(bot_id: &str, out: &OutboundMessage) -> Value {
             text_len = out.text.len(),
             "wecom: dropping message, no chat_id or reply_token"
         );
+        json!({"cmd": "noop"})
+    }
+}
+
+fn build_attachment_send_frame(
+    bot_id: &str,
+    out: &OutboundMessage,
+    attachment: &OutboundAttachment,
+) -> Value {
+    let Some(media_id) = attachment.media_id.as_deref() else {
+        tracing::warn!("wecom: dropping attachment send without media_id");
+        return json!({"cmd": "noop"});
+    };
+    let (msgtype, field) = match attachment.kind {
+        InboundAttachmentKind::Image => ("image", "image"),
+        InboundAttachmentKind::File | InboundAttachmentKind::Unknown => ("file", "file"),
+        InboundAttachmentKind::Video => ("video", "video"),
+        InboundAttachmentKind::Audio => ("voice", "voice"),
+    };
+
+    let mut body = json!({
+        "msgtype": msgtype,
+        field: {"media_id": media_id}
+    });
+    if let InboundAttachmentKind::Video = attachment.kind
+        && let Some(name) = attachment.name.as_deref()
+    {
+        body[field]["title"] = json!(name);
+    }
+
+    if let Some(ref req_id) = out.reply_token {
+        json!({
+            "cmd": "aibot_respond_msg",
+            "headers": {"req_id": req_id},
+            "body": body
+        })
+    } else if !out.chat_id.is_empty() {
+        body["bot_id"] = json!(bot_id);
+        body["chatid"] = json!(&out.chat_id);
+        json!({
+            "cmd": "aibot_send_msg",
+            "headers": {"req_id": format!("send-{}", uuid::Uuid::new_v4())},
+            "body": body
+        })
+    } else {
+        tracing::warn!("wecom: dropping attachment, no chat_id or reply_token");
         json!({"cmd": "noop"})
     }
 }
@@ -638,6 +923,14 @@ async fn download_wecom_attachments(attachments: &mut [InboundAttachment], msg_i
                 .get(CONTENT_DISPOSITION)
                 .and_then(|v| v.to_str().ok()),
         );
+        let content_type = response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|value| value.split(';').next())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
         let raw_bytes = match response.bytes().await {
             Ok(bytes) if bytes.len() as u64 <= MAX_ATTACHMENT_BYTES => bytes,
             Ok(bytes) => {
@@ -673,6 +966,9 @@ async fn download_wecom_attachments(attachments: &mut [InboundAttachment], msg_i
         }
         if attachment.name.is_none() {
             attachment.name = filename;
+        }
+        if attachment.mime_type.is_none() {
+            attachment.mime_type = content_type;
         }
         let filename = attachment_filename(attachment, idx);
         let path = dir.join(filename);
@@ -780,12 +1076,68 @@ fn attachment_filename(attachment: &InboundAttachment, idx: usize) -> String {
     if base.contains('.') {
         return base;
     }
+    if let Some(ext) = attachment_extension(attachment.mime_type.as_deref(), attachment.kind, &[]) {
+        return format!("{base}.{ext}");
+    }
     match attachment.kind {
         InboundAttachmentKind::Image => format!("{base}.image"),
         InboundAttachmentKind::File => base,
         InboundAttachmentKind::Video => format!("{base}.video"),
         InboundAttachmentKind::Audio => format!("{base}.audio"),
         InboundAttachmentKind::Unknown => base,
+    }
+}
+
+fn ensure_attachment_extension(
+    filename: &str,
+    mime_type: Option<&str>,
+    kind: InboundAttachmentKind,
+    bytes: &[u8],
+) -> String {
+    if filename.contains('.') {
+        return filename.to_string();
+    }
+    match attachment_extension(mime_type, kind, bytes) {
+        Some(ext) => format!("{filename}.{ext}"),
+        None => filename.to_string(),
+    }
+}
+
+fn attachment_extension(
+    mime_type: Option<&str>,
+    kind: InboundAttachmentKind,
+    bytes: &[u8],
+) -> Option<&'static str> {
+    let mime = mime_type.unwrap_or("").trim().to_ascii_lowercase();
+    match mime.as_str() {
+        "text/html" | "application/xhtml+xml" => return Some("html"),
+        "application/pdf" => return Some("pdf"),
+        "image/png" => return Some("png"),
+        "image/jpeg" | "image/jpg" => return Some("jpg"),
+        "image/gif" => return Some("gif"),
+        "image/webp" => return Some("webp"),
+        "text/plain" => return Some("txt"),
+        _ => {}
+    }
+    if bytes.starts_with(b"%PDF-") {
+        return Some("pdf");
+    }
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return Some("png");
+    }
+    if bytes.starts_with(b"\xff\xd8\xff") {
+        return Some("jpg");
+    }
+    let sample_len = bytes.len().min(512);
+    let sample = String::from_utf8_lossy(&bytes[..sample_len]).to_ascii_lowercase();
+    if sample.contains("<!doctype html") || sample.contains("<html") {
+        return Some("html");
+    }
+    match kind {
+        InboundAttachmentKind::Image => Some("image"),
+        InboundAttachmentKind::Video => Some("video"),
+        InboundAttachmentKind::Audio => Some("audio"),
+        InboundAttachmentKind::File | InboundAttachmentKind::Unknown => None,
     }
 }
 
@@ -1089,6 +1441,7 @@ mod tests {
         let out = OutboundMessage {
             chat_id: "chat-123".into(),
             text: "hello".into(),
+            attachment: None,
             reply_token: None,
             stream_id: None,
             feedback_id: None,
@@ -1105,6 +1458,7 @@ mod tests {
         let out = OutboundMessage {
             chat_id: "group-456".into(),
             text: "response".into(),
+            attachment: None,
             reply_token: Some("req-original".into()),
             stream_id: Some("stream-1".into()),
             feedback_id: Some("feedback-1".into()),
@@ -1123,6 +1477,7 @@ mod tests {
         let out = OutboundMessage {
             chat_id: "chat-1".into(),
             text: "response".into(),
+            attachment: None,
             reply_token: Some("req-original".into()),
             stream_id: None,
             feedback_id: Some("feedback-1".into()),
@@ -1134,6 +1489,30 @@ mod tests {
         assert_eq!(frame["body"]["msgtype"], "markdown");
         assert_eq!(frame["body"]["markdown"]["content"], "response");
         assert_eq!(frame["body"]["feedback"]["id"], "feedback-1");
+    }
+
+    #[test]
+    fn build_send_frame_attachment_respond() {
+        let out = OutboundMessage {
+            chat_id: "chat-1".into(),
+            text: String::new(),
+            attachment: Some(OutboundAttachment {
+                kind: InboundAttachmentKind::File,
+                name: Some("report.pdf".into()),
+                media_id: Some("media-file-1".into()),
+                local_path: None,
+                mime_type: Some("application/pdf".into()),
+            }),
+            reply_token: Some("req-original".into()),
+            stream_id: None,
+            feedback_id: None,
+            stream_finish: true,
+        };
+        let frame = build_send_frame("bot-1", &out);
+        assert_eq!(frame["cmd"], "aibot_respond_msg");
+        assert_eq!(frame["headers"]["req_id"], "req-original");
+        assert_eq!(frame["body"]["msgtype"], "file");
+        assert_eq!(frame["body"]["file"]["media_id"], "media-file-1");
     }
 
     #[test]
@@ -1293,6 +1672,7 @@ mod tests {
             .send(OutboundMessage {
                 chat_id: "chat-1".into(),
                 text: "wake now".into(),
+                attachment: None,
                 reply_token: None,
                 stream_id: None,
                 feedback_id: None,

@@ -7,7 +7,7 @@ use crate::cli_bridge::{self, CliProfile, CliProgress, ReasoningDisplay, Reasoni
 use crate::commands::{self, CommandContext};
 use crate::config::GatewayConfig;
 use crate::gateway_context::GatewayContext;
-use crate::platforms::{FeedbackEvent, InboundMessage, PlatformAdapter};
+use crate::platforms::{FeedbackEvent, InboundMessage, OutboundAttachment, PlatformAdapter};
 use crate::store::{self, GatewayStore};
 use crate::trace_model::{
     ConversationKey, GatewayEventKind, GatewayRequest, OutboxId, RequestId, RequestStatus,
@@ -3381,6 +3381,9 @@ impl GatewayRunner {
                                 self.handle_message_inner(&msg, &NullAdapter, None).await;
                                 continue;
                             }
+                            if echo_inbound_attachments(&adapters, &adapter_indices, &msg).await {
+                                continue;
+                            }
                             // Fast path: slash commands — instant, no CLI
                             match self.handle_fast(&msg).await {
                                 Ok(Some(text)) => {
@@ -3431,6 +3434,9 @@ impl GatewayRunner {
                             self.handle_message_inner(&msg, &NullAdapter, None).await;
                             continue;
                         }
+                        if echo_inbound_attachments(&adapters, &adapter_indices, &msg).await {
+                            continue;
+                        }
                         match self.handle_fast(&msg).await {
                             Ok(Some(text)) => {
                                 let _ = send_text_to_platform(&adapters, &adapter_indices, msg.platform, &msg.chat_id, &text, msg.reply_token.as_deref(), None, None, true).await;
@@ -3472,6 +3478,86 @@ async fn recv_from_any(adapters: &[Box<dyn PlatformAdapter>]) -> Option<AdapterR
         .collect();
     let (event, _, _) = select_all(futures).await;
     Some(event)
+}
+
+async fn echo_inbound_attachments(
+    adapters: &[Box<dyn PlatformAdapter>],
+    adapter_indices: &HashMap<&'static str, usize>,
+    msg: &InboundMessage,
+) -> bool {
+    if msg.attachments.is_empty() {
+        return false;
+    }
+
+    tracing::info!(
+        platform = msg.platform,
+        chat_id = %safe_id(&msg.chat_id),
+        count = msg.attachments.len(),
+        "echoing inbound attachments"
+    );
+
+    for attachment in &msg.attachments {
+        let outbound = OutboundAttachment::from(attachment);
+        let name = outbound
+            .name
+            .as_deref()
+            .or(outbound.local_path.as_deref())
+            .unwrap_or("attachment");
+        match send_attachment_to_platform(
+            adapters,
+            adapter_indices,
+            msg.platform,
+            &msg.chat_id,
+            &outbound,
+            msg.reply_token.as_deref(),
+        )
+        .await
+        {
+            Ok(()) => {}
+            Err(error) => {
+                let text = format!("附件回显失败：{name}\n{error}");
+                let _ = send_text_to_platform(
+                    adapters,
+                    adapter_indices,
+                    msg.platform,
+                    &msg.chat_id,
+                    &text,
+                    msg.reply_token.as_deref(),
+                    None,
+                    None,
+                    true,
+                )
+                .await;
+            }
+        }
+    }
+
+    true
+}
+
+async fn send_attachment_to_platform(
+    adapters: &[Box<dyn PlatformAdapter>],
+    adapter_indices: &HashMap<&'static str, usize>,
+    platform: &str,
+    chat_id: &str,
+    attachment: &OutboundAttachment,
+    reply_token: Option<&str>,
+) -> Result<(), String> {
+    let Some(idx) = adapter_indices.get(platform).copied() else {
+        tracing::warn!(platform, chat_id = %safe_id(chat_id), "no adapter for outbound attachment");
+        return Err("no adapter for outbound attachment".into());
+    };
+    let Some(adapter) = adapters.get(idx) else {
+        tracing::warn!(platform, chat_id = %safe_id(chat_id), "adapter index missing for outbound attachment");
+        return Err("adapter index missing for outbound attachment".into());
+    };
+    adapter
+        .send_attachment(chat_id, attachment, reply_token)
+        .await
+        .map_err(|error| {
+            tracing::warn!(platform, chat_id = %safe_id(chat_id), error, "failed to send platform attachment");
+            error
+        })
 }
 
 #[allow(clippy::too_many_arguments)]

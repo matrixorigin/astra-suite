@@ -49,6 +49,7 @@ regex = { workspace = true }
 thiserror = { workspace = true }
 uuid = { workspace = true }
 hmac = "0.12"
+md-5 = "0.10"
 sha2 = "0.10"
 subtle = "2"
 

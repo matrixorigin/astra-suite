@@ -10,6 +10,7 @@ use async_trait::async_trait;
 pub enum AdapterCapability {
     ReceiveText,
     SendText,
+    SendAttachment,
     SendTyping,
     GroupReply,
     #[serde(rename = "websocket")]
@@ -23,6 +24,7 @@ impl AdapterCapability {
         match self {
             Self::ReceiveText => "receive_text",
             Self::SendText => "send_text",
+            Self::SendAttachment => "send_attachment",
             Self::SendTyping => "send_typing",
             Self::GroupReply => "group_reply",
             Self::WebSocket => "websocket",
@@ -193,6 +195,27 @@ pub struct InboundAttachment {
     pub raw: serde_json::Value,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutboundAttachment {
+    pub kind: InboundAttachmentKind,
+    pub name: Option<String>,
+    pub media_id: Option<String>,
+    pub local_path: Option<String>,
+    pub mime_type: Option<String>,
+}
+
+impl From<&InboundAttachment> for OutboundAttachment {
+    fn from(value: &InboundAttachment) -> Self {
+        Self {
+            kind: value.kind,
+            name: value.name.clone(),
+            media_id: value.media_id.clone(),
+            local_path: value.local_path.clone(),
+            mime_type: value.mime_type.clone(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InboundAttachmentKind {
     Image,
@@ -241,6 +264,14 @@ pub trait PlatformAdapter: Send + Sync + 'static {
         text: &str,
         reply_token: Option<&str>,
     ) -> Result<(), String>;
+    async fn send_attachment(
+        &self,
+        _chat_id: &str,
+        _attachment: &OutboundAttachment,
+        _reply_token: Option<&str>,
+    ) -> Result<(), String> {
+        Err("platform does not support attachment sending".into())
+    }
     /// Send a streaming chunk. Platforms that support streaming (e.g. WeCom) should
     /// override this; others fall back to send_text.
     async fn send_stream_chunk(
