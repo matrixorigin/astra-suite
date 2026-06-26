@@ -17,11 +17,9 @@ pub struct GatewayContext {
     pub has_cron: bool,
     pub has_session: bool,
     pub has_harness: bool,
-    pub has_durable_tasks: bool,
     pub model_actions_allowed: bool,
     pub cron_jobs_count: usize,
     pub cron_jobs: Vec<(String, String, String)>, // (short_id, expr, description)
-    pub active_tasks: Vec<(String, String, String, u8)>, // (short_id, name, status, progress)
     pub db_tables: Vec<String>,
     pub extra_skills: Vec<(String, String)>,
     pub current_workspace: Option<String>,
@@ -48,11 +46,9 @@ impl GatewayContext {
             has_cron: has_db,
             has_session: caps.supports_session,
             has_harness: caps.supports_harness,
-            has_durable_tasks: has_db,
             model_actions_allowed: true,
             cron_jobs_count: 0,
             cron_jobs: Vec::new(),
-            active_tasks: Vec::new(),
             db_tables: Vec::new(),
             extra_skills: Vec::new(),
             current_workspace: None,
@@ -68,11 +64,6 @@ impl GatewayContext {
     pub fn with_cron_jobs(mut self, jobs: Vec<(String, String, String)>) -> Self {
         self.cron_jobs_count = jobs.len();
         self.cron_jobs = jobs;
-        self
-    }
-
-    pub fn with_active_tasks(mut self, tasks: Vec<(String, String, String, u8)>) -> Self {
-        self.active_tasks = tasks;
         self
     }
 
@@ -120,12 +111,13 @@ impl GatewayContext {
         }
         lines.push(String::new());
         lines.push("You have gateway MCP tools available for:".into());
-        lines.push("- Scheduling tasks and reminders (gateway_cron_*)".into());
+        lines
+            .push("- Scheduling tasks and reminders (gateway_cron_*, gateway_remind_after)".into());
         lines.push("- Managing reusable skills (gateway_skills_*)".into());
-        lines.push("- Durable task tracking (gateway_tasks_*)".into());
         lines.push("- Workspace management (gateway_workspace_*)".into());
+        lines.push("- Sending local files to the current chat (gateway_send_attachment)".into());
         lines.push(String::new());
-        lines.push("Use these tools when the user asks to set reminders, schedule tasks, save procedures, check task status, or switch projects.".into());
+        lines.push("Use these tools when the user asks to set reminders, schedule tasks, save procedures, check task status, switch projects, or send files.".into());
         lines.push(String::new());
         lines.push("### User Commands (handled by gateway, not you)".into());
         lines.push(String::new());
@@ -143,7 +135,7 @@ impl GatewayContext {
                 .into(),
         );
         lines.push(
-            r#"- "提醒我X" → remind_after(exec=false); "帮我做X" → remind_after(exec=true)"#.into(),
+            r#"- "提醒我X" → gateway_remind_after(exec=false); "帮我做X" → gateway_remind_after(exec=true)"#.into(),
         );
         lines.join("\n")
     }
@@ -229,11 +221,6 @@ fn render_template(template: &str, ctx: &GatewayContext) -> String {
                     .iter()
                     .map(|(id, expr, desc)| format!("`{id}` | `{expr}` | {desc}"))
                     .collect(),
-                "active_tasks" => ctx
-                    .active_tasks
-                    .iter()
-                    .map(|(id, name, status, pct)| format!("`{id}` | {name} | {status} | {pct}%"))
-                    .collect(),
                 "available_projects" => ctx.available_projects.clone(),
                 _ => Vec::new(),
             };
@@ -283,8 +270,6 @@ fn check_condition(var: &str, ctx: &GatewayContext) -> bool {
         "has_session" => ctx.has_session,
         "has_cron" => ctx.has_cron && ctx.model_actions_allowed,
         "has_harness" => ctx.has_harness,
-        "has_durable_tasks" => ctx.has_durable_tasks && ctx.model_actions_allowed,
-        "active_tasks" => !ctx.active_tasks.is_empty(),
         "available_projects" => !ctx.available_projects.is_empty(),
         "current_workspace" => ctx.current_workspace.is_some(),
         "db_tables" => !ctx.db_tables.is_empty(),
@@ -297,6 +282,8 @@ fn check_condition(var: &str, ctx: &GatewayContext) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const LEGACY_GATEWAY_PREFIX: &str = concat!("[[", "GATE", "WAY:");
 
     #[test]
     fn template_renders_user_info() {
@@ -311,16 +298,28 @@ mod tests {
     fn template_includes_cron_when_db() {
         let ctx = GatewayContext::new("u1", "Test", "weixin", &CliProfile::default(), true);
         let prompt = ctx.to_system_prompt();
-        assert!(prompt.contains("GATEWAY:cron_add"), "missing cron action");
-        assert!(prompt.contains("Gateway Actions"), "missing section header");
+        assert!(prompt.contains("gateway_cron_add"), "missing cron MCP tool");
+        assert!(
+            prompt.contains("gateway_remind_after"),
+            "missing reminder MCP tool"
+        );
+        assert!(
+            prompt.contains("Gateway MCP Tools"),
+            "missing section header"
+        );
+        assert!(
+            !prompt.contains(LEGACY_GATEWAY_PREFIX),
+            "must not expose legacy syntax"
+        );
     }
 
     #[test]
     fn template_excludes_cron_without_db() {
         let ctx = GatewayContext::new("u1", "Test", "weixin", &CliProfile::default(), false);
         let prompt = ctx.to_system_prompt();
-        assert!(!prompt.contains("Gateway Actions"));
-        assert!(!prompt.contains("GATEWAY:cron_add"));
+        assert!(!prompt.contains("Gateway MCP Tools"));
+        assert!(!prompt.contains("gateway_cron_add"));
+        assert!(!prompt.contains(LEGACY_GATEWAY_PREFIX));
     }
 
     #[test]
@@ -368,7 +367,8 @@ mod tests {
     fn template_response_guidelines() {
         let ctx = GatewayContext::new("u1", "Test", "weixin", &CliProfile::default(), true);
         let prompt = ctx.to_system_prompt();
-        assert!(prompt.contains("You CAN set reminders"));
+        assert!(prompt.contains("Use gateway MCP tools"));
+        assert!(prompt.contains("gateway MCP tools"));
     }
 
     #[test]
@@ -466,47 +466,10 @@ fn extra_skills_appended_to_prompt() {
 }
 
 #[test]
-fn template_includes_durable_tasks_when_db() {
-    let ctx = GatewayContext::new("u1", "Test", "weixin", &CliProfile::default(), true);
-    let prompt = ctx.to_system_prompt();
-    assert!(prompt.contains("Durable Tasks"));
-    assert!(prompt.contains("dtask_create"));
-}
-
-#[test]
-fn template_excludes_durable_tasks_without_db() {
-    let ctx = GatewayContext::new("u1", "Test", "weixin", &CliProfile::default(), false);
-    let prompt = ctx.to_system_prompt();
-    assert!(!prompt.contains("Durable Tasks"));
-}
-
-#[test]
-fn template_hides_model_generated_actions_when_policy_disallows() {
+fn template_hides_gateway_tools_when_policy_disallows() {
     let ctx = GatewayContext::new("u1", "Test", "weixin", &CliProfile::default(), true)
         .with_model_actions_allowed(false);
     let prompt = ctx.to_system_prompt();
-    assert!(!prompt.contains("GATEWAY:cron_add"));
-    assert!(!prompt.contains("dtask_create"));
-}
-
-#[test]
-fn active_tasks_in_prompt() {
-    let ctx = GatewayContext::new("u1", "Test", "weixin", &CliProfile::default(), true)
-        .with_active_tasks(vec![(
-            "abc12345".into(),
-            "weekly report".into(),
-            "running".into(),
-            50,
-        )]);
-    let prompt = ctx.to_system_prompt();
-    assert!(prompt.contains("abc12345"), "should show task ID");
-    assert!(prompt.contains("weekly report"), "should show task name");
-    assert!(prompt.contains("50%"), "should show progress");
-}
-
-#[test]
-fn no_active_tasks_no_section() {
-    let ctx = GatewayContext::new("u1", "Test", "weixin", &CliProfile::default(), true);
-    let prompt = ctx.to_system_prompt();
-    assert!(!prompt.contains("Current durable tasks"));
+    assert!(!prompt.contains("gateway_cron_add"));
+    assert!(!prompt.contains(concat!("[[", "GATE", "WAY:")));
 }

@@ -13,12 +13,13 @@
 //!       account_id: ""         # from QR login (ilink_bot_id), or WEIXIN_ACCOUNT_ID env
 
 use super::{
-    AdapterCapability, AdapterHealthEvent, AdapterHealthEventType, ChatType, InboundMessage,
-    PlatformAdapter, emit_adapter_health,
+    AdapterCapability, AdapterHealthEvent, AdapterHealthEventType, AttachmentKind, ChatType,
+    InboundMessage, OutboundAttachment, PlatformAdapter, emit_adapter_health,
 };
 use crate::dedup::MessageDeduplicator;
 use crate::store::GatewayStore;
 use async_trait::async_trait;
+use md5::{Digest, Md5};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -34,9 +35,13 @@ const MAX_RESTORED_TOKEN_LEN: usize = 8192;
 const MAX_RESTORED_ID_LEN: usize = 512;
 const MAX_RESTORED_SYNC_BUF_LEN: usize = 64 * 1024;
 const MAX_RESTORED_CONTEXT_TOKENS: usize = 4096;
+const ITEM_IMAGE: i64 = 2;
+const ITEM_FILE: i64 = 4;
+const ITEM_VIDEO: i64 = 5;
 const WEIXIN_CAPABILITIES: &[AdapterCapability] = &[
     AdapterCapability::ReceiveText,
     AdapterCapability::SendText,
+    AdapterCapability::SendAttachment,
     AdapterCapability::SendTyping,
     AdapterCapability::LongPoll,
     AdapterCapability::PersistentState,
@@ -473,6 +478,42 @@ impl PlatformAdapter for WeixinAdapter {
                         tracing::warn!(
                             chat_id = %crate::runner::truncate_chars(chat_id, 12),
                             "evicted dead context_token after fatal send"
+                        );
+                    }
+                }
+                Err(e)
+            }
+        }
+    }
+
+    async fn send_attachment(
+        &self,
+        chat_id: &str,
+        attachment: &OutboundAttachment,
+        _reply_token: Option<&str>,
+    ) -> Result<(), String> {
+        let context_token = {
+            let tokens = self.context_tokens.lock().await;
+            tokens.get(chat_id).cloned().unwrap_or_default()
+        };
+
+        match send_attachment_with_retry(&self.config.token, chat_id, attachment, &context_token)
+            .await
+        {
+            Ok(new_ct) => {
+                if let Some(ct) = new_ct {
+                    let mut tokens = self.context_tokens.lock().await;
+                    tokens.insert(chat_id.to_string(), ct);
+                }
+                Ok(())
+            }
+            Err(e) => {
+                if e.starts_with(FATAL_SEND_ERROR_PREFIX) {
+                    let mut tokens = self.context_tokens.lock().await;
+                    if tokens.remove(chat_id).is_some() {
+                        tracing::warn!(
+                            chat_id = %crate::runner::truncate_chars(chat_id, 12),
+                            "evicted dead context_token after fatal attachment send"
                         );
                     }
                 }
@@ -989,6 +1030,344 @@ async fn send_text_with_retry(
     Err(format!("weixin send failed after retries: {last_error}"))
 }
 
+async fn send_attachment_with_retry(
+    token: &str,
+    chat_id: &str,
+    attachment: &OutboundAttachment,
+    context_token: &str,
+) -> Result<Option<String>, String> {
+    let path = attachment.required_local_path("weixin")?;
+    let raw = tokio::fs::read(path)
+        .await
+        .map_err(|e| format!("read attachment `{}`: {e}", path.display()))?;
+    if raw.is_empty() {
+        return Err("cannot send empty attachment".into());
+    }
+
+    let filename = attachment.filename_or_default(path, "attachment");
+    let spec = WeixinMediaSpec::for_kind(attachment.kind);
+    let media = upload_weixin_media(token, chat_id, spec, &filename, &raw).await?;
+    let item = build_weixin_media_item(spec, &filename, raw.len(), &media);
+    send_weixin_item_with_retry(token, chat_id, context_token, spec, item).await
+}
+
+struct WeixinUploadedMedia {
+    media: Value,
+    thumb_media: Option<Value>,
+    encrypted_size: usize,
+    thumb_encrypted_size: Option<usize>,
+}
+
+#[derive(Clone, Copy)]
+struct WeixinMediaSpec {
+    media_type: i64,
+    item_type: i64,
+    item_key: &'static str,
+    size_key: Option<&'static str>,
+    include_filename: bool,
+    include_thumb: bool,
+    include_thumb_dimensions: bool,
+}
+
+impl WeixinMediaSpec {
+    const fn for_kind(kind: AttachmentKind) -> Self {
+        match kind {
+            AttachmentKind::Image => Self {
+                media_type: 1,
+                item_type: ITEM_IMAGE,
+                item_key: "image_item",
+                size_key: Some("mid_size"),
+                include_filename: false,
+                include_thumb: true,
+                include_thumb_dimensions: true,
+            },
+            AttachmentKind::Video => Self {
+                media_type: 2,
+                item_type: ITEM_VIDEO,
+                item_key: "video_item",
+                size_key: Some("video_size"),
+                include_filename: false,
+                include_thumb: true,
+                include_thumb_dimensions: false,
+            },
+            AttachmentKind::Audio | AttachmentKind::File | AttachmentKind::Unknown => Self {
+                media_type: 3,
+                item_type: ITEM_FILE,
+                item_key: "file_item",
+                size_key: None,
+                include_filename: true,
+                include_thumb: false,
+                include_thumb_dimensions: false,
+            },
+        }
+    }
+}
+
+async fn upload_weixin_media(
+    token: &str,
+    chat_id: &str,
+    spec: WeixinMediaSpec,
+    filename: &str,
+    raw: &[u8],
+) -> Result<WeixinUploadedMedia, String> {
+    let client = reqwest::Client::new();
+    let filekey = crate::weixin_media::random_filekey();
+    let aes_key = crate::weixin_media::random_aes_key();
+    let encrypted_size = crate::weixin_media::aes_padded_size(raw.len());
+    let thumb_raw = if spec.include_thumb { raw } else { &[][..] };
+    let thumb_encrypted_size = spec
+        .include_thumb
+        .then(|| crate::weixin_media::aes_padded_size(raw.len()));
+    let mut body = json!({
+        "filekey": filekey,
+        "media_type": spec.media_type,
+        "to_user_id": chat_id,
+        "rawsize": raw.len(),
+        "rawfilemd5": hex::encode(Md5::digest(raw)),
+        "filesize": encrypted_size,
+        "no_need_thumb": !spec.include_thumb,
+        "aeskey": hex::encode(aes_key),
+        "base_info": {"channel_version": CHANNEL_VERSION}
+    });
+    if spec.include_thumb {
+        body["thumb_rawsize"] = json!(thumb_raw.len());
+        body["thumb_rawfilemd5"] = json!(hex::encode(Md5::digest(thumb_raw)));
+        body["thumb_filesize"] = json!(thumb_encrypted_size.unwrap_or(encrypted_size));
+    }
+
+    let upload_config: Value = client
+        .post(format!("{ILINK_BASE_URL}/ilink/bot/getuploadurl"))
+        .headers(build_headers(token))
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("getuploadurl HTTP error: {e}"))?
+        .json()
+        .await
+        .map_err(|e| format!("getuploadurl parse error: {e}"))?;
+    let errcode = upload_config["errcode"]
+        .as_i64()
+        .or_else(|| upload_config["ret"].as_i64())
+        .unwrap_or(0);
+    if errcode != 0 {
+        let errmsg = upload_config["errmsg"].as_str().unwrap_or("unknown");
+        return Err(format!("getuploadurl failed: {errcode}: {errmsg}"));
+    }
+
+    let upload_param = upload_config["upload_param"].as_str().unwrap_or("");
+    let upload_url = upload_config["upload_full_url"].as_str().unwrap_or("");
+    if upload_param.is_empty() && upload_url.is_empty() {
+        return Err(format!("getuploadurl missing upload URL: {upload_config}"));
+    }
+    let media =
+        upload_weixin_cdn(&client, &filekey, upload_param, upload_url, raw, &aes_key).await?;
+
+    let thumb_media = if spec.include_thumb {
+        let thumb_param = upload_config["thumb_upload_param"].as_str().unwrap_or("");
+        let thumb_url = upload_config["thumb_upload_full_url"]
+            .as_str()
+            .unwrap_or("");
+        if thumb_param.is_empty() && thumb_url.is_empty() {
+            Some(media.clone())
+        } else {
+            Some(
+                upload_weixin_cdn(
+                    &client,
+                    &filekey,
+                    thumb_param,
+                    thumb_url,
+                    thumb_raw,
+                    &aes_key,
+                )
+                .await?,
+            )
+        }
+    } else {
+        None
+    };
+
+    tracing::info!(
+        platform = "weixin",
+        media_type = spec.media_type,
+        filename,
+        bytes = raw.len(),
+        "weixin media upload complete"
+    );
+    Ok(WeixinUploadedMedia {
+        media,
+        thumb_media,
+        encrypted_size,
+        thumb_encrypted_size,
+    })
+}
+
+async fn upload_weixin_cdn(
+    client: &reqwest::Client,
+    filekey: &str,
+    upload_param: &str,
+    upload_url: &str,
+    raw: &[u8],
+    aes_key: &[u8; 16],
+) -> Result<Value, String> {
+    let url = if upload_url.trim().is_empty() {
+        crate::weixin_media::cdn_upload_url(upload_param, filekey)
+    } else {
+        upload_url.to_string()
+    };
+    let encrypted = crate::weixin_media::aes128_ecb_encrypt(raw, aes_key);
+    let mut last_error = String::new();
+    for attempt in 0..3 {
+        let response = client
+            .post(&url)
+            .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
+            .body(encrypted.clone())
+            .send()
+            .await;
+        let response = match response {
+            Ok(response) => response,
+            Err(e) => {
+                last_error = format!("CDN upload HTTP error: {e}");
+                continue;
+            }
+        };
+        if !response.status().is_success() {
+            last_error = format!("CDN upload failed: {}", response.status());
+            if response.status().is_client_error() || attempt == 2 {
+                break;
+            }
+            continue;
+        }
+        let encrypted_param = response
+            .headers()
+            .get("x-encrypted-param")
+            .and_then(|value| value.to_str().ok())
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .ok_or_else(|| "CDN upload response missing x-encrypted-param".to_string())?;
+        return Ok(json!({
+            "encrypt_query_param": encrypted_param,
+            "aes_key": crate::weixin_media::encode_aes_key_for_api(aes_key),
+            "encrypt_type": 1
+        }));
+    }
+    Err(last_error)
+}
+
+async fn send_weixin_item_with_retry(
+    token: &str,
+    chat_id: &str,
+    context_token: &str,
+    spec: WeixinMediaSpec,
+    item: Value,
+) -> Result<Option<String>, String> {
+    let client = reqwest::Client::new();
+    let url = format!("{ILINK_BASE_URL}/ilink/bot/sendmessage");
+    let mut last_error = String::new();
+    let mut tried_tokenless = false;
+
+    for attempt in 0..=SEND_MAX_RETRIES {
+        let ct = if tried_tokenless { "" } else { context_token };
+        let client_id = format!("astra-gw-{}", uuid::Uuid::new_v4());
+        let body = json!({
+            "msg": {
+                "from_user_id": "",
+                "to_user_id": chat_id,
+                "client_id": client_id,
+                "message_type": 2,
+                "message_state": 2,
+                "context_token": ct,
+                "item_list": [{"type": spec.item_type, spec.item_key: item.clone()}]
+            },
+            "base_info": {"channel_version": CHANNEL_VERSION}
+        });
+        let resp = match client
+            .post(&url)
+            .headers(build_headers(token))
+            .json(&body)
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                last_error = format!("HTTP error: {e}");
+                continue;
+            }
+        };
+        let data: Value = match resp.json().await {
+            Ok(d) => d,
+            Err(e) => {
+                last_error = format!("parse error: {e}");
+                continue;
+            }
+        };
+        let errcode = data["errcode"]
+            .as_i64()
+            .or_else(|| data["ret"].as_i64())
+            .unwrap_or(0);
+        if errcode == 0 {
+            return Ok(data["context_token"]
+                .as_str()
+                .or_else(|| data["data"]["context_token"].as_str())
+                .filter(|s| !s.is_empty())
+                .map(String::from));
+        }
+        let errmsg = data["errmsg"].as_str().unwrap_or("unknown");
+        last_error = format!("{errcode}: {errmsg}");
+        match classify_send_error(errcode, errmsg, tried_tokenless) {
+            SendRetryAction::DropContextToken => {
+                tried_tokenless = true;
+                continue;
+            }
+            SendRetryAction::RateLimitBackoff => {
+                tokio::time::sleep(std::time::Duration::from_millis(SEND_RETRY_DELAY_MS * 3)).await;
+                continue;
+            }
+            SendRetryAction::Fatal => {
+                return Err(FATAL_SEND_ERROR_PREFIX.to_string() + &format!("{errcode}: {errmsg}"));
+            }
+            SendRetryAction::NormalRetry => {}
+        }
+        if attempt < SEND_MAX_RETRIES {
+            tokio::time::sleep(std::time::Duration::from_millis(SEND_RETRY_DELAY_MS)).await;
+        }
+    }
+    Err(format!(
+        "weixin attachment send failed after retries: {last_error}"
+    ))
+}
+
+fn build_weixin_media_item(
+    spec: WeixinMediaSpec,
+    filename: &str,
+    raw_len: usize,
+    uploaded: &WeixinUploadedMedia,
+) -> Value {
+    let mut item = json!({"media": uploaded.media});
+    if spec.include_filename {
+        item["file_name"] = json!(filename);
+        item["len"] = json!(raw_len.to_string());
+    }
+    if let Some(size_key) = spec.size_key {
+        item[size_key] = json!(uploaded.encrypted_size);
+        if let Some(thumb) = uploaded.thumb_media.clone().or_else(|| {
+            spec.include_thumb_dimensions
+                .then(|| uploaded.media.clone())
+        }) {
+            item["thumb_media"] = thumb;
+            item["thumb_size"] = json!(
+                uploaded
+                    .thumb_encrypted_size
+                    .unwrap_or(uploaded.encrypted_size)
+            );
+        }
+        if spec.include_thumb_dimensions {
+            item["thumb_width"] = json!(0);
+            item["thumb_height"] = json!(0);
+        }
+    }
+    item
+}
+
 /// Prefix on Err(...) from send_text_with_retry that tells the caller this
 /// is a fatal/unrecoverable send failure (stale session that even tokenless
 /// retry couldn't resolve). The PlatformAdapter impl recognizes this prefix
@@ -1399,6 +1778,74 @@ mod tests {
     fn send_retry_constants() {
         const { assert!(SEND_MAX_RETRIES >= 2) };
         const { assert!(SEND_RETRY_DELAY_MS >= 1000) };
+    }
+
+    #[test]
+    fn capabilities_include_attachment_send() {
+        assert!(WEIXIN_CAPABILITIES.contains(&AdapterCapability::SendAttachment));
+    }
+
+    #[test]
+    fn attachment_kind_maps_to_weixin_media_and_item_types() {
+        let image = WeixinMediaSpec::for_kind(AttachmentKind::Image);
+        assert_eq!(image.media_type, 1);
+        assert_eq!(image.item_type, ITEM_IMAGE);
+        assert_eq!(image.item_key, "image_item");
+
+        let video = WeixinMediaSpec::for_kind(AttachmentKind::Video);
+        assert_eq!(video.media_type, 2);
+        assert_eq!(video.item_type, ITEM_VIDEO);
+        assert_eq!(video.item_key, "video_item");
+
+        for kind in [
+            AttachmentKind::File,
+            AttachmentKind::Audio,
+            AttachmentKind::Unknown,
+        ] {
+            let spec = WeixinMediaSpec::for_kind(kind);
+            assert_eq!(spec.media_type, 3);
+            assert_eq!(spec.item_type, ITEM_FILE);
+            assert_eq!(spec.item_key, "file_item");
+        }
+    }
+
+    #[test]
+    fn build_weixin_file_item_includes_filename_and_raw_length() {
+        let uploaded = WeixinUploadedMedia {
+            media: json!({"encrypt_type": 1}),
+            thumb_media: None,
+            encrypted_size: 32,
+            thumb_encrypted_size: None,
+        };
+        let item = build_weixin_media_item(
+            WeixinMediaSpec::for_kind(AttachmentKind::File),
+            "report.pdf",
+            123,
+            &uploaded,
+        );
+        assert_eq!(item["media"]["encrypt_type"], 1);
+        assert_eq!(item["file_name"], "report.pdf");
+        assert_eq!(item["len"], "123");
+    }
+
+    #[test]
+    fn build_weixin_image_item_includes_media_and_thumb() {
+        let uploaded = WeixinUploadedMedia {
+            media: json!({"encrypt_query_param": "main"}),
+            thumb_media: Some(json!({"encrypt_query_param": "thumb"})),
+            encrypted_size: 128,
+            thumb_encrypted_size: Some(64),
+        };
+        let item = build_weixin_media_item(
+            WeixinMediaSpec::for_kind(AttachmentKind::Image),
+            "shot.png",
+            99,
+            &uploaded,
+        );
+        assert_eq!(item["media"]["encrypt_query_param"], "main");
+        assert_eq!(item["thumb_media"]["encrypt_query_param"], "thumb");
+        assert_eq!(item["mid_size"], 128);
+        assert_eq!(item["thumb_size"], 64);
     }
 
     // ── classify_send_error regression tests ───────────────────────

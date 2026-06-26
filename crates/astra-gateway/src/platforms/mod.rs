@@ -10,6 +10,7 @@ use async_trait::async_trait;
 pub enum AdapterCapability {
     ReceiveText,
     SendText,
+    SendAttachment,
     SendTyping,
     GroupReply,
     #[serde(rename = "websocket")]
@@ -23,6 +24,7 @@ impl AdapterCapability {
         match self {
             Self::ReceiveText => "receive_text",
             Self::SendText => "send_text",
+            Self::SendAttachment => "send_attachment",
             Self::SendTyping => "send_typing",
             Self::GroupReply => "group_reply",
             Self::WebSocket => "websocket",
@@ -181,6 +183,89 @@ pub struct InboundMessage {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutboundAttachment {
+    pub kind: AttachmentKind,
+    pub name: Option<String>,
+    pub media_id: Option<String>,
+    pub local_path: Option<String>,
+    pub mime_type: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttachmentKind {
+    Image,
+    File,
+    Video,
+    Audio,
+    Unknown,
+}
+
+impl AttachmentKind {
+    pub fn from_hint(
+        kind: Option<&str>,
+        mime: Option<&str>,
+        path: Option<&std::path::Path>,
+    ) -> Self {
+        match kind
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "image" => return Self::Image,
+            "file" => return Self::File,
+            "video" => return Self::Video,
+            "audio" | "voice" => return Self::Audio,
+            _ => {}
+        }
+
+        let mime = mime.unwrap_or_default().to_ascii_lowercase();
+        if mime.starts_with("image/") {
+            return Self::Image;
+        }
+        if mime.starts_with("video/") {
+            return Self::Video;
+        }
+        if mime.starts_with("audio/") {
+            return Self::Audio;
+        }
+
+        match path
+            .and_then(|p| p.extension())
+            .and_then(|ext| ext.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "png" | "jpg" | "jpeg" | "gif" | "webp" => Self::Image,
+            "mp4" | "mov" | "webm" => Self::Video,
+            "mp3" | "wav" | "m4a" | "ogg" => Self::Audio,
+            _ => Self::File,
+        }
+    }
+}
+
+impl OutboundAttachment {
+    pub fn required_local_path(&self, platform: &str) -> Result<&std::path::Path, String> {
+        self.local_path
+            .as_deref()
+            .map(std::path::Path::new)
+            .ok_or_else(|| format!("{platform} attachment requires local_path"))
+    }
+
+    pub fn filename_or_default(&self, path: &std::path::Path, default: &str) -> String {
+        self.name
+            .clone()
+            .or_else(|| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .map(str::to_string)
+            })
+            .unwrap_or_else(|| default.to_string())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FeedbackEvent {
     /// Identifier previously sent with the AI response. For WeCom this is
     /// `stream.feedback.id`, and gateway sets it to the trace request id.
@@ -219,6 +304,17 @@ pub trait PlatformAdapter: Send + Sync + 'static {
         text: &str,
         reply_token: Option<&str>,
     ) -> Result<(), String>;
+    async fn send_attachment(
+        &self,
+        _chat_id: &str,
+        _attachment: &OutboundAttachment,
+        _reply_token: Option<&str>,
+    ) -> Result<(), String> {
+        Err(format!(
+            "{} does not support sending attachments",
+            self.name()
+        ))
+    }
     /// Send a streaming chunk. Platforms that support streaming (e.g. WeCom) should
     /// override this; others fall back to send_text.
     async fn send_stream_chunk(
@@ -261,5 +357,49 @@ mod tests {
         ));
         assert_eq!(event.platform, "weixin");
         assert_eq!(event.event_type, AdapterHealthEventType::StateInvalid);
+    }
+
+    #[test]
+    fn attachment_kind_from_hint_prefers_explicit_kind() {
+        assert_eq!(
+            AttachmentKind::from_hint(Some("voice"), Some("image/png"), None),
+            AttachmentKind::Audio
+        );
+        assert_eq!(
+            AttachmentKind::from_hint(Some("file"), Some("image/png"), None),
+            AttachmentKind::File
+        );
+    }
+
+    #[test]
+    fn attachment_kind_from_hint_uses_mime_then_extension() {
+        assert_eq!(
+            AttachmentKind::from_hint(None, Some("image/png"), None),
+            AttachmentKind::Image
+        );
+        assert_eq!(
+            AttachmentKind::from_hint(None, None, Some(std::path::Path::new("clip.webm"))),
+            AttachmentKind::Video
+        );
+        assert_eq!(
+            AttachmentKind::from_hint(None, None, Some(std::path::Path::new("report.pdf"))),
+            AttachmentKind::File
+        );
+    }
+
+    #[test]
+    fn outbound_attachment_derives_filename_from_path() {
+        let attachment = OutboundAttachment {
+            kind: AttachmentKind::File,
+            name: None,
+            media_id: None,
+            local_path: Some("/tmp/report.pdf".into()),
+            mime_type: None,
+        };
+        let path = attachment.required_local_path("test").unwrap();
+        assert_eq!(
+            attachment.filename_or_default(path, "attachment"),
+            "report.pdf"
+        );
     }
 }

@@ -707,21 +707,18 @@ pub async fn open_store(
 
 /// Everything the runner needs from the storage layer.
 ///
-/// `durable_store` and `trace_repo` are trait objects so the bundle is
-/// backend-agnostic (MySQL, MatrixOne, SQLite, …). Backends that cannot
-/// provide full gateway durability are rejected before a bundle is created.
+/// `trace_repo` is a trait object so the bundle is backend-agnostic
+/// (MySQL, MatrixOne, SQLite, …).
 pub struct StoreBundle {
     pub store: std::sync::Arc<dyn GatewayStore>,
-    pub durable_store: Option<std::sync::Arc<dyn crate::durable_task_store::DurableTaskStoreExt>>,
     pub trace_repo: Option<std::sync::Arc<dyn crate::trace_model::TraceRepository>>,
 }
 
 /// Create a [`StoreBundle`] from config — or `None` for [`StorageConfig::None`].
 ///
-/// MySQL/MatrixOne and SQLite backends provision both the durable-task store
-/// and the trace repository on top of the same connection pool. File store
-/// remains usable through [`open_store`] for local tooling/tests, but not for
-/// the gateway runner.
+/// MySQL/MatrixOne and SQLite backends provision the trace repository on top of
+/// the same connection pool. File store remains usable through [`open_store`]
+/// for local tooling/tests, but not for the gateway runner.
 pub async fn open_store_bundle(
     config: &StorageConfig,
 ) -> Result<Option<StoreBundle>, Box<dyn std::error::Error + Send + Sync>> {
@@ -732,16 +729,11 @@ pub async fn open_store_bundle(
             store.ensure_usage_table().await?;
             let pool = store.pool().clone();
 
-            let durable = std::sync::Arc::new(
-                crate::durable_task_store::MysqlDurableTaskStore::new(pool.clone()),
-            );
-
             crate::trace_model::ensure_mysql_schema(&pool).await?;
             let trace = std::sync::Arc::new(crate::trace_model::MysqlTraceRepository::new(pool));
 
             Ok(Some(StoreBundle {
                 store: std::sync::Arc::new(store),
-                durable_store: Some(durable),
                 trace_repo: Some(trace),
             }))
         }
@@ -750,20 +742,15 @@ pub async fn open_store_bundle(
             store.ensure_schema().await?;
             let pool = store.pool().clone();
 
-            let durable = std::sync::Arc::new(
-                crate::durable_task_store::SqliteDurableTaskStore::new(pool.clone()),
-            );
-
             let trace = std::sync::Arc::new(crate::trace_model::SqliteTraceRepository::new(pool));
 
             Ok(Some(StoreBundle {
                 store: std::sync::Arc::new(store),
-                durable_store: Some(durable),
                 trace_repo: Some(trace),
             }))
         }
         StorageConfig::File { .. } => Err(
-            "file storage does not support gateway durability; use storage.backend: sqlite, mysql, matrixone, or none".into(),
+            "file storage does not support gateway persistence; use storage.backend: sqlite, mysql, matrixone, or none".into(),
         ),
         StorageConfig::None => Ok(None),
     }
@@ -1045,7 +1032,7 @@ mod tests {
             Err(err) => err.to_string(),
         };
         assert!(
-            err.contains("does not support gateway durability"),
+            err.contains("does not support gateway persistence"),
             "unexpected file error: {err}"
         );
     }
@@ -1060,7 +1047,6 @@ mod tests {
             .await
             .expect("sqlite bundle must succeed")
             .expect("sqlite bundle must be Some");
-        assert!(bundle.durable_store.is_some(), "durable store missing");
         assert!(bundle.trace_repo.is_some(), "trace repo missing");
     }
 

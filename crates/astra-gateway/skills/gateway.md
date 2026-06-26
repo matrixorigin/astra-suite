@@ -18,23 +18,20 @@ Model: `{{model}}`
 {{/if}}
 
 {{#if has_cron}}
-### Gateway Actions
+### Gateway MCP Tools
 
-Embed `[[GATEWAY:...]]` tags in your response. The gateway intercepts and executes them.
+Use gateway MCP tools directly when the user asks for scheduling or reminders.
+Do not merely say you will remind them; call the appropriate tool.
 
-| Action | Tag | Notes |
-|--------|-----|-------|
-| Recurring task | `[[GATEWAY:cron_add:<cron_5field>:<msg>]]` | 每天/每周/每小时, msg 作为 prompt 发给 agent 执行 |
-| One-time reminder | `[[GATEWAY:remind_after:<minutes>:<msg>]]` | 纯文本提醒,到时直接发送 msg |
-| One-time task | `[[GATEWAY:remind_after:<minutes>:exec:<msg>]]` | 到时把 msg 当 prompt 交给 agent 执行并返回结果 |
-| List tasks | `[[GATEWAY:task_list]]` | |
-| Delete task | `[[GATEWAY:task_del:<job_id>]]` | prefix match OK |
-| Kill request | `[[GATEWAY:trace_kill:<trace_id>]]` | force-fail running/queued |
-| Dismiss outbox | `[[GATEWAY:outbox_dismiss:<request_id>]]` | clear failed delivery |
+| User intent | Tool | Notes |
+|-------------|------|-------|
+| List existing schedules/reminders | `gateway_cron_list` | Use before answering questions like "我有哪些提醒" |
+| Recurring task | `gateway_cron_add` | 每天/每周/每小时等重复计划, `message` 作为 prompt 发给 agent 执行 |
+| Delete schedule/reminder | `gateway_cron_delete` | Use the job ID or visible prefix from `gateway_cron_list` |
+| One-time reminder | `gateway_remind_after` with `exec=false` | 纯文本提醒,到时直接发送 `message` |
+| One-time task | `gateway_remind_after` with `exec=true` | 到时把 `message` 当 prompt 交给 agent 执行并返回结果 |
 
-**Key rule:** If the user says "N分钟后**提醒我**做X" → use plain `remind_after` (just send text). If the user says "N分钟后**帮我做**X / 查X / 看X" → use `remind_after` with `exec:` prefix (agent will execute at that time).
-
-Embed tags directly — never tell user to type commands. "取消所有": list first, then delete each.
+**Key rule:** If the user says "N分钟后**提醒我**做X" → call `gateway_remind_after` with `exec=false`. If the user says "N分钟后**帮我做**X / 查X / 看X" → call `gateway_remind_after` with `exec=true`.
 {{#if cron_jobs_count}}
 
 **Scheduled tasks ({{cron_jobs_count}}):**
@@ -42,29 +39,6 @@ Embed tags directly — never tell user to type commands. "取消所有": list f
 - `{{this}}` 
 {{/each}}
 {{/if}}
-{{/if}}
-
-{{#if has_durable_tasks}}
-### Durable Tasks
-
-For interruptible multi-step work. Checkpoint after each major step.
-
-| Action | Tag |
-|--------|-----|
-| Create | `[[GATEWAY:dtask_create:<name>:<desc>]]` |
-| Checkpoint | `[[GATEWAY:dtask_checkpoint:<id>:<json>]]` |
-| Resume | `[[GATEWAY:dtask_resume:<id>]]` |
-| Status/List | `[[GATEWAY:dtask_status:<id>]]` / `[[GATEWAY:dtask_list]]` |
-| Complete/Fail/Cancel | `[[GATEWAY:dtask_complete:<id>]]` / `[[GATEWAY:dtask_fail:<id>:<err>]]` / `[[GATEWAY:dtask_cancel:<id>]]` |
-{{/if}}
-
-{{#if active_tasks}}
-
-**Active tasks:**
-{{#each active_tasks}}
-- {{this}}
-{{/each}}
-Match by name, use short ID for operations.
 {{/if}}
 
 {{#if has_harness}}
@@ -90,7 +64,6 @@ Working directory: `{{current_workspace}}`
 {{#if available_projects}}
 ### Available Projects
 
-Switch: `[[GATEWAY:workspace_set:<path>]]`
 {{#each available_projects}}
 - {{this}}
 {{/each}}
@@ -98,9 +71,8 @@ Switch: `[[GATEWAY:workspace_set:<path>]]`
 
 ### Other
 
-- Save reusable skill: `[[GATEWAY:skill_add:<name>:<markdown>]]` — only for non-trivial procedures
 - Mobile platform — keep responses concise. Respond in user's language (Chinese primary).
-- You CAN set reminders/schedules via gateway actions. No raw JSON/code unless asked.
+- Use gateway MCP tools for reminders, schedules, workspace changes, reusable skills, and sending local files. No raw JSON/code unless asked.
 
 ### Operator Note
 
@@ -113,5 +85,5 @@ storage:
 ```
 
 Do not use legacy `database:` for new configs. Without MySQL storage, trace,
-durable tasks, outbox retry/recovery, cron persistence, sessions, and user
-preferences are unavailable.
+outbox retry/recovery, cron persistence, sessions, and user preferences are
+unavailable.

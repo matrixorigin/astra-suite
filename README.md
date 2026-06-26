@@ -25,7 +25,6 @@ Claude Code · Codex · Astra · Custom CLI
 - **Zero-config start** — SQLite storage, 3 commands to deploy
 - **Multi-backend** — switch between Claude, Codex, Astra at runtime (`/cli`, `/model`)
 - **Autonomous scheduling** — cron jobs that invoke the agent ("每晚 10 点检查 PR 列表并总结")
-- **Durable tasks** — long-running jobs with checkpoint/resume, crash recovery
 - **Full observability** — per-request trace, audit chain, durable outbox with retry
 - **Multi-user** — per-user sessions, access control, group chat isolation
 
@@ -59,8 +58,7 @@ See [`crates/astra-gateway/README.md`](crates/astra-gateway/README.md) for full 
 astra-suite/
 ├── crates/
 │   ├── astra-gateway/     # Gateway binary + library
-│   ├── astra/             # HTTP+SSE client for Astra server
-│   └── astra-task-store/  # Durable task store trait + types
+│   └── astra/             # HTTP+SSE client for Astra server
 ├── ARCHITECTURE.md        # System design + extension points
 ├── CONTRIBUTING.md        # Developer workflow
 ├── Makefile               # Build / test / run targets

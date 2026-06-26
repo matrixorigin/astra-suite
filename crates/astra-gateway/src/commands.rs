@@ -9,11 +9,27 @@ use crate::trace_model::{
     ActiveRequestSummary, CancelRequestOutcome, ConversationKey, GatewayEvent, GatewayEventKind,
     OutboxStatus, RequestStatus, TraceId, TraceRepository,
 };
-use astra_task_store::{
-    DurableTask, DurableTaskStatus, DurableTaskStore, TaskFilter, resolve_task_for_owner,
+use serde_json::Value;
+use std::{
+    collections::HashMap,
+    sync::{Arc, LazyLock},
+    time::{Duration, Instant},
 };
-use std::{sync::Arc, time::Duration};
 use tokio::sync::Mutex;
+
+static MODEL_ENTRY_CACHE: LazyLock<Mutex<HashMap<String, ModelEntryCacheValue>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+#[derive(Clone)]
+struct ModelEntryCacheValue {
+    entries: Vec<ModelEntry>,
+    created_at: Instant,
+}
+
+struct ModelEntriesResult {
+    entries: Vec<ModelEntry>,
+    cache_age: Option<Duration>,
+}
 
 pub struct CommandContext<'a> {
     pub astra: &'a astra::Client,
@@ -23,15 +39,16 @@ pub struct CommandContext<'a> {
     pub chat_id: &'a str,
     pub user_id: &'a str,
     pub resolved_cli: &'a crate::cli_bridge::CliProfile,
-    /// Resolved provider name for the active model (e.g. "bedrock", "dashscope").
-    pub resolved_provider: Option<&'a str>,
-    pub durable_store: Option<&'a dyn astra_task_store::DurableTaskStore>,
+    /// Provider environment resolved for the active CLI run. Model discovery
+    /// uses this same environment so `/model` reflects how the CLI is actually
+    /// launched by gateway.
+    pub resolved_provider_config: Option<&'a crate::config::ProviderConfig>,
     pub trace_repo: Option<&'a dyn TraceRepository>,
     pub project_dirs: &'a [String],
     pub cli_availability: &'a [(String, crate::cli_bridge::CliAvailability)],
     pub auth_status: Option<String>,
     /// Active task registry — allows /esc to interrupt live CLI turns.
-    pub active_tasks: Option<&'a dashmap::DashMap<String, tokio_util::sync::CancellationToken>>,
+    pub active_requests: Option<&'a dashmap::DashMap<String, tokio_util::sync::CancellationToken>>,
     /// Long-lived Codex/Astra app-server pool, used by approval slash commands.
     pub(crate) codex_app_pool: Option<&'a Arc<Mutex<CodexAppPool>>>,
     /// Gateway process start time. Used by /running to flag zombie
@@ -57,16 +74,6 @@ macro_rules! require_trace_repo {
             None => return Some("⚠️ 此命令需要 MySQL 存储。当前没有启用 trace/durable 能力。".into()),
         }
     };
-}
-
-async fn resolve_owned_task(
-    store: &dyn DurableTaskStore,
-    owner_id: &str,
-    selector: &str,
-) -> Result<DurableTask, String> {
-    resolve_task_for_owner(store, owner_id, selector)
-        .await
-        .map_err(|e| format!("⚠️ {e}"))
 }
 
 pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<String> {
@@ -112,27 +119,16 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
             } else {
                 None
             };
-            // Model: show the friendly label ("Opus 4.7") instead of the raw
-            // Bedrock id, and distinguish between user override vs yaml default
-            // by comparing against `config.cli`.
             let resolved_model = ctx.resolved_cli.model_name();
             let yaml_default = ctx.config.cli.model_name();
-            let entries = all_model_entries(ctx.config, ctx.resolved_cli.name());
             let model_line = match resolved_model {
                 Some(id) => {
-                    let pretty = display_model_name(id, &entries);
                     let source = if Some(id) == yaml_default {
                         "配置默认"
                     } else {
                         "用户切换"
                     };
-                    // If pretty differs from id, show both so power users can
-                    // still see the full Bedrock id.
-                    if pretty == id {
-                        format!("- 模型: `{pretty}` ({source})")
-                    } else {
-                        format!("- 模型: {pretty} `{id}` ({source})")
-                    }
+                    format!("- 模型: `{id}` ({source})")
                 }
                 None => "- 模型: (CLI 默认,yaml 未配置 cli.model)".to_string(),
             };
@@ -422,16 +418,33 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
             // user has no per-user override, resolve_cli_profile returns this
             // untouched, so current_model == config_default_model.
             let config_default_model = ctx.config.cli.model_name();
-            let entries = match model_entries_for_context(ctx, arg).await {
-                Ok(entries) => entries,
+            let refresh = arg.eq_ignore_ascii_case("refresh");
+            let model_list = match model_entries_for_context(ctx, arg, refresh).await {
+                Ok(model_list) => model_list,
                 Err(e) => return Some(format!("⚠️ 获取模型列表失败: {e}")),
             };
+            let entries = model_list.entries;
 
-            if arg.is_empty() {
+            if arg.is_empty() || refresh {
                 let current_display = current_model
                     .map(|m| display_model_name(m, &entries))
                     .unwrap_or_else(|| "默认".to_string());
-                let mut lines = vec![format!("🤖 当前: **{current_display}**"), String::new()];
+                let mut lines = if refresh {
+                    vec![
+                        format!("🤖 当前: **{current_display}**"),
+                        "缓存 已刷新 · `/model refresh`".to_string(),
+                        String::new(),
+                    ]
+                } else {
+                    vec![
+                        format!("🤖 当前: **{current_display}**"),
+                        format!(
+                            "缓存 {} · `/model refresh`",
+                            format_cache_age(model_list.cache_age)
+                        ),
+                        String::new(),
+                    ]
+                };
                 for (i, entry) in entries.iter().enumerate() {
                     let mark = if entry.matches_current(current_model) {
                         " ✓"
@@ -463,16 +476,6 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
                 }
                 lines.push(String::new());
                 lines.push("切换: `/model <编号|名称|完整id>`".into());
-                lines.push("例: `/model 2`  `/model opus`  `/model gpt-5.5`".into());
-                if let Some(example_id) = entries.iter().find_map(|e| {
-                    if e.label == "Opus 4.7" {
-                        e.full_id.as_deref()
-                    } else {
-                        None
-                    }
-                }) {
-                    lines.push(format!("    `/model {example_id}`"));
-                }
                 return Some(lines.join("\n"));
             }
 
@@ -723,7 +726,7 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
              `/session switch <id>` — 切换会话\n\n\
              **模型**\n\
              `/model` — 当前模型 + 快捷列表\n\
-             `/model <name>` — 切换 (默认/Sonnet/Haiku/Opus/Opus 4.7/Opus 4.6)\n\n\
+             `/model <name>` — 切换模型 (默认/编号/名称/完整 id)\n\n\
              **CLI & 工作区**\n\
              `/cli` — 查看当前 CLI + 能力 + 工作目录\n\
              `/cli <name>` — 切换 CLI (astra/claude)\n\
@@ -745,12 +748,9 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
              `/inspect` — harness 详情 (token/cost/tools/warnings)\n\
              `/audit` — 审计记录 (最近 N 轮决策链)\n\
              `/trace [id]` — 查看 trace 详情\n\n\
-             **持久任务**\n\
-             `/task list` — 查看任务\n\
-             `/task status <id>` — 任务状态\n\
-             `/task cancel <id>` — 取消任务\n\
-             `/task resume <id>` — 恢复任务\n\n\
              **定时任务**\n\
+             `/task list` — 查看定时任务/提醒\n\
+             `/task cancel <id>` — 取消定时任务/提醒\n\
              `/cron list` — 查看任务\n\
              `/cron add <expr> <msg>` — 创建\n\
              `/cron del <id>` — 删除\n\n\
@@ -761,8 +761,6 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
         ),
 
         "/task" => {
-            let owner_id = format!("{}:{}", ctx.platform, ctx.chat_id);
-
             if arg.is_empty() || arg == "list" {
                 let mut lines = Vec::new();
 
@@ -789,31 +787,6 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
                     }
                 }
 
-                // Durable tasks
-                if let Some(dstore) = ctx.durable_store {
-                    let filter = TaskFilter {
-                        owner_id: Some(owner_id.clone()),
-                        ..Default::default()
-                    };
-                    if let Ok(tasks) = dstore.list(filter).await {
-                        for t in &tasks {
-                            let short_id = &t.id.0[..8.min(t.id.0.len())];
-                            let icon = match t.status {
-                                astra_task_store::DurableTaskStatus::Running => "🔄",
-                                astra_task_store::DurableTaskStatus::Suspended => "⏸",
-                                astra_task_store::DurableTaskStatus::Completed => "✅",
-                                astra_task_store::DurableTaskStatus::Failed => "❌",
-                                astra_task_store::DurableTaskStatus::Cancelled => "🚫",
-                                _ => "📋",
-                            };
-                            lines.push(format!(
-                                "{icon} `{short_id}` | {} | {}%",
-                                t.name, t.progress_pct
-                            ));
-                        }
-                    }
-                }
-
                 if lines.is_empty() {
                     return Some("📋 没有任务。".into());
                 }
@@ -824,12 +797,8 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
                 .or_else(|| arg.strip_prefix("rm "))
                 .or_else(|| arg.strip_prefix("del "))
             {
-                if let Some(denial) = slash_denial(ctx, ActionCapability::DurableTaskMutation) {
-                    return Some(denial);
-                }
                 let id = id.trim();
 
-                // Try cron job first (covers reminders + recurring)
                 if let Some(store) = ctx.store {
                     let jobs = store
                         .list_cron_jobs(ctx.platform, ctx.chat_id)
@@ -844,79 +813,9 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
                     }
                 }
 
-                // Then try durable task
-                let Some(dstore) = ctx.durable_store else {
-                    return Some("❌ 找不到该任务".into());
-                };
-                let task = match resolve_owned_task(dstore, &owner_id, id).await {
-                    Ok(task) => task,
-                    Err(e) => return Some(e),
-                };
-                match dstore
-                    .update_status(&task.id, DurableTaskStatus::Cancelled, None)
-                    .await
-                {
-                    Ok(()) => Some("🚫 任务已取消".into()),
-                    Err(e) => Some(format!("⚠️ {e}")),
-                }
-            } else if let Some(id) = arg.strip_prefix("resume ") {
-                if let Some(denial) = slash_denial(ctx, ActionCapability::DurableTaskMutation) {
-                    return Some(denial);
-                }
-                let Some(dstore) = ctx.durable_store else {
-                    return Some("⚠️ 无持久任务存储".into());
-                };
-                let task = match resolve_owned_task(dstore, &owner_id, id).await {
-                    Ok(task) => task,
-                    Err(e) => return Some(e),
-                };
-                match dstore.resume(&task.id).await {
-                    Ok(Some(cp)) => {
-                        if let Err(e) = dstore
-                            .update_status(&task.id, DurableTaskStatus::Running, None)
-                            .await
-                        {
-                            return Some(format!("⚠️ 恢复失败: {e}"));
-                        }
-                        Some(format!(
-                            "▶️ 任务已恢复\n检查点:\n```\n{}\n```",
-                            serde_json::to_string_pretty(&cp).unwrap_or_default()
-                        ))
-                    }
-                    Ok(None) => {
-                        if let Err(e) = dstore
-                            .update_status(&task.id, DurableTaskStatus::Running, None)
-                            .await
-                        {
-                            return Some(format!("⚠️ 恢复失败: {e}"));
-                        }
-                        Some("▶️ 任务无检查点，将从头开始".into())
-                    }
-                    Err(e) => Some(format!("⚠️ {e}")),
-                }
-            } else if let Some(id) = arg.strip_prefix("status ") {
-                let Some(dstore) = ctx.durable_store else {
-                    return Some("⚠️ 无持久任务存储".into());
-                };
-                match resolve_owned_task(dstore, &owner_id, id).await {
-                    Ok(t) => {
-                        let mut lines = vec![
-                            format!("📋 **{}**", t.name),
-                            format!("- 状态: {}", t.status.as_str()),
-                            format!("- 进度: {}%", t.progress_pct),
-                        ];
-                        if let Some(ref step) = t.step_description {
-                            lines.push(format!("- 当前: {step}"));
-                        }
-                        if let Some(ref err) = t.error_message {
-                            lines.push(format!("- 信息: {err}"));
-                        }
-                        Some(lines.join("\n"))
-                    }
-                    Err(e) => Some(e),
-                }
+                Some("❌ 找不到该任务".into())
             } else {
-                Some("用法: `/task [list|cancel <id>|resume <id>|status <id>]`".into())
+                Some("用法: `/task [list|cancel <id>]`".into())
             }
         }
 
@@ -1045,7 +944,7 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
                     kill_or_cancel_all(
                         repo,
                         &conversation,
-                        ctx.active_tasks,
+                        ctx.active_requests,
                         "cancelled by user via /cancel all",
                     )
                     .await,
@@ -1122,7 +1021,7 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
                     kill_or_cancel_all(
                         repo,
                         &conversation,
-                        ctx.active_tasks,
+                        ctx.active_requests,
                         if command_name == "/kill" {
                             "interrupted by user via /esc all (/kill alias)"
                         } else {
@@ -1169,7 +1068,7 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
                     // this to their native Esc/interrupt protocol for the
                     // active turn; one-shot CLIs are terminated by the bridge.
                     let interrupted_live_turn = ctx
-                        .active_tasks
+                        .active_requests
                         .map(|tasks| {
                             if let Some((_, token)) = tasks.remove(row.trace_id.as_str()) {
                                 token.cancel();
@@ -1471,7 +1370,6 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
                     if caps.supports_harness { "✅" } else { "❌" }
                 ),
                 format!("- Cron/scheduling: {}", if has_store { "✅" } else { "❌" }),
-                format!("- Durable tasks: {}", if has_store { "✅" } else { "❌" }),
                 format!(
                     "- Tool execution: {}",
                     if caps.supports_tools { "✅" } else { "❌" }
@@ -1491,7 +1389,7 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
             lines.push("| `/ws <name>` | Switch workspace |".to_string());
             lines.push("| `/session list` | Session history |".to_string());
             lines.push("| `/cron list` | Scheduled tasks |".to_string());
-            lines.push("| `/task list` | Durable tasks |".to_string());
+            lines.push("| `/task list` | Scheduled tasks/reminders |".to_string());
             lines.push("| `/running` | Active requests (numbered) |".to_string());
             lines.push("| `/cancel [N\\|text]` | Cancel queued request |".to_string());
             lines
@@ -1505,25 +1403,27 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
             lines.push("| `/auth` | Auth status + reset + auto-relogin |".to_string());
             lines.push("| `/gateway` | This context dump |".to_string());
 
-            if ctx.config.action_policy.allow_model_generated_mutations && has_store {
-                lines.push(String::new());
-                lines.push(
-                    "**Gateway Actions** (embed `[[GATEWAY:...]]` tags in response)".to_string(),
-                );
-                lines.push("| Tag | Effect |".to_string());
-                lines.push("|-----|--------|".to_string());
-                lines.push("| `cron_add:<expr>:<msg>` | Create recurring task |".to_string());
-                lines.push("| `remind_after:<min>:<msg>` | One-time reminder |".to_string());
-                lines.push("| `task_list` | List scheduled tasks |".to_string());
-                lines.push("| `task_del:<id>` | Delete task |".to_string());
-                lines.push("| `dtask_create:<name>:<desc>` | Create durable task |".to_string());
-                lines.push("| `dtask_checkpoint:<id>:<json>` | Save checkpoint |".to_string());
-                lines.push("| `dtask_complete:<id>` | Mark complete |".to_string());
-                lines.push("| `workspace_set:<path>` | Switch workspace |".to_string());
-                lines.push("| `skill_add:<name>:<md>` | Save reusable skill |".to_string());
-                lines.push("| `trace_kill:<trace_id>` | Interrupt request |".to_string());
-                lines.push("| `outbox_dismiss:<request_id>` | Dismiss failed outbox |".to_string());
-            }
+            lines.push(String::new());
+            lines.push("**MCP Tools**".to_string());
+            lines.push("| Tool | Description |".to_string());
+            lines.push("|------|-------------|".to_string());
+            lines.push("| `gateway_cron_list` | List scheduled tasks/reminders |".to_string());
+            lines.push("| `gateway_cron_add` | Create recurring scheduled task |".to_string());
+            lines
+                .push("| `gateway_cron_delete` | Delete scheduled task by ID prefix |".to_string());
+            lines.push(
+                "| `gateway_remind_after` | Create one-time reminder or scheduled exec |"
+                    .to_string(),
+            );
+            lines.push("| `gateway_skills_list` | List saved reusable skills |".to_string());
+            lines.push("| `gateway_skills_read` | Read saved skill content |".to_string());
+            lines.push("| `gateway_skills_add` | Save reusable skill |".to_string());
+            lines.push("| `gateway_skills_delete` | Delete saved skill |".to_string());
+            lines.push("| `gateway_workspace_current` | Show current workspace |".to_string());
+            lines.push("| `gateway_workspace_list` | List available workspaces |".to_string());
+            lines.push("| `gateway_workspace_switch` | Switch workspace |".to_string());
+            lines
+                .push("| `gateway_send_attachment` | Send a local file to this chat |".to_string());
 
             if let Some(store) = ctx.store {
                 let cron_jobs = store
@@ -1665,7 +1565,7 @@ pub fn is_zombie_request(created_at: &str, gateway_start: chrono::DateTime<chron
 
 /// Sweep every active request in `conversation`: force-fail in the DB,
 /// cancel the in-memory cancellation token (persistent CLIs translate that
-/// to native Esc/interrupt), and remove it from `active_tasks`. Returns a
+/// to native Esc/interrupt), and remove it from `active_requests`. Returns a
 /// user-facing summary with the count interrupted + the count of stale DB
 /// rows whose process was already gone (no token in the map — typical
 /// zombie case).
@@ -1675,7 +1575,7 @@ pub fn is_zombie_request(created_at: &str, gateway_start: chrono::DateTime<chron
 async fn kill_or_cancel_all(
     repo: &dyn TraceRepository,
     conversation: &ConversationKey,
-    active_tasks: Option<&dashmap::DashMap<String, tokio_util::sync::CancellationToken>>,
+    active_requests: Option<&dashmap::DashMap<String, tokio_util::sync::CancellationToken>>,
     reason: &str,
 ) -> String {
     let rows = match repo.list_active_requests(conversation, 200).await {
@@ -1705,7 +1605,7 @@ async fn kill_or_cancel_all(
                 );
             }
         }
-        if let Some(tasks) = active_tasks
+        if let Some(tasks) = active_requests
             && let Some((_, token)) = tasks.remove(row.trace_id.as_str())
         {
             token.cancel();
@@ -2146,13 +2046,12 @@ fn format_duration(ms: u64) -> String {
 }
 
 /// An entry in the `/model` selection list.
+#[derive(Clone)]
 pub(crate) struct ModelEntry {
     label: String,
     desc: String,
     /// Full model identifier, or `None` to mean "follow default".
     full_id: Option<String>,
-    /// Which provider this model uses (e.g. "anthropic", "bedrock", "dashscope").
-    provider: Option<String>,
     /// Extra shorthand aliases for resolution (e.g. ["deepseek", "ds"]).
     aliases: Vec<String>,
 }
@@ -2167,142 +2066,167 @@ impl ModelEntry {
     }
 }
 
-fn model_entries() -> Vec<ModelEntry> {
-    vec![
-        ModelEntry {
-            label: "默认".into(),
-            desc: "跟随配置".into(),
-            full_id: None,
-            provider: None,
-            aliases: vec![],
-        },
-        // Claude official API / Claude Code defaults. These do not need
-        // gateway provider env; the Claude CLI owns its own auth.
-        ModelEntry {
-            label: "Sonnet".into(),
-            desc: "日常任务".into(),
-            full_id: Some("claude-sonnet-4-6".into()),
-            provider: Some("anthropic".into()),
-            aliases: vec![],
-        },
-        ModelEntry {
-            label: "Haiku".into(),
-            desc: "快 / 省".into(),
-            full_id: Some("claude-haiku-4-5".into()),
-            provider: Some("anthropic".into()),
-            aliases: vec![],
-        },
-        ModelEntry {
-            label: "Opus 4.7".into(),
-            desc: "最强 / 复杂任务".into(),
-            full_id: Some("claude-opus-4-7".into()),
-            provider: Some("anthropic".into()),
-            aliases: vec![],
-        },
-        ModelEntry {
-            label: "Opus 4.6".into(),
-            desc: "上一代 Opus".into(),
-            full_id: Some("claude-opus-4-6".into()),
-            provider: Some("anthropic".into()),
-            aliases: vec![],
-        },
-        // Bedrock
-        ModelEntry {
-            label: "Sonnet".into(),
-            desc: "日常任务".into(),
-            full_id: Some("us.anthropic.claude-sonnet-4-6".into()),
-            provider: Some("bedrock".into()),
-            aliases: vec![],
-        },
-        ModelEntry {
-            label: "Haiku".into(),
-            desc: "快 / 省".into(),
-            full_id: Some("us.anthropic.claude-haiku-4-5-20251001-v1:0".into()),
-            provider: Some("bedrock".into()),
-            aliases: vec![],
-        },
-        ModelEntry {
-            label: "Opus 4.7".into(),
-            desc: "最强 / 复杂任务".into(),
-            full_id: Some("us.anthropic.claude-opus-4-7".into()),
-            provider: Some("bedrock".into()),
-            aliases: vec![],
-        },
-        ModelEntry {
-            label: "Opus 4.6".into(),
-            desc: "上一代 Opus".into(),
-            full_id: Some("us.anthropic.claude-opus-4-6-v1".into()),
-            provider: Some("bedrock".into()),
-            aliases: vec![],
-        },
-        // DashScope
-        ModelEntry {
-            label: "DeepSeek V4 Pro".into(),
-            desc: "最强 / 代码".into(),
-            full_id: Some("deepseek-v4-pro".into()),
-            provider: Some("dashscope".into()),
-            aliases: vec!["deepseek".into(), "ds".into()],
-        },
-        ModelEntry {
-            label: "Qwen 3.6+".into(),
-            desc: "通义旗舰 / thinking".into(),
-            full_id: Some("qwen3.6-plus".into()),
-            provider: Some("dashscope".into()),
-            aliases: vec!["qwen".into()],
-        },
-        ModelEntry {
-            label: "Qwen 3.6 Flash".into(),
-            desc: "快 / 省".into(),
-            full_id: Some("qwen3.6-flash".into()),
-            provider: Some("dashscope".into()),
-            aliases: vec![],
-        },
-        ModelEntry {
-            label: "Kimi K2.6".into(),
-            desc: "Moonshot".into(),
-            full_id: Some("kimi-k2.6".into()),
-            provider: Some("dashscope".into()),
-            aliases: vec!["kimi".into()],
-        },
-        ModelEntry {
-            label: "GLM 5.1".into(),
-            desc: "智谱".into(),
-            full_id: Some("glm-5.1".into()),
-            provider: Some("dashscope".into()),
-            aliases: vec!["glm".into()],
-        },
-        // Codex official defaults. Codex owns its own OpenAI auth; these do not
-        // require gateway provider env.
-        ModelEntry {
-            label: "GPT-5.5".into(),
-            desc: "OpenAI flagship".into(),
-            full_id: Some("gpt-5.5".into()),
-            provider: Some("openai-codex".into()),
-            aliases: vec!["gpt55".into()],
-        },
-        ModelEntry {
-            label: "GPT-5.4".into(),
-            desc: "OpenAI coding".into(),
-            full_id: Some("gpt-5.4".into()),
-            provider: Some("openai-codex".into()),
-            aliases: vec!["gpt54".into()],
-        },
-    ]
-}
-
 async fn model_entries_for_context(
     ctx: &CommandContext<'_>,
     arg: &str,
-) -> Result<Vec<ModelEntry>, String> {
-    if matches!(
-        ctx.resolved_cli,
-        crate::cli_bridge::CliProfile::Astra { .. }
-    ) && arg.trim() != "默认"
-        && !arg.trim().eq_ignore_ascii_case("default")
-    {
-        astra_model_entries(ctx.resolved_cli).await
-    } else {
-        Ok(all_model_entries(ctx.config, ctx.resolved_cli.name()))
+    force_refresh: bool,
+) -> Result<ModelEntriesResult, String> {
+    let trimmed = arg.trim();
+    if trimmed == "默认" || trimmed.eq_ignore_ascii_case("default") {
+        return Ok(ModelEntriesResult {
+            entries: vec![default_model_entry()],
+            cache_age: None,
+        });
+    }
+
+    let Some(cache_key) = model_entries_cache_key(ctx) else {
+        return Ok(ModelEntriesResult {
+            entries: model_entries_uncached(ctx).await?,
+            cache_age: None,
+        });
+    };
+    if force_refresh {
+        MODEL_ENTRY_CACHE.lock().await.remove(&cache_key);
+    } else if let Some(cached) = MODEL_ENTRY_CACHE.lock().await.get(&cache_key).cloned() {
+        let age = cached.created_at.elapsed();
+        tracing::debug!(
+            cli = ctx.resolved_cli.name(),
+            age_ms = age.as_millis(),
+            "using cached model entries"
+        );
+        return Ok(ModelEntriesResult {
+            entries: cached.entries,
+            cache_age: Some(age),
+        });
+    }
+
+    let entries = model_entries_uncached(ctx).await?;
+    MODEL_ENTRY_CACHE.lock().await.insert(
+        cache_key,
+        ModelEntryCacheValue {
+            entries: entries.clone(),
+            created_at: Instant::now(),
+        },
+    );
+    Ok(ModelEntriesResult {
+        entries,
+        cache_age: None,
+    })
+}
+
+async fn model_entries_uncached(ctx: &CommandContext<'_>) -> Result<Vec<ModelEntry>, String> {
+    match ctx.resolved_cli {
+        crate::cli_bridge::CliProfile::Astra { .. } => astra_model_entries(ctx.resolved_cli).await,
+        crate::cli_bridge::CliProfile::Claude { .. } => claude_model_entries(ctx).await,
+        crate::cli_bridge::CliProfile::Codex { .. } => codex_model_entries(ctx.resolved_cli).await,
+        _ => Ok(vec![default_model_entry()]),
+    }
+}
+
+fn model_entries_cache_key(ctx: &CommandContext<'_>) -> Option<String> {
+    match ctx.resolved_cli {
+        crate::cli_bridge::CliProfile::Claude { .. } => {
+            let base = base_profile_for_model_probe(ctx);
+            Some(format!(
+                "claude:{}:{}",
+                cli_profile_model_cache_key(&base),
+                provider_model_cache_key(ctx.resolved_provider_config)
+            ))
+        }
+        crate::cli_bridge::CliProfile::Codex { .. } => Some(format!(
+            "codex:{}",
+            cli_profile_model_cache_key(ctx.resolved_cli)
+        )),
+        crate::cli_bridge::CliProfile::Astra { .. } => Some(format!(
+            "astra:{}",
+            cli_profile_model_cache_key(ctx.resolved_cli)
+        )),
+        _ => None,
+    }
+}
+
+fn cli_profile_model_cache_key(profile: &crate::cli_bridge::CliProfile) -> String {
+    match profile {
+        crate::cli_bridge::CliProfile::Astra {
+            bin,
+            model,
+            permission_mode,
+            app_server_url,
+        } => format!(
+            "bin={bin};model={model:?};permission={permission_mode};app_server={app_server_url:?}"
+        ),
+        crate::cli_bridge::CliProfile::Claude {
+            bin,
+            model,
+            stream_json,
+            extra_args,
+            env,
+            env_file,
+        } => format!(
+            "bin={bin};model={model:?};stream={stream_json};extra={extra_args:?};env_file={env_file:?};env={}",
+            env_cache_key(env)
+        ),
+        crate::cli_bridge::CliProfile::Codex {
+            bin,
+            model,
+            sandbox,
+            stream_json,
+            extra_args,
+            skip_git_repo_check,
+            ephemeral,
+        } => format!(
+            "bin={bin};model={model:?};sandbox={sandbox};stream={stream_json};extra={extra_args:?};skip_git={skip_git_repo_check};ephemeral={ephemeral}"
+        ),
+        crate::cli_bridge::CliProfile::Copilot {
+            bin,
+            model,
+            env,
+            env_file,
+            launcher,
+            stream_json,
+            allow_all_tools,
+            extra_args,
+        } => format!(
+            "bin={bin};model={model:?};stream={stream_json};allow_all={allow_all_tools};extra={extra_args:?};env_file={env_file:?};launcher={launcher:?};env={}",
+            env_cache_key(env)
+        ),
+        crate::cli_bridge::CliProfile::Custom {
+            bin,
+            args_template,
+            json_output,
+            session_id_field,
+            text_field,
+        } => format!(
+            "bin={bin};args={args_template:?};json={json_output};session={session_id_field:?};text={text_field:?}"
+        ),
+    }
+}
+
+fn provider_model_cache_key(pc: Option<&crate::config::ProviderConfig>) -> String {
+    match pc {
+        Some(pc) => format!(
+            "enabled={};env_file={:?};env={}",
+            pc.enabled,
+            pc.env_file,
+            env_cache_key(&pc.env)
+        ),
+        None => "none".into(),
+    }
+}
+
+fn env_cache_key(env: &std::collections::BTreeMap<String, String>) -> String {
+    env.iter()
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect::<Vec<_>>()
+        .join(";")
+}
+
+fn default_model_entry() -> ModelEntry {
+    ModelEntry {
+        label: "默认".into(),
+        desc: "跟随配置".into(),
+        full_id: None,
+        aliases: vec![],
     }
 }
 
@@ -2348,13 +2272,7 @@ async fn astra_model_entries(
     let items: Vec<AstraModelListItem> = serde_json::from_slice(&output.stdout)
         .map_err(|e| format!("解析 `{bin} model list` 输出: {e}"))?;
 
-    let mut entries = vec![ModelEntry {
-        label: "默认".into(),
-        desc: "跟随配置".into(),
-        full_id: None,
-        provider: None,
-        aliases: vec![],
-    }];
+    let mut entries = vec![default_model_entry()];
     for item in items.into_iter().filter(|m| m.is_active) {
         let provider = item.provider.unwrap_or_else(|| "unknown".into());
         let mut desc = provider;
@@ -2370,7 +2288,6 @@ async fn astra_model_entries(
             label: item.name.clone(),
             desc,
             full_id: Some(item.name),
-            provider: None,
             aliases,
         });
     }
@@ -2379,6 +2296,256 @@ async fn astra_model_entries(
         return Err("Astra 返回的 active 模型列表为空".into());
     }
     Ok(entries)
+}
+
+async fn claude_model_entries(ctx: &CommandContext<'_>) -> Result<Vec<ModelEntry>, String> {
+    let base = base_profile_for_model_probe(ctx);
+    let mut entries = vec![default_model_entry()];
+    if let Some(model) = probe_claude_model(&base, None, ctx.resolved_provider_config).await? {
+        entries[0].desc = format!("当前默认 → {model}");
+    }
+
+    let candidates = [
+        ("opus", "Claude alias: opus", vec!["opus"]),
+        (
+            "opus[1m]",
+            "Claude alias: opus[1m]",
+            vec!["opus1m", "opus 1m"],
+        ),
+        ("sonnet", "Claude alias: sonnet", vec!["sonnet"]),
+        (
+            "sonnet[1m]",
+            "Claude alias: sonnet[1m]",
+            vec!["sonnet1m", "sonnet 1m"],
+        ),
+        ("haiku", "Claude alias: haiku", vec!["haiku"]),
+    ];
+
+    for (candidate, desc, aliases) in candidates {
+        if let Some(model) =
+            probe_claude_model(&base, Some(candidate), ctx.resolved_provider_config).await?
+        {
+            push_unique_model_entry(
+                &mut entries,
+                ModelEntry {
+                    label: model.clone(),
+                    desc: desc.into(),
+                    full_id: Some(model),
+                    aliases: aliases.into_iter().map(str::to_string).collect(),
+                },
+            );
+        }
+    }
+
+    for model in claude_custom_env_models(&base, ctx.resolved_provider_config) {
+        push_unique_model_entry(
+            &mut entries,
+            ModelEntry {
+                label: model.clone(),
+                desc: "Claude custom model".into(),
+                full_id: Some(model),
+                aliases: vec!["custom".into()],
+            },
+        );
+    }
+
+    if entries.len() == 1 {
+        return Err("Claude 未返回可用模型".into());
+    }
+    Ok(entries)
+}
+
+fn base_profile_for_model_probe(ctx: &CommandContext<'_>) -> crate::cli_bridge::CliProfile {
+    let active_name = ctx.resolved_cli.name();
+    if ctx.config.cli.name() == active_name {
+        return ctx.config.cli.clone();
+    }
+    ctx.config
+        .cli_profiles
+        .values()
+        .find(|profile| profile.name() == active_name)
+        .cloned()
+        .unwrap_or_else(|| ctx.resolved_cli.clone())
+}
+
+async fn probe_claude_model(
+    base: &crate::cli_bridge::CliProfile,
+    model_arg: Option<&str>,
+    provider_config: Option<&crate::config::ProviderConfig>,
+) -> Result<Option<String>, String> {
+    let mut profile = base.clone();
+    if let Some(model) = model_arg {
+        profile.set_model_override(model.to_string());
+    }
+    let mut command = profile.build_command_with_context("/model", None, None, None);
+    profile
+        .apply_runtime_environment(&mut command)
+        .map_err(|e| {
+            format!(
+                "failed to prepare `{}` CLI environment for model probe: {e}",
+                profile.name()
+            )
+        })?;
+    if let Some(pc) = provider_config {
+        crate::cli_bridge::apply_provider_environment(&mut command, pc).map_err(|e| {
+            format!(
+                "failed to prepare provider environment for `{}` model probe: {e}",
+                profile.name()
+            )
+        })?;
+    }
+
+    let output = tokio::time::timeout(Duration::from_secs(8), command.output())
+        .await
+        .map_err(|_| "Claude model probe 超时".to_string())?
+        .map_err(|e| format!("运行 Claude model probe: {e}"))?;
+    if let Some(model) = parse_claude_init_model(&output.stdout) {
+        return Ok(Some(model));
+    }
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "Claude model probe 退出码 {}: {}",
+            output.status.code().unwrap_or(-1),
+            stderr.trim()
+        ));
+    }
+    Ok(None)
+}
+
+fn parse_claude_init_model(stdout: &[u8]) -> Option<String> {
+    let text = std::str::from_utf8(stdout).ok()?;
+    for line in text.lines() {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if value["type"] == "system"
+            && value["subtype"] == "init"
+            && let Some(model) = value["model"].as_str()
+            && !model.trim().is_empty()
+        {
+            return Some(model.to_string());
+        }
+    }
+    None
+}
+
+fn claude_custom_env_models(
+    profile: &crate::cli_bridge::CliProfile,
+    provider_config: Option<&crate::config::ProviderConfig>,
+) -> Vec<String> {
+    let mut models = Vec::new();
+    if let Some(model) = cli_profile_env_value(profile, "ANTHROPIC_MODEL") {
+        models.push(model);
+    }
+    if let Some(pc) = provider_config
+        && let Some(model) = pc.env.get("ANTHROPIC_MODEL")
+        && !model.trim().is_empty()
+    {
+        models.push(model.trim().to_string());
+    }
+    models.sort();
+    models.dedup();
+    models
+}
+
+fn cli_profile_env_value(profile: &crate::cli_bridge::CliProfile, key: &str) -> Option<String> {
+    match profile {
+        crate::cli_bridge::CliProfile::Claude { env, .. }
+        | crate::cli_bridge::CliProfile::Copilot { env, .. } => env
+            .get(key)
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty()),
+        _ => None,
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct CodexModelCatalog {
+    models: Vec<CodexModelItem>,
+}
+
+#[derive(serde::Deserialize)]
+struct CodexModelItem {
+    slug: String,
+    display_name: Option<String>,
+    description: Option<String>,
+    visibility: Option<String>,
+}
+
+async fn codex_model_entries(
+    profile: &crate::cli_bridge::CliProfile,
+) -> Result<Vec<ModelEntry>, String> {
+    let crate::cli_bridge::CliProfile::Codex { bin, .. } = profile else {
+        return Ok(Vec::new());
+    };
+
+    let output = tokio::time::timeout(
+        Duration::from_secs(8),
+        tokio::process::Command::new(bin)
+            .arg("debug")
+            .arg("models")
+            .output(),
+    )
+    .await
+    .map_err(|_| format!("`{bin} debug models` 超时"))?
+    .map_err(|e| format!("运行 `{bin} debug models`: {e}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "`{bin} debug models` 退出码 {}: {}",
+            output.status.code().unwrap_or(-1),
+            stderr.trim()
+        ));
+    }
+
+    let catalog: CodexModelCatalog = serde_json::from_slice(&output.stdout)
+        .map_err(|e| format!("解析 `{bin} debug models` 输出: {e}"))?;
+    let mut entries = vec![default_model_entry()];
+    for item in catalog
+        .models
+        .into_iter()
+        .filter(|item| item.visibility.as_deref() == Some("list"))
+    {
+        let aliases = codex_model_aliases(&item.slug);
+        push_unique_model_entry(
+            &mut entries,
+            ModelEntry {
+                label: item.display_name.unwrap_or_else(|| item.slug.clone()),
+                desc: item.description.unwrap_or_else(|| "Codex model".into()),
+                full_id: Some(item.slug),
+                aliases,
+            },
+        );
+    }
+    if entries.len() == 1 {
+        return Err("Codex 返回的模型列表为空".into());
+    }
+    Ok(entries)
+}
+
+fn codex_model_aliases(slug: &str) -> Vec<String> {
+    let mut aliases = vec![slug.replace(['-', '.'], "")];
+    if slug == "gpt-5.5" {
+        aliases.push("gpt55".into());
+    } else if slug == "gpt-5.4" {
+        aliases.push("gpt54".into());
+    }
+    aliases.sort();
+    aliases.dedup();
+    aliases
+}
+
+fn push_unique_model_entry(entries: &mut Vec<ModelEntry>, entry: ModelEntry) {
+    if let Some(id) = entry.full_id.as_deref()
+        && entries
+            .iter()
+            .any(|existing| existing.full_id.as_deref() == Some(id))
+    {
+        return;
+    }
+    entries.push(entry);
 }
 
 fn astra_model_aliases(name: &str) -> Vec<String> {
@@ -2410,35 +2577,20 @@ fn format_context_window(n: u64) -> String {
     }
 }
 
-/// Return model entries filtered by configured providers and active CLI.
-///
-/// - "默认" (provider=None) always appears.
-/// - Claude official IDs appear for `claude` when Bedrock is not configured.
-/// - Bedrock IDs replace official Claude IDs when `providers.bedrock` is configured.
-/// - DashScope (Anthropic-compatible) only appears when using `claude` CLI.
-/// - Codex official IDs always appear for `codex`.
-/// - Other CLI types (copilot, custom) see everything.
-/// - External providers must be configured with `enabled: true`.
-pub(crate) fn all_model_entries(
-    config: &crate::config::GatewayConfig,
-    cli_name: &str,
-) -> Vec<ModelEntry> {
-    let bedrock_configured = provider_enabled(config, "bedrock");
-    model_entries()
-        .into_iter()
-        .filter(|e| match e.provider.as_deref() {
-            None => true,
-            Some("anthropic") => cli_name == "claude" && !bedrock_configured,
-            Some("bedrock") => cli_name == "claude" && bedrock_configured,
-            Some("dashscope") => cli_name == "claude" && provider_enabled(config, "dashscope"),
-            Some("openai-codex") => cli_name == "codex",
-            Some(p) => provider_enabled(config, p),
-        })
-        .collect()
-}
-
-fn provider_enabled(config: &crate::config::GatewayConfig, name: &str) -> bool {
-    config.providers.get(name).is_some_and(|p| p.enabled)
+fn format_cache_age(age: Option<Duration>) -> String {
+    let Some(age) = age else {
+        return "刚刚".into();
+    };
+    let secs = age.as_secs();
+    if secs < 60 {
+        "刚刚".into()
+    } else if secs < 3600 {
+        format!("{}分钟前", secs / 60)
+    } else if secs < 86_400 {
+        format!("{}小时前", secs / 3600)
+    } else {
+        format!("{}天前", secs / 86_400)
+    }
 }
 
 /// Result of resolving a user-provided `/model` argument.
@@ -2451,8 +2603,8 @@ pub(crate) enum ResolvedModel {
     Unrecognized,
 }
 
-/// Match against: numeric index · "默认"/"default" · "opus" shorthand · label
-/// (case-insensitive, whitespace ignored) · alias · exact id · extended whitelist.
+/// Match against: numeric index · "默认"/"default" · label
+/// (case-insensitive, whitespace ignored) · alias · exact id.
 /// Anything else → `Unrecognized`.
 pub(crate) fn resolve_model_input(input: &str, entries: &[ModelEntry]) -> ResolvedModel {
     let trimmed = input.trim();
@@ -2474,22 +2626,6 @@ pub(crate) fn resolve_model_input(input: &str, entries: &[ModelEntry]) -> Resolv
     // "默认" / "default"
     if trimmed == "默认" || trimmed.eq_ignore_ascii_case("default") {
         return ResolvedModel::Default;
-    }
-
-    // "opus" shorthand → latest Opus in the active menu. This keeps the
-    // provider-specific ID aligned with the current config.
-    if trimmed.eq_ignore_ascii_case("opus")
-        && let Some(id) = entries
-            .iter()
-            .find(|e| e.label == "Opus 4.7")
-            .and_then(|e| e.full_id.clone())
-    {
-        return ResolvedModel::Id(id);
-    }
-    if entries.iter().all(|entry| entry.full_id.is_none())
-        && let Some(id) = legacy_model_shorthand(trimmed)
-    {
-        return ResolvedModel::Id(id.to_string());
     }
 
     // Label match with whitespace ignored, case-insensitive.
@@ -2524,78 +2660,15 @@ pub(crate) fn resolve_model_input(input: &str, entries: &[ModelEntry]) -> Resolv
         }
     }
 
-    // Extended model id whitelist.
-    for id in known_model_ids() {
-        if trimmed.eq_ignore_ascii_case(id) {
-            return ResolvedModel::Id(id.to_string());
-        }
+    if is_explicit_model_id(trimmed) {
+        return ResolvedModel::Id(trimmed.to_string());
     }
 
     ResolvedModel::Unrecognized
 }
 
-fn legacy_model_shorthand(input: &str) -> Option<&'static str> {
-    if input.eq_ignore_ascii_case("opus") {
-        Some("us.anthropic.claude-opus-4-7")
-    } else if input.eq_ignore_ascii_case("haiku") {
-        Some("us.anthropic.claude-haiku-4-5-20251001-v1:0")
-    } else if input.eq_ignore_ascii_case("sonnet") {
-        Some("us.anthropic.claude-sonnet-4-6")
-    } else {
-        None
-    }
-}
-
-/// All model identifiers the gateway accepts.
-fn known_model_ids() -> &'static [&'static str] {
-    &[
-        // Bedrock full IDs
-        "us.anthropic.claude-opus-4-7",
-        "us.anthropic.claude-opus-4-6-v1",
-        "us.anthropic.claude-opus-4-5-20251101-v1:0",
-        "us.anthropic.claude-opus-4-1-20250805-v1:0",
-        "us.anthropic.claude-opus-4-20250514-v1:0",
-        "us.anthropic.claude-sonnet-4-6",
-        "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
-        "us.anthropic.claude-sonnet-4-20250514-v1:0",
-        "us.anthropic.claude-haiku-4-5-20251001-v1:0",
-        // Anthropic API short names
-        "claude-opus-4-7",
-        "claude-opus-4-6",
-        "claude-opus-4-5",
-        "claude-opus-4-5-20251101",
-        "claude-opus-4-1",
-        "claude-opus-4-1-20250805",
-        "claude-opus-4",
-        "claude-opus-4-0",
-        "claude-opus-4-20250514",
-        "claude-sonnet-4-6",
-        "claude-sonnet-4-5",
-        "claude-sonnet-4-5-20250929",
-        "claude-sonnet-4",
-        "claude-sonnet-4-0",
-        "claude-sonnet-4-20250514",
-        "claude-haiku-4-5",
-        "claude-haiku-4-5-20251001",
-        "claude-haiku-4",
-    ]
-}
-
-/// Map a concrete model ID to its provider name, or None.
-pub(crate) fn model_provider(model_id: &str, entries: &[ModelEntry]) -> Option<String> {
-    for entry in entries {
-        if entry.full_id.as_deref() == Some(model_id) {
-            return entry.provider.clone();
-        }
-    }
-    None
-}
-
-/// Return whether a concrete model ID is present in the active model menu.
-pub(crate) fn has_model_id(model_id: &str, entries: &[ModelEntry]) -> bool {
-    entries
-        .iter()
-        .any(|entry| entry.full_id.as_deref() == Some(model_id))
+fn is_explicit_model_id(input: &str) -> bool {
+    !input.chars().any(char::is_whitespace) && input.contains('.')
 }
 
 fn strip_whitespace(s: &str) -> String {
@@ -2643,6 +2716,15 @@ mod tests {
         assert_eq!(format_duration(500), "500ms");
         assert_eq!(format_duration(3500), "3.5s");
         assert_eq!(format_duration(125_000), "2m 5s");
+    }
+
+    #[test]
+    fn format_cache_age_values() {
+        assert_eq!(format_cache_age(None), "刚刚");
+        assert_eq!(format_cache_age(Some(Duration::from_secs(59))), "刚刚");
+        assert_eq!(format_cache_age(Some(Duration::from_secs(120))), "2分钟前");
+        assert_eq!(format_cache_age(Some(Duration::from_secs(7200))), "2小时前");
+        assert_eq!(format_cache_age(Some(Duration::from_secs(172800))), "2天前");
     }
 
     // ── Harness snapshot tests ──────────────────────────────────
@@ -2851,13 +2933,12 @@ mod tests {
                     chat_id: "chat_1",
                     user_id: "user_1",
                     resolved_cli: &cli,
-                    resolved_provider: None,
-                    durable_store: None,
+                    resolved_provider_config: None,
                     trace_repo: None,
                     project_dirs: &config.project_dirs,
                     cli_availability: &[],
                     auth_status: None,
-                    active_tasks: None,
+                    active_requests: None,
                     codex_app_pool: None,
                     gateway_start: chrono::Utc::now(),
                 };
@@ -2890,13 +2971,12 @@ mod tests {
     #[tokio::test]
     async fn cmd_model_no_arg_shows_current() {
         let config = test_config();
-        let cli = crate::cli_bridge::CliProfile::Claude {
-            bin: "claude".into(),
-            model: None,
-            stream_json: true,
-            extra_args: vec![],
-            env: Default::default(),
-            env_file: None,
+        let cli = crate::cli_bridge::CliProfile::Custom {
+            bin: "echo".into(),
+            args_template: vec![],
+            json_output: false,
+            session_id_field: None,
+            text_field: None,
         };
         let astra = astra::Client::new("http://localhost:8080", None).unwrap();
         let ctx = CommandContext {
@@ -2907,28 +2987,39 @@ mod tests {
             chat_id: "chat_1",
             user_id: "user_1",
             resolved_cli: &cli,
-            resolved_provider: None,
-            durable_store: None,
+            resolved_provider_config: None,
             trace_repo: None,
             project_dirs: &config.project_dirs,
             cli_availability: &[],
             auth_status: None,
-            active_tasks: None,
+            active_requests: None,
             codex_app_pool: None,
             gateway_start: chrono::Utc::now(),
         };
         let r = handle_command(&ctx, "/model").await;
         let s = r.unwrap();
         assert!(s.contains("当前"));
-        assert!(s.contains("Haiku"));
-        assert!(s.contains("Opus"));
         assert!(s.contains("默认"));
         assert!(s.contains("切换"));
     }
 
     #[test]
     fn resolve_model_input_variants() {
-        let e = model_entries();
+        let e = vec![
+            default_model_entry(),
+            ModelEntry {
+                label: "qwen3.7-max".into(),
+                desc: "Claude alias: haiku".into(),
+                full_id: Some("qwen3.7-max".into()),
+                aliases: vec!["haiku".into()],
+            },
+            ModelEntry {
+                label: "deepseek-v4-pro".into(),
+                desc: "Claude custom model".into(),
+                full_id: Some("deepseek-v4-pro".into()),
+                aliases: vec!["deepseek".into(), "ds".into()],
+            },
+        ];
         fn id(r: ResolvedModel) -> String {
             match r {
                 ResolvedModel::Id(s) => s,
@@ -2937,22 +3028,15 @@ mod tests {
             }
         }
 
-        // "opus" shorthand → latest Opus
-        assert_eq!(id(resolve_model_input("opus", &e)), "claude-opus-4-7");
-        assert_eq!(id(resolve_model_input("Opus", &e)), "claude-opus-4-7");
-        // Exact label match (case-insensitive)
-        assert_eq!(id(resolve_model_input("Opus 4.7", &e)), "claude-opus-4-7");
-        assert_eq!(id(resolve_model_input("opus 4.7", &e)), "claude-opus-4-7");
-        assert_eq!(id(resolve_model_input("Opus 4.6", &e)), "claude-opus-4-6");
-        assert_eq!(id(resolve_model_input("sonnet", &e)), "claude-sonnet-4-6");
-        assert_eq!(id(resolve_model_input("Haiku", &e)), "claude-haiku-4-5");
-        // Numeric index: 1=默认, 2=Sonnet, 3=Haiku, 4=Opus 4.7, 5=Opus 4.6
+        assert_eq!(id(resolve_model_input("haiku", &e)), "qwen3.7-max");
+        assert_eq!(id(resolve_model_input("QWEN3.7-MAX", &e)), "qwen3.7-max");
+        assert_eq!(id(resolve_model_input("deepseek", &e)), "deepseek-v4-pro");
+        assert_eq!(id(resolve_model_input("ds", &e)), "deepseek-v4-pro");
         assert!(matches!(
             resolve_model_input("1", &e),
             ResolvedModel::Default
         ));
-        assert_eq!(id(resolve_model_input("4", &e)), "claude-opus-4-7");
-        // Default
+        assert_eq!(id(resolve_model_input("2", &e)), "qwen3.7-max");
         assert!(matches!(
             resolve_model_input("默认", &e),
             ResolvedModel::Default
@@ -2961,46 +3045,14 @@ mod tests {
             resolve_model_input("default", &e),
             ResolvedModel::Default
         ));
-        // Full id of a known entry accepted
-        assert_eq!(
-            id(resolve_model_input("us.anthropic.claude-opus-4-7", &e)),
-            "us.anthropic.claude-opus-4-7"
-        );
-        // Whitespace collapsed inside labels
-        assert_eq!(
-            id(resolve_model_input("  opus  4.7  ", &e)),
-            "claude-opus-4-7"
-        );
-        assert_eq!(id(resolve_model_input("opus4.7", &e)), "claude-opus-4-7");
-        assert_eq!(id(resolve_model_input("OPUS4.7", &e)), "claude-opus-4-7");
-        // Extended whitelist: CLI short name
-        assert_eq!(
-            id(resolve_model_input("claude-opus-4-7", &e)),
-            "claude-opus-4-7"
-        );
-        assert_eq!(
-            id(resolve_model_input("claude-sonnet-4-5-20250929", &e)),
-            "claude-sonnet-4-5-20250929"
-        );
-        // Extended whitelist: older Bedrock ids not in the menu still accepted
-        assert_eq!(
-            id(resolve_model_input(
-                "us.anthropic.claude-opus-4-5-20251101-v1:0",
-                &e
-            )),
-            "us.anthropic.claude-opus-4-5-20251101-v1:0"
-        );
-        // DashScope aliases and IDs resolve when entries include them
-        assert_eq!(id(resolve_model_input("deepseek", &e)), "deepseek-v4-pro");
-        assert_eq!(id(resolve_model_input("ds", &e)), "deepseek-v4-pro");
         assert_eq!(
             id(resolve_model_input("deepseek-v4-pro", &e)),
             "deepseek-v4-pro"
         );
-        assert_eq!(id(resolve_model_input("qwen", &e)), "qwen3.6-plus");
-        assert_eq!(id(resolve_model_input("kimi", &e)), "kimi-k2.6");
-        assert_eq!(id(resolve_model_input("glm", &e)), "glm-5.1");
-        // Anything else rejected
+        assert_eq!(
+            id(resolve_model_input("vendor.model-v1", &e)),
+            "vendor.model-v1"
+        );
         assert!(matches!(
             resolve_model_input("xyz-model", &e),
             ResolvedModel::Unrecognized
@@ -3018,165 +3070,43 @@ mod tests {
             ResolvedModel::Unrecognized
         ));
         assert!(matches!(
-            resolve_model_input("us.anthropic.claude-opus-9-9", &e),
+            resolve_model_input("claude-opus-9-9", &e),
             ResolvedModel::Unrecognized
         ));
     }
 
     #[test]
-    fn all_model_entries_filters_by_provider() {
-        let mut config = test_config();
-        // No providers configured → Claude official IDs + default
-        let entries = all_model_entries(&config, "claude");
-        assert!(
-            entries
-                .iter()
-                .all(|e| e.provider.as_deref() != Some("dashscope"))
-        );
-        assert!(
-            entries
-                .iter()
-                .all(|e| e.provider.as_deref() != Some("bedrock"))
-        );
-        assert!(entries.iter().any(|e| e.label == "Sonnet"));
-        assert_eq!(id(resolve_model_input("opus", &entries)), "claude-opus-4-7");
-        assert!(matches!(
-            resolve_model_input("deepseek-v4-pro", &entries),
-            ResolvedModel::Unrecognized
-        ));
-        let official_count = entries.len();
-
-        // Disabled bedrock provider does not change Claude official IDs.
-        config
-            .providers
-            .insert("bedrock".into(), Default::default());
-        let entries = all_model_entries(&config, "claude");
-        assert_eq!(id(resolve_model_input("opus", &entries)), "claude-opus-4-7");
-
-        // Enable bedrock provider → Bedrock IDs replace official Claude IDs.
-        config.providers.get_mut("bedrock").unwrap().enabled = true;
-        let entries = all_model_entries(&config, "claude");
-        assert!(
-            entries
-                .iter()
-                .all(|e| e.provider.as_deref() != Some("anthropic"))
-        );
-        assert!(
-            entries
-                .iter()
-                .any(|e| e.provider.as_deref() == Some("bedrock"))
-        );
-        assert_eq!(
-            id(resolve_model_input("opus", &entries)),
-            "us.anthropic.claude-opus-4-7"
-        );
-
-        // codex CLI without TAAS provider → default + official Codex models
-        let entries = all_model_entries(&config, "codex");
-        assert!(
-            entries
-                .iter()
-                .all(|e| e.provider.as_deref() != Some("bedrock"))
-        );
-        assert!(
-            entries
-                .iter()
-                .any(|e| e.full_id.as_deref() == Some("gpt-5.5"))
-        );
-        assert!(
-            entries
-                .iter()
-                .any(|e| e.full_id.as_deref() == Some("gpt-5.4"))
-        );
-        assert_eq!(entries.len(), 3);
-
-        // Enable dashscope provider → DashScope models appear for claude CLI.
-        config
-            .providers
-            .insert("dashscope".into(), Default::default());
-        config.providers.get_mut("dashscope").unwrap().enabled = true;
-        let entries = all_model_entries(&config, "claude");
-        assert!(entries.len() > official_count);
-        assert!(entries.iter().any(|e| e.label == "DeepSeek V4 Pro"));
-        assert!(entries.iter().any(|e| e.label == "Qwen 3.6+"));
-        assert!(entries.iter().any(|e| e.label == "Kimi K2.6"));
-
-        // codex CLI hides Bedrock/DashScope entries and only exposes Codex models.
-        let codex_entries = all_model_entries(&config, "codex");
-        assert!(!codex_entries.iter().any(|e| e.label == "Sonnet"));
-        assert!(!codex_entries.iter().any(|e| e.label == "DeepSeek V4 Pro"));
-        assert!(
-            codex_entries
-                .iter()
-                .any(|e| e.full_id.as_deref() == Some("gpt-5.5"))
-        );
-        assert!(
-            codex_entries
-                .iter()
-                .any(|e| e.full_id.as_deref() == Some("gpt-5.4"))
-        );
-        assert_eq!(codex_entries.len(), 3);
-
-        // Even if TAAS is configured, codex does not consume it.
-        config.providers.insert("taas".into(), Default::default());
-        config.providers.get_mut("taas").unwrap().enabled = true;
-        let codex_entries = all_model_entries(&config, "codex");
-        assert!(
-            codex_entries
-                .iter()
-                .any(|e| e.full_id.as_deref() == Some("gpt-5.5"))
-        );
-        assert!(
-            codex_entries
-                .iter()
-                .all(|e| e.provider.as_deref() != Some("taas"))
-        );
-        assert_eq!(codex_entries.len(), 3);
-
-        // Aliases resolve against the filtered list
-        fn id(r: ResolvedModel) -> String {
-            match r {
-                ResolvedModel::Id(s) => s,
-                ResolvedModel::Default => "__DEFAULT__".to_string(),
-                ResolvedModel::Unrecognized => "__UNRECOGNIZED__".to_string(),
-            }
-        }
-        assert_eq!(
-            id(resolve_model_input("deepseek", &entries)),
-            "deepseek-v4-pro"
-        );
-        assert_eq!(id(resolve_model_input("ds", &entries)), "deepseek-v4-pro");
-        assert_eq!(id(resolve_model_input("DS", &entries)), "deepseek-v4-pro");
-        assert_eq!(
-            id(resolve_model_input("DeepSeek V4 Pro", &entries)),
-            "deepseek-v4-pro"
-        );
-        assert_eq!(
-            id(resolve_model_input("deepseekv4pro", &entries)),
-            "deepseek-v4-pro"
-        );
-        assert_eq!(
-            id(resolve_model_input("opus", &entries)),
-            "us.anthropic.claude-opus-4-7"
-        );
-        assert!(matches!(
-            resolve_model_input("xyz", &entries),
-            ResolvedModel::Unrecognized
-        ));
-    }
-
-    #[test]
-    fn display_model_name_maps_known_ids() {
-        let entries = model_entries();
-        assert_eq!(
-            display_model_name("us.anthropic.claude-opus-4-7", &entries),
-            "Opus 4.7"
-        );
-        assert_eq!(
-            display_model_name("us.anthropic.claude-sonnet-4-6", &entries),
-            "Sonnet"
-        );
+    fn display_model_name_uses_discovered_entries() {
+        let entries = vec![
+            default_model_entry(),
+            ModelEntry {
+                label: "qwen3.7-max".into(),
+                desc: "Claude alias: haiku".into(),
+                full_id: Some("qwen3.7-max".into()),
+                aliases: vec!["haiku".into()],
+            },
+        ];
+        assert_eq!(display_model_name("qwen3.7-max", &entries), "qwen3.7-max");
         assert_eq!(display_model_name("unknown-id", &entries), "unknown-id");
+    }
+
+    #[test]
+    fn dynamic_claude_entries_display_resolved_model_id() {
+        let entries = vec![
+            default_model_entry(),
+            ModelEntry {
+                label: "qwen3.7-max".into(),
+                desc: "Claude alias: haiku".into(),
+                full_id: Some("qwen3.7-max".into()),
+                aliases: vec!["haiku".into()],
+            },
+        ];
+
+        assert_eq!(display_model_name("qwen3.7-max", &entries), "qwen3.7-max");
+        assert!(matches!(
+            resolve_model_input("haiku", &entries),
+            ResolvedModel::Id(id) if id == "qwen3.7-max"
+        ));
     }
     cmd_test!(
         cmd_model_set_without_db_still_succeeds,
@@ -3231,7 +3161,7 @@ mod tests {
             );
         }
     });
-    cmd_test!(cmd_task_requires_durable_store, "/task list", |r| {
+    cmd_test!(cmd_task_list_returns_response, "/task list", |r| {
         assert!(r.is_some());
     });
     cmd_test!(cmd_status_works_without_db, "/status", |r| {
@@ -3251,13 +3181,12 @@ mod tests {
             chat_id: "chat_1",
             user_id: "user_1",
             resolved_cli: &cli,
-            resolved_provider: None,
-            durable_store: None,
+            resolved_provider_config: None,
             trace_repo: None,
             project_dirs: &config.project_dirs,
             cli_availability: &[],
             auth_status: Some("⚠️ 暂停 (剩余 3m 42s)".to_string()),
-            active_tasks: None,
+            active_requests: None,
             codex_app_pool: None,
             gateway_start: chrono::Utc::now(),
         };
@@ -3422,9 +3351,6 @@ mod tests {
         let s = r.unwrap();
         assert!(s.contains("/manage"), "gateway should include /manage");
     });
-    // Note: trace_kill and outbox_dismiss GATEWAY action tags are only visible
-    // when model_generated_mutations is allowed AND store is available (tested below).
-
     // ── GAP 4: /gateway content completeness ────────────────────
 
     cmd_test!(cmd_gateway_content_completeness, "/gateway", |r| {
@@ -3745,7 +3671,7 @@ mod tests {
         cli: &'a crate::cli_bridge::CliProfile,
         astra: &'a astra::Client,
         repo: &'a dyn crate::trace_model::TraceRepository,
-        active_tasks: Option<&'a dashmap::DashMap<String, tokio_util::sync::CancellationToken>>,
+        active_requests: Option<&'a dashmap::DashMap<String, tokio_util::sync::CancellationToken>>,
     ) -> CommandContext<'a> {
         CommandContext {
             astra,
@@ -3755,13 +3681,12 @@ mod tests {
             chat_id: "chat_kill_all",
             user_id: "user_1",
             resolved_cli: cli,
-            resolved_provider: None,
-            durable_store: None,
+            resolved_provider_config: None,
             trace_repo: Some(repo),
             project_dirs: &config.project_dirs,
             cli_availability: &[],
             auth_status: None,
-            active_tasks,
+            active_requests,
             codex_app_pool: None,
             gateway_start: chrono::Utc::now(),
         }
@@ -3853,14 +3778,14 @@ mod tests {
         let config = test_config();
         let cli = crate::cli_bridge::CliProfile::default();
         let astra = astra::Client::new("http://localhost:8080", None).unwrap();
-        let active_tasks: dashmap::DashMap<String, tokio_util::sync::CancellationToken> =
+        let active_requests: dashmap::DashMap<String, tokio_util::sync::CancellationToken> =
             dashmap::DashMap::new();
 
         let t1 = seed_running_request(&repo, cli.name(), "chat_kill_all", "live").await;
         let token = tokio_util::sync::CancellationToken::new();
-        active_tasks.insert(t1.as_str().to_string(), token.clone());
+        active_requests.insert(t1.as_str().to_string(), token.clone());
 
-        let ctx = build_ctx_with_repo(&config, &cli, &astra, &repo, Some(&active_tasks)).await;
+        let ctx = build_ctx_with_repo(&config, &cli, &astra, &repo, Some(&active_requests)).await;
         handle_command(&ctx, "/esc all").await.unwrap();
 
         assert!(
@@ -3869,8 +3794,8 @@ mod tests {
              live turn is interrupted — not just mark DB as failed"
         );
         assert!(
-            active_tasks.get(t1.as_str()).is_none(),
-            "cancelled token entry should be removed from active_tasks"
+            active_requests.get(t1.as_str()).is_none(),
+            "cancelled token entry should be removed from active_requests"
         );
     }
 

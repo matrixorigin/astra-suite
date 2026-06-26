@@ -176,36 +176,6 @@ impl GatewayStore for SqliteGatewayStore {
         .await?;
 
         sqlx::query(
-            "CREATE TABLE IF NOT EXISTS gw_durable_tasks (
-                task_id TEXT PRIMARY KEY,
-                name TEXT NOT NULL,
-                description TEXT,
-                owner_id TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'created',
-                progress_pct INTEGER NOT NULL DEFAULT 0,
-                step_description TEXT,
-                checkpoint_json TEXT,
-                error_message TEXT,
-                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%f', 'now')),
-                updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%f', 'now'))
-            )",
-        )
-        .execute(&self.pool)
-        .await?;
-        sqlx::query(
-            "CREATE INDEX IF NOT EXISTS idx_durable_tasks_owner_status
-             ON gw_durable_tasks(owner_id, status)",
-        )
-        .execute(&self.pool)
-        .await?;
-        sqlx::query(
-            "CREATE INDEX IF NOT EXISTS idx_durable_tasks_owner_updated
-             ON gw_durable_tasks(owner_id, updated_at)",
-        )
-        .execute(&self.pool)
-        .await?;
-
-        sqlx::query(
             "CREATE TABLE IF NOT EXISTS gw_skills (
                 platform TEXT NOT NULL,
                 chat_id TEXT NOT NULL,
@@ -2264,7 +2234,6 @@ mod tests {
     async fn store_bundle_full_stack_integration() {
         use crate::store::{StorageConfig, open_store_bundle};
         use crate::trace_model::{ConversationKey, GatewayRequest};
-        use astra_task_store::TaskSpec;
 
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("bundle_test.db");
@@ -2276,19 +2245,6 @@ mod tests {
             .await
             .expect("open_store_bundle should succeed")
             .expect("bundle should be Some for sqlite");
-
-        // Durable store: create a task and get back a TaskId.
-        let durable = bundle.durable_store.as_ref().unwrap();
-        let task_id = durable
-            .create(&TaskSpec {
-                name: "integration test task".into(),
-                description: Some("testing full wiring".into()),
-                owner_id: "test_owner".into(),
-                initial_state: Some(serde_json::json!({"step": 0})),
-            })
-            .await
-            .expect("create durable task");
-        assert!(!task_id.0.is_empty(), "TaskId should be non-empty");
 
         // Trace repo: create a request.
         let trace = bundle.trace_repo.as_ref().unwrap();
@@ -2330,67 +2286,7 @@ mod tests {
         }
     }
 
-    // ── 7. Durable task survives reconnect ─────────────────────────────────
-
-    #[tokio::test]
-    async fn durable_task_survives_reconnect() {
-        use crate::durable_task_store::SqliteDurableTaskStore;
-        use astra_task_store::{DurableTaskStore, TaskSpec};
-
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("durable_reconnect.db");
-
-        let task_id;
-
-        // First connection: create task + checkpoint.
-        {
-            let store = make_file_store(&db_path).await;
-            let durable = SqliteDurableTaskStore::new(store.pool().clone());
-
-            task_id = durable
-                .create(&TaskSpec {
-                    name: "persist test".into(),
-                    description: None,
-                    owner_id: "owner1".into(),
-                    initial_state: Some(serde_json::json!({"step": 1})),
-                })
-                .await
-                .unwrap();
-
-            // Checkpoint.
-            durable
-                .checkpoint(
-                    &task_id,
-                    &serde_json::json!({"step": 2, "data": "important"}),
-                    Some(50),
-                    Some("halfway"),
-                )
-                .await
-                .unwrap();
-            // store + durable dropped here.
-        }
-
-        // Second connection: verify task + checkpoint intact.
-        {
-            let store = make_file_store(&db_path).await;
-            let durable = SqliteDurableTaskStore::new(store.pool().clone());
-
-            let task = durable
-                .get(&task_id)
-                .await
-                .unwrap()
-                .expect("task should survive reconnect");
-            assert_eq!(task.name, "persist test");
-            assert_eq!(task.progress_pct, 50);
-            assert_eq!(task.step_description.as_deref(), Some("halfway"));
-
-            let checkpoint = task.checkpoint.expect("checkpoint should survive");
-            assert_eq!(checkpoint["step"], 2);
-            assert_eq!(checkpoint["data"], "important");
-        }
-    }
-
-    // ── 8. Connect with invalid path errors cleanly ────────────────────────
+    // ── 7. Connect with invalid path errors cleanly ────────────────────────
 
     #[tokio::test]
     async fn connect_invalid_path_errors_cleanly() {

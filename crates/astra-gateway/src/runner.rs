@@ -7,7 +7,8 @@ use crate::cli_bridge::{self, CliProfile, CliProgress, ReasoningDisplay, Reasoni
 use crate::commands::{self, CommandContext};
 use crate::config::GatewayConfig;
 use crate::gateway_context::GatewayContext;
-use crate::platforms::{FeedbackEvent, InboundMessage, PlatformAdapter};
+use crate::mcp::tools_cron;
+use crate::platforms::{FeedbackEvent, InboundMessage, OutboundAttachment, PlatformAdapter};
 use crate::store::{self, GatewayStore};
 use crate::trace_model::{
     ConversationKey, GatewayEventKind, GatewayRequest, OutboxId, RequestId, RequestStatus,
@@ -63,7 +64,7 @@ fn is_astra_app_server_startup_error(error: &str) -> bool {
 
 const SEND_FAILURE_THRESHOLD: u32 = 3;
 /// After this long without a new failure, the breaker auto half-opens even
-/// without a success call. This matters for long-running tasks that recover
+/// without a success call. This matters for long-running requests that recover
 /// the platform but don't emit sends (so `record_success` is never called).
 /// Without the cooldown, such tasks would stay silent forever.
 #[allow(dead_code)]
@@ -386,7 +387,6 @@ pub struct GatewayRunner {
     cli_profile: CliProfile,
     thin: astra::Client,
     outbound_tx: Option<tokio::sync::mpsc::Sender<OutboundMessage>>,
-    durable_store: Option<Arc<dyn crate::durable_task_store::DurableTaskStoreExt>>,
     user_skills: Vec<(String, String)>,
     projects: Vec<String>,
     trace_repo: Option<Arc<dyn TraceRepository>>,
@@ -403,7 +403,7 @@ pub struct GatewayRunner {
     request_counter: AtomicU32,
     /// Active CLI turns indexed by trace_id. Used by `/esc` to interrupt
     /// running turns immediately instead of only marking DB state.
-    active_tasks: Arc<dashmap::DashMap<String, CancellationToken>>,
+    active_requests: Arc<dashmap::DashMap<String, CancellationToken>>,
     /// Per-conversation send circuit breaker. Workers check this before
     /// emitting heartbeats — stops sending after consecutive failures to
     /// avoid message flood when platform is unreachable.
@@ -416,6 +416,8 @@ pub struct GatewayRunner {
     cli_pool: Arc<tokio::sync::Mutex<crate::cli_pool::CliProcessPool>>,
     /// Pool of long-lived Codex app-server processes (persistent mode).
     codex_app_pool: Arc<tokio::sync::Mutex<crate::codex_app_pool::CodexAppPool>>,
+    runtime_api_url: Option<String>,
+    runtime_api_token: Option<String>,
 }
 
 /// No-op adapter used in spawned CLI tasks (typing/heartbeats not available in background).
@@ -478,18 +480,17 @@ impl GatewayRunner {
         )?;
 
         let storage_config = config.resolve_storage();
-        let (store, durable_store, trace_repo) =
-            match store::open_store_bundle(&storage_config).await {
-                Ok(Some(bundle)) => {
-                    tracing::info!(backend = ?storage_config, "storage connected");
-                    (Some(bundle.store), bundle.durable_store, bundle.trace_repo)
-                }
-                Ok(None) => {
-                    tracing::info!("running without persistence (storage: none)");
-                    (None, None, None)
-                }
-                Err(e) => return Err(e),
-            };
+        let (store, trace_repo) = match store::open_store_bundle(&storage_config).await {
+            Ok(Some(bundle)) => {
+                tracing::info!(backend = ?storage_config, "storage connected");
+                (Some(bundle.store), bundle.trace_repo)
+            }
+            Ok(None) => {
+                tracing::info!("running without persistence (storage: none)");
+                (None, None)
+            }
+            Err(e) => return Err(e),
+        };
 
         let cli_profile = config.cli.clone();
 
@@ -553,7 +554,6 @@ impl GatewayRunner {
             cli_profile: effective_cli,
             thin,
             outbound_tx: None,
-            durable_store,
             user_skills,
             projects,
             trace_repo,
@@ -563,7 +563,7 @@ impl GatewayRunner {
             auth_failures: Arc::new(dashmap::DashMap::new()),
             shared_auth,
             request_counter: AtomicU32::new(0),
-            active_tasks: Arc::new(dashmap::DashMap::new()),
+            active_requests: Arc::new(dashmap::DashMap::new()),
             send_health: SendCircuitBreaker::default(),
             gateway_start: chrono::Utc::now(),
             cli_pool: Arc::new(tokio::sync::Mutex::new(
@@ -572,6 +572,8 @@ impl GatewayRunner {
             codex_app_pool: Arc::new(tokio::sync::Mutex::new(
                 crate::codex_app_pool::CodexAppPool::new(),
             )),
+            runtime_api_url: None,
+            runtime_api_token: None,
         })
     }
 
@@ -594,20 +596,6 @@ impl GatewayRunner {
         &self.cli_profile
     }
 
-    pub async fn sweep_stale_tasks(&self) {
-        if let Some(ref store) = self.durable_store {
-            let result = retry_once_on_transient("sweep_stale_tasks", || async {
-                store.suspend_stale_running_tasks("gateway restarted").await
-            })
-            .await;
-            match result {
-                Ok(0) => {}
-                Ok(n) => tracing::info!(count = n, "swept stale running tasks → suspended"),
-                Err(e) => tracing::warn!(error = %e, "failed to sweep stale tasks"),
-            }
-        }
-    }
-
     pub async fn sweep_stale_traces(&self) {
         if let Some(ref repo) = self.trace_repo {
             let result = retry_once_on_transient("sweep_stale_traces", || async {
@@ -624,6 +612,11 @@ impl GatewayRunner {
 
     pub fn set_outbound_tx(&mut self, tx: tokio::sync::mpsc::Sender<OutboundMessage>) {
         self.outbound_tx = Some(tx);
+    }
+
+    pub fn set_runtime_api(&mut self, url: String, token: String) {
+        self.runtime_api_url = Some(url);
+        self.runtime_api_token = Some(token);
     }
 
     async fn record_feedback(&self, msg: &InboundMessage, feedback: &FeedbackEvent) {
@@ -723,29 +716,16 @@ impl GatewayRunner {
         // Apply per-user model override scoped to this CLI. Empty string is the
         // "use default" sentinel written by `/model 默认` — treat as no override.
         let model_key = store::model_preference_key(profile.name(), Some(chat_id));
-        let entries = crate::commands::all_model_entries(&self.config, profile.name());
         if let Some(ref store) = self.store
             && let Ok(Some(model_name)) = store
                 .get_user_preference(platform, user_id, &model_key)
                 .await
             && !model_name.is_empty()
         {
-            let is_supported_codex_model = crate::commands::has_model_id(&model_name, &entries);
-            if profile.name() != "codex" || is_supported_codex_model {
-                profile.set_model_override(model_name);
-            } else {
-                tracing::warn!(
-                    cli = profile.name(),
-                    model = %model_name,
-                    "ignoring stale model override not supported by active CLI"
-                );
-            }
+            profile.set_model_override(model_name);
         }
 
-        let provider = profile
-            .model_name()
-            .and_then(|mid| crate::commands::model_provider(mid, &entries))
-            .and_then(|pn| self.config.providers.get(&pn).cloned());
+        let provider = crate::cli_bridge::provider_for_cli_profile(&self.config, &profile);
 
         (profile, provider)
     }
@@ -809,13 +789,9 @@ impl GatewayRunner {
         };
 
         // Resolve active CLI profile
-        let (cli_profile, _provider_config) = self
+        let (cli_profile, provider_config) = self
             .resolve_cli_profile(msg.platform, &msg.user_id, &effective_chat_id)
             .await;
-        let entries = crate::commands::all_model_entries(&self.config, cli_profile.name());
-        let provider_name = cli_profile
-            .model_name()
-            .and_then(|mid| crate::commands::model_provider(mid, &entries));
 
         let trimmed = msg.text.trim();
 
@@ -853,11 +829,7 @@ impl GatewayRunner {
                     chat_id: &effective_chat_id,
                     user_id: &msg.user_id,
                     resolved_cli: &cli_profile,
-                    resolved_provider: provider_name.as_deref(),
-                    durable_store: self
-                        .durable_store
-                        .as_ref()
-                        .map(|s| s.as_ref() as &dyn astra_task_store::DurableTaskStore),
+                    resolved_provider_config: provider_config.as_ref(),
                     trace_repo: self
                         .trace_repo
                         .as_ref()
@@ -865,7 +837,7 @@ impl GatewayRunner {
                     project_dirs: &self.config.project_dirs,
                     cli_availability: &self.cli_availability,
                     auth_status: self.auth_status_line(cli_profile.name()),
-                    active_tasks: Some(&self.active_tasks),
+                    active_requests: Some(&self.active_requests),
                     codex_app_pool: Some(&self.codex_app_pool),
                     gateway_start: self.gateway_start,
                 };
@@ -903,11 +875,7 @@ impl GatewayRunner {
             chat_id: &effective_chat_id,
             user_id: &msg.user_id,
             resolved_cli: &cli_profile,
-            resolved_provider: provider_name.as_deref(),
-            durable_store: self
-                .durable_store
-                .as_ref()
-                .map(|s| s.as_ref() as &dyn astra_task_store::DurableTaskStore),
+            resolved_provider_config: provider_config.as_ref(),
             trace_repo: self
                 .trace_repo
                 .as_ref()
@@ -915,7 +883,7 @@ impl GatewayRunner {
             project_dirs: &self.config.project_dirs,
             cli_availability: &self.cli_availability,
             auth_status: self.auth_status_line(cli_profile.name()),
-            active_tasks: Some(&self.active_tasks),
+            active_requests: Some(&self.active_requests),
             codex_app_pool: Some(&self.codex_app_pool),
             gateway_start: self.gateway_start,
         };
@@ -932,11 +900,10 @@ impl GatewayRunner {
                 // resolved to a valid model. Otherwise the user just gets an
                 // error message back and the existing session stays warm.
                 let should_kill = if let Some(arg) = msg.text.strip_prefix("/model ") {
-                    let entries = commands::all_model_entries(&self.config, cli_profile.name());
-                    !matches!(
-                        commands::resolve_model_input(arg, &entries),
-                        commands::ResolvedModel::Unrecognized
-                    )
+                    let arg = arg.trim();
+                    !arg.eq_ignore_ascii_case("refresh")
+                        && !response.starts_with("⚠️ 未识别模型")
+                        && !response.starts_with("⚠️ 模型设置失败")
                 } else {
                     true
                 };
@@ -1190,28 +1157,6 @@ impl GatewayRunner {
                     .collect();
                 ctx = ctx.with_cron_jobs(cron_list);
             }
-            if let Some(ref store) = self.durable_store {
-                let owner = format!("{}:{}", msg.platform, effective_chat_id);
-                let filter = astra_task_store::TaskFilter {
-                    owner_id: Some(owner),
-                    ..Default::default()
-                };
-                if let Ok(tasks) = store.list(filter).await {
-                    let task_list: Vec<_> = tasks
-                        .iter()
-                        .filter(|t| t.status.is_active())
-                        .map(|t| {
-                            (
-                                t.id.0[..8.min(t.id.0.len())].to_string(),
-                                t.name.clone(),
-                                t.status.as_str().to_string(),
-                                t.progress_pct,
-                            )
-                        })
-                        .collect();
-                    ctx = ctx.with_active_tasks(task_list);
-                }
-            }
             if !self.user_skills.is_empty() {
                 ctx = ctx.with_extra_skills(self.user_skills.clone());
             }
@@ -1295,7 +1240,7 @@ impl GatewayRunner {
             .as_ref()
             .map(|t| t.trace_id.to_string())
             .unwrap_or_else(|| format!("notrace:{request_tag}"));
-        self.active_tasks
+        self.active_requests
             .insert(kill_registry_key.clone(), cancel_token.clone());
 
         let use_claude_pool = supports_claude_pool;
@@ -1325,6 +1270,8 @@ impl GatewayRunner {
                 &effective_chat_id,
                 &msg.user_id,
                 &self.config.project_dirs,
+                self.runtime_api_url.as_deref(),
+                self.runtime_api_token.as_deref(),
             )
             .ok()
         } else {
@@ -1726,7 +1673,7 @@ impl GatewayRunner {
         // OutboundMessage with msg.chat_id and tracks failures under
         // that key. Using effective_chat_id here would create a mismatch.
         let health_key = format!("{}:{}", msg.platform, msg.chat_id);
-        // Reset health at task start — previous failures are stale.
+        // Reset health at request start — previous failures are stale.
         self.send_health.reset(&health_key);
 
         // Full accumulated text for stream (WeCom stream content is full-replacement, not append).
@@ -2135,7 +2082,7 @@ impl GatewayRunner {
         }
 
         // Deregister from active tasks registry.
-        self.active_tasks.remove(&kill_registry_key);
+        self.active_requests.remove(&kill_registry_key);
 
         // If the task was cancelled, the persistent pools translate it to
         // native Esc/interrupt for the active turn. One-shot CLIs are
@@ -2164,30 +2111,6 @@ impl GatewayRunner {
             );
         }
 
-        // Helper: suspend running durable tasks for this chat on failure
-        let suspend_tasks = |store: &Option<
-            Arc<dyn crate::durable_task_store::DurableTaskStoreExt>,
-        >,
-                             reason: String| {
-            let store = store.clone();
-            let owner = format!(
-                "{platform}:{chat_id}",
-                platform = msg.platform,
-                chat_id = effective_chat_id
-            );
-            async move {
-                if let Some(ref s) = store {
-                    let n = s
-                        .suspend_running_tasks_for_owner(&owner, &reason)
-                        .await
-                        .unwrap_or(0);
-                    if n > 0 {
-                        tracing::info!(count = n, %reason, "auto-suspended durable tasks on CLI failure");
-                    }
-                }
-            }
-        };
-
         let mut result = match cli_handle.await {
             Ok(Ok(result)) => result,
             Ok(Err(e)) => {
@@ -2198,7 +2121,6 @@ impl GatewayRunner {
                         auth.invalidate().await;
                     }
                 }
-                suspend_tasks(&self.durable_store, format!("CLI error: {e}")).await;
                 if let Some(writer) = trace_writer.as_ref() {
                     if let Some(ref run_id) = run_id {
                         let _ = writer
@@ -2221,7 +2143,6 @@ impl GatewayRunner {
                 );
             }
             Err(e) => {
-                suspend_tasks(&self.durable_store, format!("CLI interrupted: {e}")).await;
                 if let Some(writer) = trace_writer.as_ref() {
                     if let Some(ref run_id) = run_id {
                         let _ = writer
@@ -2351,11 +2272,6 @@ impl GatewayRunner {
                 }
             }
 
-            suspend_tasks(
-                &self.durable_store,
-                format!("CLI exit code {}", result.exit_code),
-            )
-            .await;
             if result.text.is_none() || result.text.as_deref() == Some("") {
                 let error_text = if result.stderr.is_empty() {
                     &result.stdout
@@ -2460,14 +2376,7 @@ impl GatewayRunner {
                 msg.platform,
                 &msg.chat_id,
                 &msg.user_id,
-                self.durable_store
-                    .as_ref()
-                    .map(|s| s.as_ref() as &dyn astra_task_store::DurableTaskStore),
-                self.config.skills_dir.as_deref(),
                 &self.config.action_policy,
-                self.trace_repo
-                    .as_ref()
-                    .map(|r| r.as_ref() as &dyn TraceRepository),
                 &mut action_results,
             )
             .await;
@@ -2901,7 +2810,7 @@ impl GatewayRunner {
         let mut sections = vec![
             "# Gateway 任务管理模式".to_string(),
             "你现在是 Gateway 任务管理助手。分析以下运行状态，帮助用户管理任务。".to_string(),
-            "你可以使用 [[GATEWAY:...]] 标签直接执行操作。".to_string(),
+            "你不能直接执行管理操作；请给出明确的 slash command 建议。".to_string(),
         ];
 
         // Active requests
@@ -2937,9 +2846,8 @@ impl GatewayRunner {
                     ));
                 }
                 sections.push("\n可用操作:".to_string());
-                sections.push("- 中断运行中: [[GATEWAY:trace_kill:<trace_id>]]".to_string());
-                sections
-                    .push("- 清除失败投递: [[GATEWAY:outbox_dismiss:<request_id>]]".to_string());
+                sections.push("- 用 `/esc <trace_id>` 中断运行中的请求".to_string());
+                sections.push("- 用 `/retry dismiss <request_id>` 清除失败投递".to_string());
             } else {
                 sections.push("\n## 活跃请求\n无".to_string());
             }
@@ -2961,39 +2869,7 @@ impl GatewayRunner {
                         job.cron_expr, job.description
                     ));
                 }
-                sections.push("\n可用操作: [[GATEWAY:task_del:<job_id>]] 删除".to_string());
-            }
-        }
-
-        // Durable tasks
-        if let Some(ref durable) = self.durable_store {
-            let owner = format!("{}:{}", msg.platform, effective_chat_id);
-            let filter = astra_task_store::TaskFilter {
-                owner_id: Some(owner),
-                ..Default::default()
-            };
-            if let Ok(tasks) = durable.list(filter).await {
-                let active: Vec<_> = tasks.iter().filter(|t| t.status.is_active()).collect();
-                if !active.is_empty() {
-                    sections.push("\n## 持久任务".to_string());
-                    for t in &active {
-                        let short = &t.id.0[..8.min(t.id.0.len())];
-                        let icon = match t.status {
-                            astra_task_store::DurableTaskStatus::Running => "\u{1f504}",
-                            astra_task_store::DurableTaskStatus::Suspended => "\u{23f8}",
-                            _ => "\u{1f4cb}",
-                        };
-                        let step = t
-                            .step_description
-                            .as_ref()
-                            .map(|s| format!(" | {s}"))
-                            .unwrap_or_default();
-                        sections.push(format!(
-                            "- {} `{short}` | {} | {}%{}",
-                            icon, t.name, t.progress_pct, step,
-                        ));
-                    }
-                }
+                sections.push("\n可用操作: 使用 `/task cancel <job_id>` 删除".to_string());
             }
         }
 
@@ -3001,7 +2877,8 @@ impl GatewayRunner {
             sections.push(format!("\n## 用户指示\n{extra}"));
         } else {
             sections.push(
-                "\n## 请求\n请分析以上状态，报告异常，并建议操作。如果有明显的问题（如长时间 running、失败的投递），直接用 GATEWAY 标签处理。".to_string(),
+                "\n## 请求\n请分析以上状态，报告异常，并建议用户执行对应 slash command。"
+                    .to_string(),
             );
         }
 
@@ -3079,7 +2956,7 @@ impl GatewayRunner {
 
     /// See build_queued_request_with_profile_override — used by the
     /// `/manage` slow-path so the request goes to a different worker
-    /// than the user's currently-running tasks.
+    /// than the user's currently-running requests.
     async fn enqueue_cli_request_with_profile_override(
         self: &Arc<Self>,
         msg: InboundMessage,
@@ -3337,6 +3214,7 @@ impl GatewayRunner {
         adapters: Vec<Box<dyn PlatformAdapter>>,
         mut cron_rx: tokio::sync::mpsc::Receiver<OutboundMessage>,
         mut inject_rx: tokio::sync::mpsc::Receiver<InboundMessage>,
+        mut runtime_cmd_rx: tokio::sync::mpsc::Receiver<crate::runtime_api::RuntimeCommand>,
         mut shutdown: tokio::sync::broadcast::Receiver<()>,
     ) {
         let mut started: Vec<Box<dyn PlatformAdapter>> = Vec::new();
@@ -3363,7 +3241,6 @@ impl GatewayRunner {
         for (idx, adapter) in adapters.iter().enumerate() {
             adapter_indices.insert(adapter.name(), idx);
         }
-        self.sweep_stale_tasks().await;
         self.sweep_stale_traces().await;
         self.replay_retryable_outbox(&adapters, &adapter_indices)
             .await;
@@ -3446,12 +3323,79 @@ impl GatewayRunner {
                         }
                     }
                 }
+                command = runtime_cmd_rx.recv() => {
+                    if let Some(command) = command {
+                        self.handle_runtime_command(&adapters, &adapter_indices, command).await;
+                    }
+                }
                 _ = shutdown.recv() => break,
             }
         }
 
         for adapter in &mut adapters {
             adapter.stop().await;
+        }
+    }
+
+    async fn handle_runtime_command(
+        &self,
+        adapters: &[Box<dyn PlatformAdapter>],
+        adapter_indices: &HashMap<&'static str, usize>,
+        command: crate::runtime_api::RuntimeCommand,
+    ) {
+        match command {
+            crate::runtime_api::RuntimeCommand::SendAttachment {
+                platform,
+                chat_id,
+                attachment,
+                caption,
+            } => {
+                tracing::info!(
+                    platform = %platform,
+                    chat_id = %safe_id(&chat_id),
+                    path = attachment.local_path.as_deref(),
+                    media_id = attachment.media_id.as_deref(),
+                    "runtime send attachment command"
+                );
+                if let Some(caption) = caption.as_deref().filter(|s| !s.trim().is_empty())
+                    && let Err((_, e)) = send_text_to_platform(
+                        adapters,
+                        adapter_indices,
+                        &platform,
+                        &chat_id,
+                        caption,
+                        None,
+                        None,
+                        None,
+                        true,
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        platform = %platform,
+                        chat_id = %safe_id(&chat_id),
+                        error = %e,
+                        "runtime attachment caption send failed"
+                    );
+                }
+                if let Err(e) = send_attachment_to_platform(
+                    adapters,
+                    adapter_indices,
+                    &platform,
+                    &chat_id,
+                    &attachment,
+                    None,
+                )
+                .await
+                {
+                    tracing::warn!(
+                        platform = %platform,
+                        chat_id = %safe_id(&chat_id),
+                        error = %e,
+                        "runtime attachment send failed"
+                    );
+                }
+            }
         }
     }
 }
@@ -3534,6 +3478,25 @@ async fn send_text_to_platform(
         }
     }
     Ok(chunk_count)
+}
+
+async fn send_attachment_to_platform(
+    adapters: &[Box<dyn PlatformAdapter>],
+    adapter_indices: &HashMap<&'static str, usize>,
+    platform: &str,
+    chat_id: &str,
+    attachment: &OutboundAttachment,
+    reply_token: Option<&str>,
+) -> Result<(), String> {
+    let Some(idx) = adapter_indices.get(platform).copied() else {
+        return Err("no adapter for outbound attachment".into());
+    };
+    let Some(adapter) = adapters.get(idx) else {
+        return Err("adapter index missing for outbound attachment".into());
+    };
+    adapter
+        .send_attachment(chat_id, attachment, reply_token)
+        .await
 }
 
 async fn send_typing_to_platform(
@@ -3785,30 +3748,12 @@ fn save_token_to_cli_credentials(
     Ok(())
 }
 
-fn is_safe_skill_name(name: &str) -> bool {
-    let trimmed = name.trim();
-    !trimmed.is_empty()
-        && trimmed
-            .chars()
-            .all(|ch| ch.is_alphanumeric() || matches!(ch, ' ' | '_' | '-'))
-}
-
 #[cfg(test)]
 fn is_safe_db_name(name: &str) -> bool {
     !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
-async fn resolve_gateway_task(
-    store: &dyn astra_task_store::DurableTaskStore,
-    owner_id: &str,
-    selector: &str,
-) -> Result<astra_task_store::DurableTask, String> {
-    astra_task_store::resolve_task_for_owner(store, owner_id, selector)
-        .await
-        .map_err(|e| format!("⚠️ {e}"))
-}
-
-/// Parse and execute `[[GATEWAY:action:args]]` tags in agent response text.
+/// Parse and execute gateway action tags in agent response text.
 /// Returns the text with tags removed, and populates action_results with status messages.
 #[allow(clippy::too_many_arguments)]
 #[cfg(test)]
@@ -3818,8 +3763,6 @@ async fn execute_gateway_actions(
     platform: &str,
     chat_id: &str,
     user_id: &str,
-    durable_store: Option<&dyn astra_task_store::DurableTaskStore>,
-    skills_dir: Option<&str>,
     action_results: &mut Vec<String>,
 ) -> String {
     execute_gateway_actions_with_policy(
@@ -3828,14 +3771,11 @@ async fn execute_gateway_actions(
         platform,
         chat_id,
         user_id,
-        durable_store,
-        skills_dir,
         &crate::access_control::ActionPolicy {
             allow_slash_mutations: true,
             allow_model_generated_mutations: true,
             workspace_roots: Vec::new(),
         },
-        None,
         action_results,
     )
     .await
@@ -3848,10 +3788,7 @@ async fn execute_gateway_actions_with_policy(
     platform: &str,
     chat_id: &str,
     user_id: &str,
-    durable_store: Option<&dyn astra_task_store::DurableTaskStore>,
-    skills_dir: Option<&str>,
     action_policy: &crate::access_control::ActionPolicy,
-    trace_repo: Option<&dyn TraceRepository>,
     action_results: &mut Vec<String>,
 ) -> String {
     static RE: std::sync::LazyLock<regex::Regex> =
@@ -3878,543 +3815,23 @@ async fn execute_gateway_actions_with_policy(
             Some("cron_add") if parts.len() == 3 => {
                 let cron_expr = parts[1].trim();
                 let message = parts[2].trim();
-                if message.is_empty() {
-                    "⚠️ 任务消息不能为空".into()
-                } else if !is_valid_cron_expr(cron_expr) {
-                    format!("⚠️ 无效的 cron 表达式: `{cron_expr}`（需要 5 个字段: 分 时 日 月 周）")
-                } else if let Some(store) = store {
-                    let job_id = uuid::Uuid::new_v4().to_string();
-                    match store
-                        .create_cron_job(&store::CronJobSpec {
-                            job_id: job_id.clone(),
-                            platform: platform.to_string(),
-                            chat_id: chat_id.to_string(),
-                            user_id: user_id.to_string(),
-                            cron_expr: cron_expr.to_string(),
-                            message: message.to_string(),
-                            description: message.to_string(),
-                        })
-                        .await
-                    {
-                        Ok(()) => {
-                            tracing::info!(
-                                id = &job_id[..8],
-                                expr = cron_expr,
-                                msg = message,
-                                "gateway action: cron_add"
-                            );
-                            format!(
-                                "⏰ 定时任务已创建\n- ID: `{}`\n- 周期: `{cron_expr}`\n- 内容: {message}",
-                                &job_id[..8]
-                            )
-                        }
-                        Err(e) => format!("⚠️ 定时任务创建失败: {e}"),
-                    }
-                } else {
-                    "⚠️ 定时任务需要 MySQL 存储支持".into()
-                }
+                tools_cron::cron_add(store, platform, chat_id, user_id, cron_expr, message).await
             }
-            Some("cron_add") => "⚠️ cron_add 格式错误（需要: cron_add:表达式:消息）".into(),
+            Some("cron_add") => "Error: cron_add format is cron_add:<expr>:<message>".into(),
 
             Some("remind_after") if parts.len() == 3 => {
                 let minutes: u64 = parts[1].trim().parse().unwrap_or(0);
                 let raw_message = parts[2].trim().to_string();
-                if raw_message.is_empty() {
-                    "⚠️ 提醒消息不能为空".into()
-                } else if minutes == 0 {
-                    "⚠️ 提醒时间无效（需要大于 0 的分钟数）".into()
-                } else if minutes > 1440 * 7 {
-                    "⚠️ 提醒时间过长（最多 7 天 = 10080 分钟）".into()
-                } else if let Some(store) = store {
-                    // "exec:" prefix means the scheduler should invoke the agent
-                    // to execute the message as a prompt. Without it, just send
-                    // the text as a plain reminder.
-                    let (cron_type, message) =
-                        if let Some(stripped) = raw_message.strip_prefix("exec:") {
-                            ("once_exec", stripped.trim().to_string())
-                        } else {
-                            ("once", raw_message.clone())
-                        };
-
-                    let job_id = uuid::Uuid::new_v4().to_string();
-                    let next_run = chrono::Utc::now() + chrono::Duration::minutes(minutes as i64);
-                    let next_run_str = next_run.format("%Y-%m-%d %H:%M:%S").to_string();
-                    let desc = if cron_type == "once_exec" {
-                        format!("🤖 {message} (定时执行)")
-                    } else {
-                        format!("⏰ {message} (一次性)")
-                    };
-                    match store
-                        .create_cron_job(&store::CronJobSpec {
-                            job_id: job_id.clone(),
-                            platform: platform.to_string(),
-                            chat_id: chat_id.to_string(),
-                            user_id: user_id.to_string(),
-                            cron_expr: cron_type.to_string(),
-                            message: message.clone(),
-                            description: desc,
-                        })
-                        .await
-                    {
-                        Ok(()) => {
-                            if let Err(e) = store.update_cron_next_run(&job_id, &next_run_str).await
-                            {
-                                tracing::warn!(job_id = %&job_id[..8], error = %e, "failed to set remind_after next_run");
-                            }
-                            tracing::info!(minutes, msg = %message, exec = cron_type == "once_exec", job_id = &job_id[..8], "remind_after → cron job");
-                            let time_str = if minutes >= 60 {
-                                let h = minutes / 60;
-                                let m = minutes % 60;
-                                if m == 0 {
-                                    format!("{h}小时")
-                                } else {
-                                    format!("{h}小时{m}分钟")
-                                }
-                            } else {
-                                format!("{minutes}分钟")
-                            };
-                            if cron_type == "once_exec" {
-                                format!("🤖 {time_str}后执行: {message}\n(ID: `{}`)", &job_id[..8])
-                            } else {
-                                format!("⏰ {time_str}后提醒: {message}\n(ID: `{}`)", &job_id[..8])
-                            }
-                        }
-                        Err(e) => format!("⚠️ 创建提醒失败: {e}"),
-                    }
+                let (exec, message) = if let Some(stripped) = raw_message.strip_prefix("exec:") {
+                    (true, stripped.trim())
                 } else {
-                    "⚠️ 延时提醒需要存储支持".into()
-                }
+                    (false, raw_message.as_str())
+                };
+                tools_cron::remind_after(store, platform, chat_id, user_id, minutes, message, exec)
+                    .await
             }
             Some("remind_after") => {
-                "⚠️ remind_after 格式错误（需要: remind_after:分钟数:消息）".into()
-            }
-
-            Some("task_list") => {
-                if let Some(store) = store {
-                    match store.list_cron_jobs(platform, chat_id).await {
-                        Ok(jobs) if jobs.is_empty() => "📋 当前没有定时任务。".into(),
-                        Ok(jobs) => {
-                            let mut lines = vec![format!("📋 **定时任务** ({} 个)", jobs.len())];
-                            for j in &jobs {
-                                let status = if j.enabled { "✅" } else { "⏸" };
-                                let short_id = &j.job_id[..8.min(j.job_id.len())];
-                                lines.push(format!(
-                                    "{status} `{short_id}` | `{}` | {}",
-                                    j.cron_expr, j.description
-                                ));
-                            }
-                            lines.join("\n")
-                        }
-                        Err(e) => format!("⚠️ 查询失败: {e}"),
-                    }
-                } else {
-                    "⚠️ 需要 MySQL 存储支持".into()
-                }
-            }
-
-            Some("task_del") if parts.len() >= 2 => {
-                let target = parts[1].trim();
-                if target.is_empty() {
-                    "⚠️ 请指定任务 ID".into()
-                } else if let Some(store) = store {
-                    // Support prefix match
-                    match find_and_delete_job(store, platform, chat_id, target).await {
-                        Ok(Some(desc)) => {
-                            tracing::info!(target, "gateway action: task_del");
-                            format!("✅ 已删除任务: {desc}")
-                        }
-                        Ok(None) => format!("❌ 找不到任务 `{target}`"),
-                        Err(e) => format!("⚠️ 删除失败: {e}"),
-                    }
-                } else {
-                    "⚠️ 需要 MySQL 存储支持".into()
-                }
-            }
-            Some("task_del") => "⚠️ task_del 格式错误（需要: task_del:任务ID）".into(),
-
-            // Legacy alias
-            Some("cron_del") if parts.len() >= 2 => {
-                let job_id = parts[1].trim();
-                if let Some(store) = store {
-                    match find_and_delete_job(store, platform, chat_id, job_id).await {
-                        Ok(Some(desc)) => {
-                            tracing::info!(job_id, "gateway action: cron_del");
-                            format!("✅ 已删除任务: {desc}")
-                        }
-                        Ok(None) => format!("❌ 找不到任务 `{job_id}`"),
-                        Err(e) => format!("⚠️ 删除失败: {e}"),
-                    }
-                } else {
-                    "⚠️ 需要 MySQL 存储支持".into()
-                }
-            }
-
-            Some("dtask_create") if parts.len() >= 2 => {
-                let name = parts[1].trim();
-                let desc = if parts.len() >= 3 {
-                    Some(parts[2].trim().to_string())
-                } else {
-                    None
-                };
-                if name.is_empty() {
-                    "⚠️ 任务名称不能为空".into()
-                } else if let Some(store) = durable_store {
-                    let spec = astra_task_store::TaskSpec {
-                        name: name.to_string(),
-                        description: desc,
-                        owner_id: format!("{platform}:{chat_id}"),
-                        initial_state: None,
-                    };
-                    match store.create(&spec).await {
-                        Ok(id) => {
-                            tracing::info!(task_id = %id, name, "dtask created");
-                            format!(
-                                "📋 任务已创建\n- ID: `{}`\n- 名称: {name}",
-                                &id.0[..8.min(id.0.len())]
-                            )
-                        }
-                        Err(e) => format!("⚠️ 创建失败: {e}"),
-                    }
-                } else {
-                    "⚠️ 需要 MySQL 存储支持".into()
-                }
-            }
-
-            Some("dtask_checkpoint") if parts.len() == 3 => {
-                let task_id = parts[1].trim();
-                let json_str = parts[2].trim();
-                if task_id.is_empty() {
-                    "⚠️ 请指定任务 ID".into()
-                } else {
-                    match serde_json::from_str::<serde_json::Value>(json_str) {
-                        Err(e) => format!("⚠️ checkpoint JSON 无效: {e}"),
-                        Ok(state) => {
-                            if let Some(store) = durable_store {
-                                let owner_id = format!("{platform}:{chat_id}");
-                                match resolve_gateway_task(store, &owner_id, task_id).await {
-                                    Ok(task) => {
-                                        match store.checkpoint(&task.id, &state, None, None).await {
-                                            Ok(()) => {
-                                                tracing::info!(task_id, "dtask checkpoint saved");
-                                                format!(
-                                                    "💾 检查点已保存 (`{}`)",
-                                                    &task.id.0[..8.min(task.id.0.len())]
-                                                )
-                                            }
-                                            Err(e) => format!("⚠️ 保存失败: {e}"),
-                                        }
-                                    }
-                                    Err(e) => e,
-                                }
-                            } else {
-                                "⚠️ 需要 MySQL 存储支持".into()
-                            }
-                        }
-                    }
-                }
-            }
-
-            Some("dtask_status") if parts.len() >= 2 => {
-                let task_id = parts[1].trim();
-                if let Some(store) = durable_store {
-                    let owner_id = format!("{platform}:{chat_id}");
-                    match resolve_gateway_task(store, &owner_id, task_id).await {
-                        Ok(t) => {
-                            let mut lines = vec![
-                                format!("📋 **任务: {}**", t.name),
-                                format!("- 状态: {}", t.status.as_str()),
-                                format!("- 进度: {}%", t.progress_pct),
-                            ];
-                            if let Some(ref step) = t.step_description {
-                                lines.push(format!("- 当前: {step}"));
-                            }
-                            if let Some(ref err) = t.error_message {
-                                lines.push(format!("- 错误: {err}"));
-                            }
-                            lines.join("\n")
-                        }
-                        Err(e) => e,
-                    }
-                } else {
-                    "⚠️ 需要 MySQL 存储支持".into()
-                }
-            }
-
-            Some("dtask_resume") if parts.len() >= 2 => {
-                let task_id = parts[1].trim();
-                if let Some(store) = durable_store {
-                    let owner_id = format!("{platform}:{chat_id}");
-                    match resolve_gateway_task(store, &owner_id, task_id).await {
-                        Ok(task) => match store.resume(&task.id).await {
-                            Ok(Some(checkpoint)) => {
-                                match store
-                                    .update_status(
-                                        &task.id,
-                                        astra_task_store::DurableTaskStatus::Running,
-                                        None,
-                                    )
-                                    .await
-                                {
-                                    Ok(()) => format!(
-                                        "▶️ 任务已恢复，检查点:\n```json\n{}\n```",
-                                        serde_json::to_string_pretty(&checkpoint)
-                                            .unwrap_or_default()
-                                    ),
-                                    Err(e) => format!("⚠️ 恢复失败: {e}"),
-                                }
-                            }
-                            Ok(None) => match store
-                                .update_status(
-                                    &task.id,
-                                    astra_task_store::DurableTaskStatus::Running,
-                                    None,
-                                )
-                                .await
-                            {
-                                Ok(()) => format!("▶️ 任务 `{task_id}` 无检查点，从头开始"),
-                                Err(e) => format!("⚠️ 恢复失败: {e}"),
-                            },
-                            Err(e) => format!("⚠️ 恢复失败: {e}"),
-                        },
-                        Err(e) => e,
-                    }
-                } else {
-                    "⚠️ 需要 MySQL 存储支持".into()
-                }
-            }
-
-            Some("dtask_list") => {
-                if let Some(store) = durable_store {
-                    let filter = astra_task_store::TaskFilter {
-                        owner_id: Some(format!("{platform}:{chat_id}")),
-                        ..Default::default()
-                    };
-                    match store.list(filter).await {
-                        Ok(tasks) if tasks.is_empty() => "📋 没有持久任务。".into(),
-                        Ok(tasks) => {
-                            let mut lines = vec![format!("📋 **持久任务** ({} 个)", tasks.len())];
-                            for t in &tasks {
-                                let short_id = &t.id.0[..8.min(t.id.0.len())];
-                                let icon = match t.status {
-                                    astra_task_store::DurableTaskStatus::Running => "🔄",
-                                    astra_task_store::DurableTaskStatus::Suspended => "⏸",
-                                    astra_task_store::DurableTaskStatus::Completed => "✅",
-                                    astra_task_store::DurableTaskStatus::Failed => "❌",
-                                    _ => "📋",
-                                };
-                                lines.push(format!(
-                                    "{icon} `{short_id}` | {} | {}%",
-                                    t.name, t.progress_pct
-                                ));
-                            }
-                            lines.join("\n")
-                        }
-                        Err(e) => format!("⚠️ 查询失败: {e}"),
-                    }
-                } else {
-                    "⚠️ 需要 MySQL 存储支持".into()
-                }
-            }
-
-            Some("dtask_complete") if parts.len() >= 2 => {
-                let task_id = parts[1].trim();
-                if let Some(store) = durable_store {
-                    let owner_id = format!("{platform}:{chat_id}");
-                    match resolve_gateway_task(store, &owner_id, task_id).await {
-                        Ok(task) => match store
-                            .update_status(
-                                &task.id,
-                                astra_task_store::DurableTaskStatus::Completed,
-                                None,
-                            )
-                            .await
-                        {
-                            Ok(()) => "✅ 任务已完成".into(),
-                            Err(e) => format!("⚠️ {e}"),
-                        },
-                        Err(e) => e,
-                    }
-                } else {
-                    "⚠️ 需要 MySQL 存储支持".into()
-                }
-            }
-
-            Some("dtask_fail") if parts.len() >= 2 => {
-                let task_id = parts[1].trim();
-                let error = if parts.len() >= 3 {
-                    Some(parts[2].trim())
-                } else {
-                    None
-                };
-                if let Some(store) = durable_store {
-                    let owner_id = format!("{platform}:{chat_id}");
-                    match resolve_gateway_task(store, &owner_id, task_id).await {
-                        Ok(task) => match store
-                            .update_status(
-                                &task.id,
-                                astra_task_store::DurableTaskStatus::Failed,
-                                error,
-                            )
-                            .await
-                        {
-                            Ok(()) => "❌ 任务已标记失败".into(),
-                            Err(e) => format!("⚠️ {e}"),
-                        },
-                        Err(e) => e,
-                    }
-                } else {
-                    "⚠️ 需要 MySQL 存储支持".into()
-                }
-            }
-
-            Some("dtask_cancel") if parts.len() >= 2 => {
-                let task_id = parts[1].trim();
-                if let Some(store) = durable_store {
-                    let owner_id = format!("{platform}:{chat_id}");
-                    match resolve_gateway_task(store, &owner_id, task_id).await {
-                        Ok(task) => match store
-                            .update_status(
-                                &task.id,
-                                astra_task_store::DurableTaskStatus::Cancelled,
-                                None,
-                            )
-                            .await
-                        {
-                            Ok(()) => "🚫 任务已取消".into(),
-                            Err(e) => format!("⚠️ {e}"),
-                        },
-                        Err(e) => e,
-                    }
-                } else {
-                    "⚠️ 需要 MySQL 存储支持".into()
-                }
-            }
-
-            Some("skill_add") if parts.len() >= 2 => {
-                let name = parts[1].trim();
-                let content = if parts.len() >= 3 {
-                    parts[2].trim()
-                } else {
-                    ""
-                };
-                if name.is_empty() {
-                    "⚠️ skill 名称不能为空".into()
-                } else if !is_safe_skill_name(name) {
-                    "⚠️ skill 名称只能包含字母、数字、中文、空格、下划线或连字符，不能包含路径。"
-                        .into()
-                } else if content.is_empty() {
-                    "⚠️ skill 内容不能为空".into()
-                } else if let Some(dir) = skills_dir {
-                    let expanded = if dir.starts_with('~') {
-                        let home = std::env::var("HOME").unwrap_or_default();
-                        dir.replacen('~', &home, 1)
-                    } else {
-                        dir.to_string()
-                    };
-                    let path = std::path::Path::new(&expanded);
-                    if !path.is_dir()
-                        && let Err(e) = std::fs::create_dir_all(path)
-                    {
-                        action_results.push(format!("⚠️ 创建 skill 目录失败: {e}"));
-                        clean = clean.replace(full_match, "");
-                        continue;
-                    }
-                    let file = path.join(format!("{name}.md"));
-                    match std::fs::write(&file, content) {
-                        Ok(()) => {
-                            tracing::info!(name, "gateway action: skill_add");
-                            format!("📝 Skill `{name}` 已保存 → {}", file.display())
-                        }
-                        Err(e) => format!("⚠️ 保存失败: {e}"),
-                    }
-                } else {
-                    "⚠️ skill 目录未配置 (gateway.yaml: skills_dir)".into()
-                }
-            }
-
-            Some("workspace_set") if parts.len() >= 2 => {
-                let target = parts[1].trim();
-                let expanded = if target.starts_with('~') {
-                    let home = std::env::var("HOME").unwrap_or_default();
-                    target.replacen('~', &home, 1)
-                } else {
-                    target.to_string()
-                };
-                let path = std::path::Path::new(&expanded);
-                if !path.is_dir() {
-                    format!("❌ 目录不存在: `{expanded}`")
-                } else if let Err(denial) = action_policy.workspace_allowed(path) {
-                    denial
-                } else if let Some(store) = store {
-                    let canonical = path
-                        .canonicalize()
-                        .map(|p| p.to_string_lossy().to_string())
-                        .unwrap_or(expanded);
-                    match store
-                        .set_user_preference(platform, user_id, "workspace", &canonical)
-                        .await
-                    {
-                        Ok(()) => {
-                            tracing::info!(workspace = %canonical, "gateway action: workspace_set");
-                            format!("📂 工作目录已切换: `{canonical}`")
-                        }
-                        Err(e) => format!("⚠️ 保存工作目录失败: {e}"),
-                    }
-                } else {
-                    "⚠️ 需要 MySQL 存储支持".into()
-                }
-            }
-
-            Some("trace_kill") if parts.len() >= 2 => {
-                let trace_id_str = parts[1].trim();
-                if trace_id_str.is_empty() {
-                    "⚠️ 请指定 trace ID".into()
-                } else if let Some(repo) = trace_repo {
-                    let tid = TraceId::from_string(trace_id_str.to_string());
-                    match repo
-                        .force_fail_request(&tid, "interrupted via manage")
-                        .await
-                    {
-                        Ok(true) => {
-                            tracing::info!(trace_id = trace_id_str, "gateway action: trace_kill");
-                            format!(
-                                "⎋ 已中断请求 `{}`",
-                                &trace_id_str[..8.min(trace_id_str.len())]
-                            )
-                        }
-                        Ok(false) => format!(
-                            "⚠️ 请求 `{}` 已是终态",
-                            &trace_id_str[..8.min(trace_id_str.len())]
-                        ),
-                        Err(e) => format!("⚠️ 中断失败: {e}"),
-                    }
-                } else {
-                    "⚠️ 需要 trace 支持".into()
-                }
-            }
-
-            Some("outbox_dismiss") if parts.len() >= 2 => {
-                let request_id_str = parts[1].trim();
-                if request_id_str.is_empty() {
-                    "⚠️ 请指定 request ID".into()
-                } else if let Some(repo) = trace_repo {
-                    let rid = RequestId::from_string(request_id_str.to_string());
-                    match repo.dismiss_failed_outbox(&rid).await {
-                        Ok(()) => {
-                            tracing::info!(
-                                request_id = request_id_str,
-                                "gateway action: outbox_dismiss"
-                            );
-                            format!(
-                                "🧹 已清除失败消息 `{}`",
-                                &request_id_str[..8.min(request_id_str.len())]
-                            )
-                        }
-                        Err(e) => format!("⚠️ 清除失败: {e}"),
-                    }
-                } else {
-                    "⚠️ 需要 trace 支持".into()
-                }
+                "Error: remind_after format is remind_after:<minutes>:<message>".into()
             }
 
             _ => {
@@ -4434,38 +3851,14 @@ async fn execute_gateway_actions_with_policy(
 fn action_capability(action: &str) -> Option<crate::access_control::ActionCapability> {
     use crate::access_control::ActionCapability as Cap;
     match action {
-        "cron_add" | "remind_after" | "task_del" | "cron_del" => Some(Cap::CronMutation),
-        "dtask_create" | "dtask_checkpoint" | "dtask_resume" | "dtask_complete" | "dtask_fail"
-        | "dtask_cancel" => Some(Cap::DurableTaskMutation),
-        "skill_add" => Some(Cap::SkillMutation),
-        "workspace_set" => Some(Cap::WorkspaceMutation),
-        "trace_kill" | "outbox_dismiss" => Some(Cap::SessionMutation),
+        "cron_add" | "remind_after" => Some(Cap::CronMutation),
         _ => None,
     }
 }
 
+#[cfg(test)]
 fn is_valid_cron_expr(expr: &str) -> bool {
     store::is_valid_cron_expr(expr)
-}
-
-async fn find_and_delete_job(
-    store: &dyn GatewayStore,
-    platform: &str,
-    chat_id: &str,
-    target: &str,
-) -> Result<Option<String>, store::StoreError> {
-    let jobs = store.list_cron_jobs(platform, chat_id).await?;
-    // Exact or prefix match
-    let matched = jobs
-        .iter()
-        .find(|j| j.job_id == target || j.job_id.starts_with(target));
-    if let Some(j) = matched {
-        let desc = j.description.clone();
-        store.delete_cron_job(&j.job_id).await?;
-        Ok(Some(desc))
-    } else {
-        Ok(None)
-    }
 }
 
 /// Streaming filter for `<think>...</think>` / `<thinking>...</thinking>` blocks.
@@ -5211,7 +4604,7 @@ mod tests {
     #[test]
     fn gateway_action_stream_filter_removes_complete_tag() {
         let mut filter = GatewayActionStreamFilter::default();
-        let out = filter.push("before [[GATEWAY:dtask_complete:abc]] after");
+        let out = filter.push("before [[GATEWAY:cron_add:0 9 * * *:hello]] after");
         assert_eq!(out, "before  after");
         assert_eq!(filter.finish(), "");
     }
@@ -5220,7 +4613,7 @@ mod tests {
     fn gateway_action_stream_filter_handles_split_tag_start() {
         let mut filter = GatewayActionStreamFilter::default();
         assert_eq!(filter.push("hello [["), "hello ");
-        assert_eq!(filter.push("GATEWAY:dtask_cancel:abc]] done"), " done");
+        assert_eq!(filter.push("GATEWAY:remind_after:5:hello]] done"), " done");
         assert_eq!(filter.finish(), "");
     }
 
@@ -5228,7 +4621,7 @@ mod tests {
     fn gateway_action_stream_filter_drops_unclosed_tag_at_finish() {
         let mut filter = GatewayActionStreamFilter::default();
         assert_eq!(
-            filter.push("visible [[GATEWAY:dtask_complete:abc"),
+            filter.push("visible [[GATEWAY:remind_after:5:hello"),
             "visible "
         );
         assert_eq!(filter.finish(), "");
@@ -5358,114 +4751,90 @@ mod tests {
     async fn action_cron_add_no_db() {
         let text = "好的\n[[GATEWAY:cron_add:0 9 * * *:早上好]]";
         let mut r = Vec::new();
-        let clean = execute_gateway_actions(text, None, "wx", "c1", "u1", None, None, &mut r).await;
+        let clean = execute_gateway_actions(text, None, "wx", "c1", "u1", &mut r).await;
         assert_eq!(clean, "好的");
-        assert!(r[0].contains("存储"), "{}", r[0]);
+        assert!(r[0].contains("storage"), "{}", r[0]);
     }
 
     #[tokio::test]
     async fn action_cron_add_invalid_expr() {
         let text = "[[GATEWAY:cron_add:bad expr:msg]]";
         let mut r = Vec::new();
-        execute_gateway_actions(text, None, "wx", "c1", "u1", None, None, &mut r).await;
-        assert!(r[0].contains("无效"), "{}", r[0]);
+        execute_gateway_actions(text, None, "wx", "c1", "u1", &mut r).await;
+        assert!(r[0].contains("invalid cron expression"), "{}", r[0]);
     }
 
     #[tokio::test]
     async fn action_cron_add_empty_message() {
         let text = "[[GATEWAY:cron_add:0 9 * * *:]]";
         let mut r = Vec::new();
-        execute_gateway_actions(text, None, "wx", "c1", "u1", None, None, &mut r).await;
-        assert!(r[0].contains("不能为空"), "{}", r[0]);
+        execute_gateway_actions(text, None, "wx", "c1", "u1", &mut r).await;
+        assert!(r[0].contains("message cannot be empty"), "{}", r[0]);
     }
 
     #[tokio::test]
     async fn action_cron_add_missing_parts() {
         let text = "[[GATEWAY:cron_add:only_one_part]]";
         let mut r = Vec::new();
-        execute_gateway_actions(text, None, "wx", "c1", "u1", None, None, &mut r).await;
-        assert!(r[0].contains("格式错误"), "{}", r[0]);
+        execute_gateway_actions(text, None, "wx", "c1", "u1", &mut r).await;
+        assert!(r[0].contains("format"), "{}", r[0]);
     }
 
     #[tokio::test]
     async fn action_remind_after_no_db() {
         let text = "好的\n[[GATEWAY:remind_after:5:喝水]]";
         let mut r = Vec::new();
-        let clean = execute_gateway_actions(text, None, "wx", "c1", "u1", None, None, &mut r).await;
+        let clean = execute_gateway_actions(text, None, "wx", "c1", "u1", &mut r).await;
         assert_eq!(clean, "好的");
-        assert!(r[0].contains("存储"), "{}", r[0]);
+        assert!(r[0].contains("storage"), "{}", r[0]);
     }
 
     #[tokio::test]
     async fn action_remind_after_zero_minutes() {
         let text = "[[GATEWAY:remind_after:0:msg]]";
         let mut r = Vec::new();
-        execute_gateway_actions(text, None, "wx", "c1", "u1", None, None, &mut r).await;
-        assert!(r[0].contains("无效"), "{}", r[0]);
+        execute_gateway_actions(text, None, "wx", "c1", "u1", &mut r).await;
+        assert!(r[0].contains("minutes must be > 0"), "{}", r[0]);
     }
 
     #[tokio::test]
     async fn action_remind_after_too_long() {
         let text = "[[GATEWAY:remind_after:99999:msg]]";
         let mut r = Vec::new();
-        execute_gateway_actions(text, None, "wx", "c1", "u1", None, None, &mut r).await;
-        assert!(r[0].contains("过长"), "{}", r[0]);
+        execute_gateway_actions(text, None, "wx", "c1", "u1", &mut r).await;
+        assert!(r[0].contains("maximum 7 days"), "{}", r[0]);
     }
 
     #[tokio::test]
     async fn action_remind_after_empty_message() {
         let text = "[[GATEWAY:remind_after:5:]]";
         let mut r = Vec::new();
-        execute_gateway_actions(text, None, "wx", "c1", "u1", None, None, &mut r).await;
-        assert!(r[0].contains("不能为空"), "{}", r[0]);
+        execute_gateway_actions(text, None, "wx", "c1", "u1", &mut r).await;
+        assert!(r[0].contains("message cannot be empty"), "{}", r[0]);
     }
 
     #[tokio::test]
     async fn action_remind_after_non_numeric() {
         let text = "[[GATEWAY:remind_after:abc:msg]]";
         let mut r = Vec::new();
-        execute_gateway_actions(text, None, "wx", "c1", "u1", None, None, &mut r).await;
-        assert!(r[0].contains("无效"), "{}", r[0]);
-    }
-
-    #[tokio::test]
-    async fn action_task_list_no_db() {
-        let text = "[[GATEWAY:task_list]]";
-        let mut r = Vec::new();
-        execute_gateway_actions(text, None, "wx", "c1", "u1", None, None, &mut r).await;
-        assert!(r[0].contains("存储"), "{}", r[0]);
-    }
-
-    #[tokio::test]
-    async fn action_task_del_empty_id() {
-        let text = "[[GATEWAY:task_del:]]";
-        let mut r = Vec::new();
-        execute_gateway_actions(text, None, "wx", "c1", "u1", None, None, &mut r).await;
-        assert!(r[0].contains("请指定"), "{}", r[0]);
-    }
-
-    #[tokio::test]
-    async fn action_task_del_no_db() {
-        let text = "[[GATEWAY:task_del:abc123]]";
-        let mut r = Vec::new();
-        execute_gateway_actions(text, None, "wx", "c1", "u1", None, None, &mut r).await;
-        assert!(r[0].contains("存储"), "{}", r[0]);
+        execute_gateway_actions(text, None, "wx", "c1", "u1", &mut r).await;
+        assert!(r[0].contains("minutes must be > 0"), "{}", r[0]);
     }
 
     #[tokio::test]
     async fn action_multiple_mixed() {
         let text = "好的，帮你设置：\n[[GATEWAY:cron_add:0 9 * * 1-5:工作日早报]]\n[[GATEWAY:remind_after:30:半小时后开会]]";
         let mut r = Vec::new();
-        let clean = execute_gateway_actions(text, None, "wx", "c1", "u1", None, None, &mut r).await;
+        let clean = execute_gateway_actions(text, None, "wx", "c1", "u1", &mut r).await;
         assert_eq!(clean, "好的，帮你设置：");
         assert_eq!(r.len(), 2);
     }
 
     #[tokio::test]
     async fn action_unknown_type() {
-        let text = "[[GATEWAY:fly_to_moon:now]]";
+        let text = format!("[[GATEWAY:{}:now]]", "fly_to_moon");
         let mut r = Vec::new();
-        execute_gateway_actions(text, None, "wx", "c1", "u1", None, None, &mut r).await;
+        execute_gateway_actions(&text, None, "wx", "c1", "u1", &mut r).await;
         assert!(r[0].contains("未知"), "{}", r[0]);
     }
 
@@ -5473,7 +4842,7 @@ mod tests {
     async fn action_no_tags_passthrough() {
         let text = "普通回复";
         let mut r = Vec::new();
-        let clean = execute_gateway_actions(text, None, "wx", "c1", "u1", None, None, &mut r).await;
+        let clean = execute_gateway_actions(text, None, "wx", "c1", "u1", &mut r).await;
         assert_eq!(clean, "普通回复");
         assert!(r.is_empty());
     }
@@ -5725,179 +5094,27 @@ mod tests {
     }
 }
 
-// ── Durable task action tests ───────────────────────────────
+// ── Fix #1: Regex handles JSON with `]` chars (arrays/nested) ──
 
 #[tokio::test]
-async fn action_dtask_create_no_db() {
-    let text = "[[GATEWAY:dtask_create:weekly report:collect stats]]";
+async fn action_tag_json_with_array() {
+    let text = r#"[[GATEWAY:cron_add:0 9 * * *:{"items":[1,2,3]}]]"#;
     let mut r = Vec::new();
-    execute_gateway_actions(text, None, "wx", "c1", "u1", None, None, &mut r).await;
-    assert!(r[0].contains("存储"), "{}", r[0]);
-}
-
-#[tokio::test]
-async fn action_dtask_create_empty_name() {
-    let text = "[[GATEWAY:dtask_create::desc]]";
-    let mut r = Vec::new();
-    execute_gateway_actions(text, None, "wx", "c1", "u1", None, None, &mut r).await;
-    assert!(r[0].contains("不能为空"), "{}", r[0]);
-}
-
-#[tokio::test]
-async fn action_dtask_checkpoint_bad_json() {
-    let text = "[[GATEWAY:dtask_checkpoint:tid:not-json]]";
-    let mut r = Vec::new();
-    execute_gateway_actions(text, None, "wx", "c1", "u1", None, None, &mut r).await;
-    assert!(r[0].contains("JSON 无效"), "{}", r[0]);
-}
-
-#[tokio::test]
-async fn action_dtask_checkpoint_empty_id() {
-    let text = r#"[[GATEWAY:dtask_checkpoint::{"k":1}]]"#;
-    let mut r = Vec::new();
-    execute_gateway_actions(text, None, "wx", "c1", "u1", None, None, &mut r).await;
-    assert!(r[0].contains("请指定"), "{}", r[0]);
-}
-
-#[tokio::test]
-async fn action_dtask_status_no_db() {
-    let text = "[[GATEWAY:dtask_status:some-id]]";
-    let mut r = Vec::new();
-    execute_gateway_actions(text, None, "wx", "c1", "u1", None, None, &mut r).await;
-    assert!(r[0].contains("存储"), "{}", r[0]);
-}
-
-#[tokio::test]
-async fn action_dtask_resume_no_db() {
-    let text = "[[GATEWAY:dtask_resume:some-id]]";
-    let mut r = Vec::new();
-    execute_gateway_actions(text, None, "wx", "c1", "u1", None, None, &mut r).await;
-    assert!(r[0].contains("存储"), "{}", r[0]);
-}
-
-#[tokio::test]
-async fn action_dtask_list_no_db() {
-    let text = "[[GATEWAY:dtask_list]]";
-    let mut r = Vec::new();
-    execute_gateway_actions(text, None, "wx", "c1", "u1", None, None, &mut r).await;
-    assert!(r[0].contains("存储"), "{}", r[0]);
-}
-
-#[tokio::test]
-async fn action_dtask_complete_no_db() {
-    let text = "[[GATEWAY:dtask_complete:some-id]]";
-    let mut r = Vec::new();
-    execute_gateway_actions(text, None, "wx", "c1", "u1", None, None, &mut r).await;
-    assert!(r[0].contains("存储"), "{}", r[0]);
-}
-
-#[tokio::test]
-async fn action_dtask_fail_no_db() {
-    let text = "[[GATEWAY:dtask_fail:some-id:oops]]";
-    let mut r = Vec::new();
-    execute_gateway_actions(text, None, "wx", "c1", "u1", None, None, &mut r).await;
-    assert!(r[0].contains("存储"), "{}", r[0]);
-}
-
-#[tokio::test]
-async fn action_dtask_cancel_no_db() {
-    let text = "[[GATEWAY:dtask_cancel:some-id]]";
-    let mut r = Vec::new();
-    execute_gateway_actions(text, None, "wx", "c1", "u1", None, None, &mut r).await;
-    assert!(r[0].contains("存储"), "{}", r[0]);
-}
-
-// ── trace_kill / outbox_dismiss GATEWAY actions ──
-
-#[tokio::test]
-async fn action_trace_kill_no_repo() {
-    let text = "[[GATEWAY:trace_kill:some-trace-id]]";
-    let mut r = Vec::new();
-    // execute_gateway_actions passes None for trace_repo
-    execute_gateway_actions(text, None, "wx", "c1", "u1", None, None, &mut r).await;
-    assert!(r[0].contains("trace 支持"), "{}", r[0]);
-}
-
-#[tokio::test]
-async fn action_trace_kill_empty_id() {
-    let text = "[[GATEWAY:trace_kill:]]";
-    let mut r = Vec::new();
-    execute_gateway_actions(text, None, "wx", "c1", "u1", None, None, &mut r).await;
-    assert!(r[0].contains("请指定"), "{}", r[0]);
-}
-
-#[tokio::test]
-async fn action_trace_kill_with_repo() {
-    use crate::trace_model::{InMemoryTraceRepository, TraceWriter};
-    let repo = InMemoryTraceRepository::default();
-    let conv = crate::trace_model::ConversationKey::new("wx", "c1", "astra");
-    let req = crate::trace_model::GatewayRequest::new(conv, "msg-1", "u1", "hello");
-    let trace_id = req.trace_id.clone();
-    let writer = TraceWriter::begin(&repo, req).await.unwrap();
-    let _ = writer.start_run("astra", None).await.unwrap();
-
-    let text = format!("[[GATEWAY:trace_kill:{trace_id}]]");
-    let policy = crate::access_control::ActionPolicy {
-        allow_slash_mutations: true,
-        allow_model_generated_mutations: true,
-        workspace_roots: Vec::new(),
-    };
-    let mut r = Vec::new();
-    let repo_ref: &dyn crate::trace_model::TraceRepository = &repo;
-    execute_gateway_actions_with_policy(
-        &text,
-        None,
-        "wx",
-        "c1",
-        "u1",
-        None,
-        None,
-        &policy,
-        Some(repo_ref),
-        &mut r,
-    )
-    .await;
+    let clean = execute_gateway_actions(text, None, "wx", "c1", "u1", &mut r).await;
+    assert!(clean.is_empty(), "tags should be stripped, got: {clean}");
     assert_eq!(r.len(), 1);
     assert!(
-        r[0].contains("已中断"),
-        "expected interrupt confirmation, got: {}",
+        r[0].contains("storage"),
+        "expected no-db error, got: {}",
         r[0]
     );
 }
 
 #[tokio::test]
-async fn action_outbox_dismiss_no_repo() {
-    let text = "[[GATEWAY:outbox_dismiss:some-request-id]]";
+async fn action_tag_json_with_nested_brackets() {
+    let text = r#"[[GATEWAY:cron_add:0 9 * * *:{"a":{"b":[true]}}]]"#;
     let mut r = Vec::new();
-    execute_gateway_actions(text, None, "wx", "c1", "u1", None, None, &mut r).await;
-    assert!(r[0].contains("trace 支持"), "{}", r[0]);
-}
-
-#[tokio::test]
-async fn action_outbox_dismiss_empty_id() {
-    let text = "[[GATEWAY:outbox_dismiss:]]";
-    let mut r = Vec::new();
-    execute_gateway_actions(text, None, "wx", "c1", "u1", None, None, &mut r).await;
-    assert!(r[0].contains("请指定"), "{}", r[0]);
-}
-
-// ── Fix #1: Regex handles JSON with `]` chars (arrays/nested) ──
-
-#[tokio::test]
-async fn action_dtask_checkpoint_json_with_array() {
-    let text = r#"[[GATEWAY:dtask_checkpoint:tid:{"items":[1,2,3]}]]"#;
-    let mut r = Vec::new();
-    let clean = execute_gateway_actions(text, None, "wx", "c1", "u1", None, None, &mut r).await;
-    assert!(clean.is_empty(), "tags should be stripped, got: {clean}");
-    assert_eq!(r.len(), 1);
-    assert!(r[0].contains("存储"), "expected no-db error, got: {}", r[0]);
-}
-
-#[tokio::test]
-async fn action_dtask_checkpoint_json_with_nested_brackets() {
-    let text = r#"[[GATEWAY:dtask_checkpoint:tid:{"a":{"b":[true]}}]]"#;
-    let mut r = Vec::new();
-    let clean = execute_gateway_actions(text, None, "wx", "c1", "u1", None, None, &mut r).await;
+    let clean = execute_gateway_actions(text, None, "wx", "c1", "u1", &mut r).await;
     assert!(clean.is_empty(), "tags should be stripped, got: {clean}");
     assert_eq!(r.len(), 1);
 }
@@ -5905,10 +5122,10 @@ async fn action_dtask_checkpoint_json_with_nested_brackets() {
 #[tokio::test]
 async fn action_tag_with_text_around_bracket_json() {
     let text = r#"OK here:
-[[GATEWAY:dtask_checkpoint:tid:{"steps":["a","b"]}]]
+[[GATEWAY:cron_add:0 9 * * *:{"steps":["a","b"]}]]
 done"#;
     let mut r = Vec::new();
-    let clean = execute_gateway_actions(text, None, "wx", "c1", "u1", None, None, &mut r).await;
+    let clean = execute_gateway_actions(text, None, "wx", "c1", "u1", &mut r).await;
     assert_eq!(r.len(), 1);
     assert!(!clean.contains("GATEWAY"), "tag should be removed: {clean}");
     assert!(clean.contains("OK here"));
@@ -5926,10 +5143,8 @@ async fn action_policy_blocks_model_mutations_when_disabled() {
         workspace_roots: Vec::new(),
     };
     let mut r = Vec::new();
-    let clean = execute_gateway_actions_with_policy(
-        text, None, "wx", "c1", "u1", None, None, &policy, None, &mut r,
-    )
-    .await;
+    let clean =
+        execute_gateway_actions_with_policy(text, None, "wx", "c1", "u1", &policy, &mut r).await;
     assert!(clean.is_empty(), "tag should be stripped: {clean}");
     assert_eq!(r.len(), 1);
     assert!(r[0].contains("拒绝"), "expected denial, got: {}", r[0]);
@@ -5944,14 +5159,12 @@ async fn action_policy_allows_when_enabled() {
         workspace_roots: Vec::new(),
     };
     let mut r = Vec::new();
-    let clean = execute_gateway_actions_with_policy(
-        text, None, "wx", "c1", "u1", None, None, &policy, None, &mut r,
-    )
-    .await;
+    let clean =
+        execute_gateway_actions_with_policy(text, None, "wx", "c1", "u1", &policy, &mut r).await;
     assert!(clean.is_empty());
     assert_eq!(r.len(), 1);
     assert!(
-        r[0].contains("存储"),
+        r[0].contains("storage"),
         "expected no-db fallback, got: {}",
         r[0]
     );
@@ -6024,52 +5237,6 @@ fn safe_id(id: &str) -> String {
     } else {
         format!("{}…", crate::text::safe_prefix(id, 8))
     }
-}
-
-// ── skill_add action tests ──────────────────────────────────
-
-#[tokio::test]
-async fn action_skill_add_no_skills_dir() {
-    let text = "[[GATEWAY:skill_add:deploy:# Deploy\nRun make deploy]]";
-    let mut r = Vec::new();
-    execute_gateway_actions(text, None, "wx", "c1", "u1", None, None, &mut r).await;
-    assert!(
-        r[0].contains("skill 目录未配置") || r[0].contains("skills_dir"),
-        "{}",
-        r[0]
-    );
-}
-
-#[tokio::test]
-async fn action_skill_add_empty_name() {
-    let text = "[[GATEWAY:skill_add::content]]";
-    let mut r = Vec::new();
-    execute_gateway_actions(text, None, "wx", "c1", "u1", None, None, &mut r).await;
-    assert!(r[0].contains("名称不能为空"), "{}", r[0]);
-}
-
-#[tokio::test]
-async fn action_skill_add_rejects_path_traversal() {
-    let dir = tempfile::tempdir().unwrap();
-    let text = "[[GATEWAY:skill_add:../../evil:# owned]]";
-    let mut r = Vec::new();
-    execute_gateway_actions(
-        text,
-        None,
-        "wx",
-        "c1",
-        "u1",
-        None,
-        Some(dir.path().to_str().unwrap()),
-        &mut r,
-    )
-    .await;
-    assert!(
-        r[0].contains("不能包含路径") || r[0].contains("只能包含"),
-        "{}",
-        r[0]
-    );
-    assert!(!dir.path().parent().unwrap().join("evil.md").exists());
 }
 
 // ── Concurrency tests ───────────────────────────────────────
@@ -6276,7 +5443,7 @@ async fn typing_sent_before_cli_spawn() {
 // ── Active turn interruption registry tests ────────────────────────────
 
 #[test]
-fn active_tasks_registry_insert_and_cancel() {
+fn active_requests_registry_insert_and_cancel() {
     let registry: dashmap::DashMap<String, CancellationToken> = dashmap::DashMap::new();
     let token = CancellationToken::new();
     registry.insert("trace-1".into(), token.clone());
@@ -6289,7 +5456,7 @@ fn active_tasks_registry_insert_and_cancel() {
 }
 
 #[test]
-fn active_tasks_registry_esc_nonexistent_returns_none() {
+fn active_requests_registry_esc_nonexistent_returns_none() {
     let registry: dashmap::DashMap<String, CancellationToken> = dashmap::DashMap::new();
     assert!(registry.remove("ghost").is_none());
 }
@@ -6841,8 +6008,8 @@ mod truncate_tests {
 // very first acquire from a freshly-built pool when the server has silently
 // closed the idle connection mid-handshake. `test_before_acquire(true)`
 // catches most of these, but the first-use race still slips through once.
-// Startup sweeps (sweep_stale_traces / sweep_stale_tasks /
-// replay_retryable_outbox) then permanently silently fail, leaving zombie
+// Startup sweeps (sweep_stale_traces / replay_retryable_outbox) can otherwise
+// permanently silently fail, leaving zombie
 // state in the DB. The retry helper wraps those paths so a single
 // transient error doesn't poison startup.
 

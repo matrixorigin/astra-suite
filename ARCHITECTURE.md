@@ -9,8 +9,8 @@ and extension points.
 
 The main binary crate. A chat-platform gateway that bridges messaging
 platforms (WeChat, WeCom) to AI agent CLIs (Claude Code, Codex, Copilot,
-Astra). Handles sessions, scheduling, durable tasks, trace/audit,
-access control, and reliable message delivery.
+Astra). Handles sessions, scheduling, trace/audit, access control, and
+reliable message delivery.
 
 ### astra
 
@@ -18,12 +18,6 @@ An HTTP + SSE client library for the Astra agent server. Used by the
 gateway's `astra` CLI backend to communicate with a running Astra
 instance. Provides typed request/response models and streaming event
 parsing.
-
-### astra-task-store
-
-Defines the `DurableTaskStore` trait and associated types for
-checkpointable long-running tasks. Consumed by the gateway and
-potentially reusable by other services that need durable job semantics.
 
 ## Gateway Architecture
 
@@ -76,7 +70,7 @@ jobs, and feeds them back through the runner like normal user messages.
 |--------------------|-----------------------------------------------|------------------------------------------------------------------------------------------|
 | CLI backend        | `cli_bridge.rs` -- `CliProfile` enum          | Add variant, implement `build_command` / `parse_output` / `capabilities`                 |
 | Platform           | `platforms/<name>.rs`                         | Implement `PlatformAdapter`, instantiate in `main.rs`                                    |
-| Storage backend    | `store/<name>.rs`                             | Implement `GatewayStore` + `DurableTaskStore` + `TraceRepository`, wire in `StorageConfig` + `open_store_bundle` |
+| Storage backend    | `store/<name>.rs`                             | Implement `GatewayStore` + `TraceRepository`, wire in `StorageConfig` + `open_store_bundle` |
 
 ## Glossary
 
@@ -100,7 +94,3 @@ Skills provide domain knowledge or behavioral instructions to the agent.
 **workspace** -- The working directory passed to the CLI subprocess.
 Controls which project the agent operates on; switchable at runtime via
 `/workspace`.
-
-**durable task** -- A long-running job with checkpoint/resume semantics.
-Tasks persist progress to storage so they can be restarted after crashes
-or intentional stops without losing intermediate work.

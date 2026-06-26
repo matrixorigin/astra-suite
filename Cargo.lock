@@ -124,7 +124,6 @@ version = "0.3.4"
 dependencies = [
  "aes",
  "astra",
- "astra-task-store",
  "async-trait",
  "base64",
  "chrono",
@@ -137,6 +136,7 @@ dependencies = [
  "hex",
  "hmac",
  "libc",
+ "md-5",
  "rand 0.9.4",
  "regex",
  "reqwest",
@@ -157,15 +157,6 @@ dependencies = [
  "tracing-subscriber",
  "urlencoding",
  "uuid",
-]
-
-[[package]]
-name = "astra-task-store"
-version = "0.3.4"
-dependencies = [
- "async-trait",
- "serde",
- "serde_json",
 ]
 
 [[package]]

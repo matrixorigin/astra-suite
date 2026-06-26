@@ -604,33 +604,9 @@ async fn session_switch_restores_previous() {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 #[tokio::test]
-async fn durable_task_created_via_gateway_action() {
-    let fake_cli = create_fake_cli_script(
-        "Done. [[GATEWAY:dtask_create:test-migration:migrating users to new schema]]",
-    );
-    let mut config = TestGateway::build_config(&script_path(&fake_cli));
-    config.action_policy.allow_model_generated_mutations = true;
-    let gw = TestGateway::with_config(config).await;
-    let outputs = Arc::new(Mutex::new(Vec::new()));
-    let adapter = MockPlatformAdapter::new(mpsc::channel(1).1, outputs.clone());
-
-    let m = msg("chat-task", "user-1", "create a migration task");
-    let response = gw.runner.handle_message(&m, &adapter).await;
-    assert!(response.is_some());
-    // The response should mention task creation
-    let text = response.unwrap();
-    // Gateway action tags get processed; the response includes action results
-    assert!(
-        text.contains("task") || text.contains("Done") || text.contains("创建"),
-        "response should acknowledge task: {text}"
-    );
-}
-
-#[tokio::test]
-async fn durable_task_slash_list_shows_running_tasks() {
+async fn task_slash_list_shows_scheduled_tasks() {
     let gw = TestGateway::new().await;
 
-    // The /task list command requires trace_repo. With SQLite :memory: we have it.
     let m = msg("chat-tl", "user-1", "/task list");
     let result = gw.runner.handle_fast(&m).await;
     assert!(result.is_ok());
@@ -640,8 +616,7 @@ async fn durable_task_slash_list_shows_running_tasks() {
 }
 
 #[tokio::test]
-async fn durable_task_suspend_on_cli_failure() {
-    // When CLI exits non-zero, running tasks for that conversation should be suspended.
+async fn cli_failure_returns_error_response() {
     let fake_cli = create_failing_cli_script(1, "segfault");
     let config = TestGateway::build_config(&script_path(&fake_cli));
     let gw = TestGateway::with_config(config).await;
@@ -657,14 +632,6 @@ async fn durable_task_suspend_on_cli_failure() {
         text.contains("segfault") || text.contains("错误") || text.contains("⚠"),
         "should report CLI failure: {text}"
     );
-}
-
-#[tokio::test]
-async fn durable_task_sweep_on_startup() {
-    // sweep_stale_tasks is called during run() but we can call it directly
-    let gw = TestGateway::new().await;
-    // This should not panic even with no tasks
-    gw.runner.sweep_stale_tasks().await;
 }
 
 #[tokio::test]
@@ -751,13 +718,6 @@ async fn runner_init_invalid_config_errors() {
 
     let result = GatewayRunner::new(config).await;
     assert!(result.is_err(), "should fail with invalid MySQL connection");
-}
-
-#[tokio::test]
-async fn runner_suspend_stale_tasks_on_startup() {
-    let gw = TestGateway::new().await;
-    // Should complete without error
-    gw.runner.sweep_stale_tasks().await;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1015,7 +975,7 @@ async fn handle_fast_upserts_user_for_first_time_slash_command() {
     );
 
     // Very first message — straight to a mutation slash command.
-    let m = msg("chat-nc", "newcomer", "/model opus");
+    let m = msg("chat-nc", "newcomer", "/model us.anthropic.claude-opus-4-7");
     let result = gw.runner.handle_fast(&m).await;
     assert!(result.is_ok());
     let response = result.unwrap().expect("slash command must respond");
@@ -1051,7 +1011,11 @@ async fn per_user_model_override_isolated() {
     let gw = TestGateway::new().await;
 
     // User A sets model
-    let m = msg("chat-model-a", "alice", "/model opus");
+    let m = msg(
+        "chat-model-a",
+        "alice",
+        "/model us.anthropic.claude-opus-4-7",
+    );
     let result = gw.runner.handle_fast(&m).await;
     assert!(result.is_ok());
     let text = result.unwrap();
@@ -1086,8 +1050,12 @@ async fn same_user_model_override_is_scoped_by_chat() {
     let store = gw.runner.store().unwrap();
     let cli_name = gw.runner.cli_profile().name();
 
-    let first = msg("chat-one", "alice", "/model opus");
-    let second = msg("chat-two", "alice", "/model haiku");
+    let first = msg("chat-one", "alice", "/model us.anthropic.claude-opus-4-7");
+    let second = msg(
+        "chat-two",
+        "alice",
+        "/model us.anthropic.claude-haiku-4-5-20251001-v1:0",
+    );
     assert!(gw.runner.handle_fast(&first).await.unwrap().is_some());
     assert!(gw.runner.handle_fast(&second).await.unwrap().is_some());
 
@@ -1250,7 +1218,11 @@ async fn slash_model_switch_persists() {
     gw.runner.handle_message(&m0, &adapter).await;
 
     // Switch model
-    let m = msg("chat-model", "user-1", "/model opus");
+    let m = msg(
+        "chat-model",
+        "user-1",
+        "/model us.anthropic.claude-opus-4-7",
+    );
     let result = gw.runner.handle_fast(&m).await;
     assert!(result.is_ok());
     let text = result.unwrap();
@@ -1259,7 +1231,7 @@ async fn slash_model_switch_persists() {
     let t = text.unwrap();
     // It either confirms the switch or shows current model
     assert!(
-        t.contains("opus") || t.contains("模型") || t.contains("model"),
+        t.contains("us.anthropic.claude-opus-4-7") || t.contains("模型") || t.contains("model"),
         "model response should reference the model: {t}"
     );
 }

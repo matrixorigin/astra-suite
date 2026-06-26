@@ -10,16 +10,16 @@ use crate::store::{self, GatewayStore};
 
 use super::tools_cron;
 use super::tools_skills;
-use super::tools_tasks;
 use super::tools_workspace;
 
 pub struct GatewayMcpServer {
     pub store: Arc<dyn GatewayStore>,
-    pub durable_store: Option<Arc<dyn crate::durable_task_store::DurableTaskStoreExt>>,
     pub platform: String,
     pub chat_id: String,
     pub user_id: String,
     pub project_dirs: Vec<String>,
+    pub runtime_api_url: Option<String>,
+    pub runtime_api_token: Option<String>,
 }
 
 #[derive(Deserialize, schemars::JsonSchema, Default)]
@@ -60,27 +60,26 @@ pub struct SkillDeleteParams {
 }
 
 #[derive(Deserialize, schemars::JsonSchema, Default)]
-pub struct TaskCreateParams {
-    pub name: String,
-    #[serde(default)]
-    pub description: Option<String>,
-}
-
-#[derive(Deserialize, schemars::JsonSchema, Default)]
-pub struct TaskIdParams {
-    pub task_id: String,
-}
-
-#[derive(Deserialize, schemars::JsonSchema, Default)]
-pub struct TaskFailParams {
-    pub task_id: String,
-    #[serde(default)]
-    pub error: Option<String>,
-}
-
-#[derive(Deserialize, schemars::JsonSchema, Default)]
 pub struct WorkspaceSwitchParams {
     pub path: String,
+}
+
+#[derive(Deserialize, schemars::JsonSchema, Default)]
+pub struct SendAttachmentParams {
+    /// Absolute or workspace-relative path to the file to send.
+    pub path: String,
+    /// Optional display filename.
+    #[serde(default)]
+    pub filename: Option<String>,
+    /// Optional explanatory message sent before the file.
+    #[serde(default)]
+    pub caption: Option<String>,
+    /// Optional MIME type, for example application/pdf or image/png.
+    #[serde(default)]
+    pub mime: Option<String>,
+    /// Optional attachment kind: image, file, video, or audio.
+    #[serde(default)]
+    pub kind: Option<String>,
 }
 
 #[derive(Serialize, schemars::JsonSchema)]
@@ -106,20 +105,20 @@ impl GatewayMcpServer {
 
     #[tool(
         name = "gateway_cron_list",
-        description = "List all scheduled tasks (cron jobs and one-time reminders) for the current conversation"
+        description = "List scheduled tasks and one-time reminders for the current conversation. Use this when the user asks what reminders, schedules, cron jobs, or timed tasks are active."
     )]
     async fn cron_list(&self) -> Json<TextResult> {
-        let result = tools_cron::cron_list(&*self.store, &self.platform, &self.chat_id).await;
+        let result = tools_cron::cron_list(Some(&*self.store), &self.platform, &self.chat_id).await;
         Json(TextResult::new(result))
     }
 
     #[tool(
         name = "gateway_cron_add",
-        description = "Create a recurring scheduled task. cron_expr is a standard 5-field cron expression (minute hour day month weekday). message is the prompt to execute on each trigger."
+        description = "Create a recurring scheduled task. Use this when the user asks for repeated reminders or repeated work, such as daily, weekly, every weekday, every hour, or at a regular time. cron_expr is a standard 5-field cron expression (minute hour day month weekday). message is the prompt to execute on each trigger."
     )]
     async fn cron_add(&self, Parameters(params): Parameters<CronAddParams>) -> Json<TextResult> {
         let result = tools_cron::cron_add(
-            &*self.store,
+            Some(&*self.store),
             &self.platform,
             &self.chat_id,
             &self.user_id,
@@ -132,28 +131,32 @@ impl GatewayMcpServer {
 
     #[tool(
         name = "gateway_cron_delete",
-        description = "Delete a scheduled task by job ID (prefix match supported)"
+        description = "Delete a scheduled task or reminder by job ID. Prefix match is supported. Use gateway_cron_list first if the user identifies the task by description rather than ID."
     )]
     async fn cron_delete(
         &self,
         Parameters(params): Parameters<CronDeleteParams>,
     ) -> Json<TextResult> {
-        let result =
-            tools_cron::cron_delete(&*self.store, &self.platform, &self.chat_id, &params.job_id)
-                .await;
+        let result = tools_cron::cron_delete(
+            Some(&*self.store),
+            &self.platform,
+            &self.chat_id,
+            &params.job_id,
+        )
+        .await;
         Json(TextResult::new(result))
     }
 
     #[tool(
         name = "gateway_remind_after",
-        description = "Set a one-time reminder or task. minutes: delay in minutes (1-10080). message: content. exec: if true, the message is executed as a prompt by an agent at trigger time; if false, it's sent as plain text reminder."
+        description = "Set a one-time reminder or one-time delayed task. Use this when the user asks for a relative-time reminder, such as in 10 minutes, after half an hour, tomorrow, or later today. minutes: delay in minutes (1-10080). message: content. exec=false sends plain reminder text; exec=true runs the message as an agent prompt at trigger time."
     )]
     async fn remind_after(
         &self,
         Parameters(params): Parameters<RemindAfterParams>,
     ) -> Json<TextResult> {
         let result = tools_cron::remind_after(
-            &*self.store,
+            Some(&*self.store),
             &self.platform,
             &self.chat_id,
             &self.user_id,
@@ -220,97 +223,6 @@ impl GatewayMcpServer {
     }
 
     #[tool(
-        name = "gateway_tasks_list",
-        description = "List active durable tasks (long-running, checkpointable tasks)"
-    )]
-    async fn tasks_list(&self) -> Json<TextResult> {
-        let result =
-            tools_tasks::tasks_list(self.durable_store.as_deref(), &self.platform, &self.chat_id)
-                .await;
-        Json(TextResult::new(result))
-    }
-
-    #[tool(
-        name = "gateway_tasks_create",
-        description = "Create a new durable task for interruptible multi-step work"
-    )]
-    async fn tasks_create(
-        &self,
-        Parameters(params): Parameters<TaskCreateParams>,
-    ) -> Json<TextResult> {
-        let result = tools_tasks::tasks_create(
-            self.durable_store.as_deref(),
-            &self.platform,
-            &self.chat_id,
-            &params.name,
-            params.description.as_deref(),
-        )
-        .await;
-        Json(TextResult::new(result))
-    }
-
-    #[tool(
-        name = "gateway_tasks_status",
-        description = "Get status of a durable task by ID (prefix match supported)"
-    )]
-    async fn tasks_status(&self, Parameters(params): Parameters<TaskIdParams>) -> Json<TextResult> {
-        let result = tools_tasks::tasks_status(
-            self.durable_store.as_deref(),
-            &self.platform,
-            &self.chat_id,
-            &params.task_id,
-        )
-        .await;
-        Json(TextResult::new(result))
-    }
-
-    #[tool(
-        name = "gateway_tasks_complete",
-        description = "Mark a durable task as completed"
-    )]
-    async fn tasks_complete(
-        &self,
-        Parameters(params): Parameters<TaskIdParams>,
-    ) -> Json<TextResult> {
-        let result = tools_tasks::tasks_complete(
-            self.durable_store.as_deref(),
-            &self.platform,
-            &self.chat_id,
-            &params.task_id,
-        )
-        .await;
-        Json(TextResult::new(result))
-    }
-
-    #[tool(
-        name = "gateway_tasks_fail",
-        description = "Mark a durable task as failed with optional error message"
-    )]
-    async fn tasks_fail(&self, Parameters(params): Parameters<TaskFailParams>) -> Json<TextResult> {
-        let result = tools_tasks::tasks_fail(
-            self.durable_store.as_deref(),
-            &self.platform,
-            &self.chat_id,
-            &params.task_id,
-            params.error.as_deref(),
-        )
-        .await;
-        Json(TextResult::new(result))
-    }
-
-    #[tool(name = "gateway_tasks_cancel", description = "Cancel a durable task")]
-    async fn tasks_cancel(&self, Parameters(params): Parameters<TaskIdParams>) -> Json<TextResult> {
-        let result = tools_tasks::tasks_cancel(
-            self.durable_store.as_deref(),
-            &self.platform,
-            &self.chat_id,
-            &params.task_id,
-        )
-        .await;
-        Json(TextResult::new(result))
-    }
-
-    #[tool(
         name = "gateway_workspace_current",
         description = "Get the current workspace (working directory) path"
     )]
@@ -347,8 +259,99 @@ impl GatewayMcpServer {
         .await;
         Json(TextResult::new(result))
     }
+
+    #[tool(
+        name = "gateway_send_attachment",
+        description = "Send a local file to the current chat through the gateway. Use this when the user asks you to send, deliver, or return a document/image/file. path may be absolute or relative to the current workspace; caption is optional text sent before the file."
+    )]
+    async fn send_attachment(
+        &self,
+        Parameters(params): Parameters<SendAttachmentParams>,
+    ) -> Json<TextResult> {
+        Json(TextResult::new(
+            self.send_attachment_inner(params)
+                .await
+                .unwrap_or_else(|e| format!("failed to send attachment: {e}")),
+        ))
+    }
 }
 
+impl GatewayMcpServer {
+    async fn send_attachment_inner(&self, params: SendAttachmentParams) -> Result<String, String> {
+        let Some(runtime_api_url) = self.runtime_api_url.as_deref() else {
+            return Err("gateway runtime API is not configured".into());
+        };
+        let path = resolve_allowed_attachment_path(&params.path, &self.project_dirs)?;
+        let payload = serde_json::json!({
+            "platform": self.platform,
+            "chat_id": self.chat_id,
+            "path": path.to_string_lossy(),
+            "filename": params.filename,
+            "caption": params.caption,
+            "mime": params.mime,
+            "kind": params.kind,
+        });
+        let url = format!(
+            "{}/outbound/attachment",
+            runtime_api_url.trim_end_matches('/')
+        );
+        let client = reqwest::Client::new();
+        let mut request = client.post(url).json(&payload);
+        if let Some(token) = self.runtime_api_token.as_deref().filter(|s| !s.is_empty()) {
+            request = request.bearer_auth(token);
+        }
+        let response = request
+            .send()
+            .await
+            .map_err(|e| format!("runtime API request failed: {e}"))?;
+        let status = response.status();
+        let text = response.text().await.unwrap_or_default();
+        if !status.is_success() {
+            return Err(format!("runtime API returned {status}: {text}"));
+        }
+        Ok(format!("attachment sent: {}", path.display()))
+    }
+}
+
+fn resolve_allowed_attachment_path(
+    path: &str,
+    project_dirs: &[String],
+) -> Result<std::path::PathBuf, String> {
+    let input = std::path::PathBuf::from(path);
+    let candidate = if input.is_absolute() {
+        input
+    } else {
+        std::env::current_dir()
+            .map_err(|e| format!("cannot read current directory: {e}"))?
+            .join(input)
+    };
+    let canonical = candidate
+        .canonicalize()
+        .map_err(|e| format!("cannot access `{}`: {e}", candidate.display()))?;
+    if !canonical.is_file() {
+        return Err(format!("`{}` is not a file", canonical.display()));
+    }
+
+    let mut roots = Vec::new();
+    if let Ok(cwd) = std::env::current_dir().and_then(|p| p.canonicalize()) {
+        roots.push(cwd);
+    }
+    for root in project_dirs {
+        if let Ok(root) = std::path::PathBuf::from(root).canonicalize() {
+            roots.push(root);
+        }
+    }
+    if roots.iter().any(|root| canonical.starts_with(root)) {
+        Ok(canonical)
+    } else {
+        Err(format!(
+            "`{}` is outside the allowed workspace directories",
+            canonical.display()
+        ))
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 pub async fn run_stdio_server(
     database_url: Option<String>,
     sqlite_path: Option<String>,
@@ -356,6 +359,8 @@ pub async fn run_stdio_server(
     chat_id: Option<String>,
     user_id: Option<String>,
     project_dirs: Vec<String>,
+    runtime_api_url: Option<String>,
+    runtime_api_token: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let platform = platform.unwrap_or_else(|| "mcp".into());
     let chat_id = chat_id.unwrap_or_else(|| "default".into());
@@ -374,15 +379,14 @@ pub async fn run_stdio_server(
         .map_err(|e| format!("failed to open store: {e}"))?
         .ok_or("storage not available")?;
 
-    let durable_store = bundle.durable_store;
-
     let server = GatewayMcpServer {
         store: bundle.store,
-        durable_store,
         platform,
         chat_id,
         user_id,
         project_dirs,
+        runtime_api_url,
+        runtime_api_token,
     };
 
     let transport = rmcp::transport::io::stdio();

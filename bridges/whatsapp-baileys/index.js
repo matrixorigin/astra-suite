@@ -192,6 +192,31 @@ async function handleJsonlCommand(stream, command) {
       writeLine(stream, { type: 'response', id, ok: true, message_id: result?.key?.id || '' })
       return
     }
+    if (command.type === 'send_attachment') {
+      const jid = normalizeJid(command.to)
+      const filePath = String(command.path || '')
+      if (!jid || !filePath) {
+        writeLine(stream, { type: 'response', id, ok: false, error: 'to and path are required' })
+        return
+      }
+      let stat
+      try {
+        stat = await fs.stat(filePath)
+      } catch (err) {
+        writeLine(stream, { type: 'response', id, ok: false, error: `file not accessible: ${err.message || err}` })
+        return
+      }
+      if (!stat.isFile()) {
+        writeLine(stream, { type: 'response', id, ok: false, error: 'path is not a file' })
+        return
+      }
+      const filename = command.filename || path.basename(filePath)
+      const mimetype = command.mime || guessMime(filename)
+      const payload = attachmentPayload(command.kind, filePath, filename, mimetype)
+      const result = await sock.sendMessage(jid, payload)
+      writeLine(stream, { type: 'response', id, ok: true, message_id: result?.key?.id || '' })
+      return
+    }
     if (command.type === 'typing') {
       const jid = normalizeJid(command.to)
       const state = command.state === 'paused' ? 'paused' : 'composing'
@@ -207,6 +232,41 @@ async function handleJsonlCommand(stream, command) {
   } catch (err) {
     logger.error({ err, commandType: command.type }, 'JSONL command failed')
     writeLine(stream, { type: 'response', id, ok: false, error: String(err.message || err) })
+  }
+}
+
+function attachmentPayload(kind, filePath, filename, mimetype) {
+  const url = filePath
+  if (kind === 'image') {
+    return { image: { url }, mimetype }
+  }
+  if (kind === 'video') {
+    return { video: { url }, mimetype, fileName: filename }
+  }
+  if (kind === 'audio') {
+    return { audio: { url }, mimetype }
+  }
+  return { document: { url }, mimetype, fileName: filename }
+}
+
+function guessMime(filename) {
+  const ext = path.extname(filename || '').toLowerCase()
+  switch (ext) {
+    case '.png': return 'image/png'
+    case '.jpg':
+    case '.jpeg': return 'image/jpeg'
+    case '.gif': return 'image/gif'
+    case '.webp': return 'image/webp'
+    case '.pdf': return 'application/pdf'
+    case '.html':
+    case '.htm': return 'text/html'
+    case '.txt': return 'text/plain'
+    case '.mp4': return 'video/mp4'
+    case '.webm': return 'video/webm'
+    case '.mp3': return 'audio/mpeg'
+    case '.ogg': return 'audio/ogg'
+    case '.wav': return 'audio/wav'
+    default: return 'application/octet-stream'
   }
 }
 

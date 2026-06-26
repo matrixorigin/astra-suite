@@ -85,6 +85,12 @@ enum Command {
         /// Colon-separated project directories
         #[arg(long, env = "GW_MCP_PROJECT_DIRS")]
         project_dirs: Option<String>,
+        /// Local gateway runtime API URL
+        #[arg(long, env = "GW_MCP_RUNTIME_API_URL")]
+        runtime_api_url: Option<String>,
+        /// Bearer token for local gateway runtime API
+        #[arg(long, env = "GW_MCP_RUNTIME_API_TOKEN")]
+        runtime_api_token: Option<String>,
     },
 }
 
@@ -148,6 +154,10 @@ fn lock_path() -> PathBuf {
 
 fn log_path() -> PathBuf {
     default_run_dir().join("gateway.log")
+}
+
+fn runtime_api_token_path() -> PathBuf {
+    default_run_dir().join("runtime-api-token")
 }
 
 const REPO: &str = "matrixorigin/astra-suite";
@@ -645,6 +655,8 @@ async fn main() {
         chat_id,
         user_id,
         project_dirs,
+        runtime_api_url,
+        runtime_api_token,
     }) = cli.command
     {
         let dirs: Vec<String> = project_dirs
@@ -657,6 +669,8 @@ async fn main() {
             chat_id,
             user_id,
             dirs,
+            runtime_api_url,
+            runtime_api_token,
         )
         .await
         {
@@ -864,12 +878,30 @@ async fn main() {
     let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
     let (cron_tx, cron_rx) = tokio::sync::mpsc::channel(64);
     let (inject_tx, inject_rx) = tokio::sync::mpsc::channel(64);
+    let (runtime_cmd_tx, runtime_cmd_rx) = tokio::sync::mpsc::channel(64);
     runner.set_outbound_tx(cron_tx.clone());
 
-    // Start inject API server if configured
+    // Start local runtime API server if configured
     if let Some(port) = config.api_port {
         let tx = inject_tx.clone();
-        tokio::spawn(astra_gateway::inject_server::run(port, tx));
+        let command_tx = runtime_cmd_tx.clone();
+        let token = uuid::Uuid::new_v4().to_string();
+        let token_path = runtime_api_token_path();
+        if let Err(e) = std::fs::write(&token_path, &token) {
+            tracing::warn!(path = %token_path.display(), error = %e, "failed to write runtime API token file");
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&token_path, std::fs::Permissions::from_mode(0o600));
+        }
+        runner.set_runtime_api(format!("http://127.0.0.1:{port}"), token.clone());
+        tokio::spawn(astra_gateway::runtime_api::run(
+            port,
+            tx,
+            command_tx,
+            Some(token),
+        ));
     }
 
     // Start cron scheduler (only if store + trace_repo available)
@@ -908,7 +940,9 @@ async fn main() {
     });
 
     let runner = std::sync::Arc::new(runner);
-    runner.run(adapters, cron_rx, inject_rx, shutdown_rx).await;
+    runner
+        .run(adapters, cron_rx, inject_rx, runtime_cmd_rx, shutdown_rx)
+        .await;
 }
 
 // Only fixed-offset timezones are supported (no DST handling).
