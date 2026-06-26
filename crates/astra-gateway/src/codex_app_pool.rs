@@ -6,6 +6,7 @@
 use crate::cli_bridge::{
     CliProfile, CliProgress, CliResult, ReasoningKind, apply_provider_environment,
 };
+use crate::mcp::config::CodexMcpConfig;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::path::Path;
@@ -79,6 +80,7 @@ impl CodexAppPool {
         system_prompt: Option<&str>,
         provider_config: Option<&crate::config::ProviderConfig>,
         github_token: Option<&str>,
+        mcp_config: Option<&CodexMcpConfig>,
     ) -> Result<mpsc::Receiver<CliProgress>, String> {
         if !self.processes.contains_key(key) || !self.is_alive(key) {
             self.processes.remove(key);
@@ -90,6 +92,7 @@ impl CodexAppPool {
                 system_prompt,
                 provider_config,
                 github_token,
+                mcp_config,
             )
             .await?;
         }
@@ -193,6 +196,7 @@ impl CodexAppPool {
         if let Some(handle) = self.processes.remove(key) {
             handle.cancel.cancel();
         }
+        crate::mcp::config::cleanup_mcp_config(key);
     }
 
     pub async fn respond_current_approval(&self, key: &str, decision: &str) -> Result<(), String> {
@@ -279,6 +283,7 @@ impl CodexAppPool {
         system_prompt: Option<&str>,
         provider_config: Option<&crate::config::ProviderConfig>,
         github_token: Option<&str>,
+        mcp_config: Option<&CodexMcpConfig>,
     ) -> Result<(), String> {
         let mut cmd = build_app_server_command(profile, working_dir, provider_config, github_token)
             .ok_or("profile does not support codex app-server mode")?;
@@ -394,7 +399,13 @@ impl CodexAppPool {
             match handle
                 .request(
                     "thread/resume",
-                    thread_resume_params(session_id, profile, working_dir, system_prompt),
+                    thread_resume_params(
+                        session_id,
+                        profile,
+                        working_dir,
+                        system_prompt,
+                        mcp_config,
+                    ),
                 )
                 .await
             {
@@ -404,7 +415,7 @@ impl CodexAppPool {
                     handle
                         .request(
                             "thread/start",
-                            thread_start_params(profile, working_dir, system_prompt),
+                            thread_start_params(profile, working_dir, system_prompt, mcp_config),
                         )
                         .await?
                 }
@@ -413,7 +424,7 @@ impl CodexAppPool {
             handle
                 .request(
                     "thread/start",
-                    thread_start_params(profile, working_dir, system_prompt),
+                    thread_start_params(profile, working_dir, system_prompt, mcp_config),
                 )
                 .await?
         };
@@ -522,6 +533,7 @@ fn thread_start_params(
     profile: &CliProfile,
     working_dir: Option<&Path>,
     system_prompt: Option<&str>,
+    mcp_config: Option<&CodexMcpConfig>,
 ) -> Value {
     let mut params = serde_json::json!({
         "approvalPolicy": "never",
@@ -530,13 +542,7 @@ fn thread_start_params(
         "persistExtendedHistory": false,
     });
 
-    if let Some(dir) = working_dir {
-        params["cwd"] = Value::String(dir.to_string_lossy().to_string());
-    }
-
-    if let Some(sp) = system_prompt.filter(|s| !s.trim().is_empty()) {
-        params["developerInstructions"] = Value::String(sp.to_string());
-    }
+    apply_thread_context_params(&mut params, working_dir, system_prompt, mcp_config);
 
     match profile {
         CliProfile::Codex {
@@ -568,6 +574,7 @@ fn thread_resume_params(
     profile: &CliProfile,
     working_dir: Option<&Path>,
     system_prompt: Option<&str>,
+    mcp_config: Option<&CodexMcpConfig>,
 ) -> Value {
     let mut params = serde_json::json!({
         "threadId": thread_id,
@@ -576,13 +583,7 @@ fn thread_resume_params(
         "approvalPolicy": "never",
     });
 
-    if let Some(dir) = working_dir {
-        params["cwd"] = Value::String(dir.to_string_lossy().to_string());
-    }
-
-    if let Some(sp) = system_prompt.filter(|s| !s.trim().is_empty()) {
-        params["developerInstructions"] = Value::String(sp.to_string());
-    }
+    apply_thread_context_params(&mut params, working_dir, system_prompt, mcp_config);
 
     match profile {
         CliProfile::Codex {
@@ -604,6 +605,25 @@ fn thread_resume_params(
     }
 
     params
+}
+
+fn apply_thread_context_params(
+    params: &mut Value,
+    working_dir: Option<&Path>,
+    system_prompt: Option<&str>,
+    mcp_config: Option<&CodexMcpConfig>,
+) {
+    if let Some(dir) = working_dir {
+        params["cwd"] = Value::String(dir.to_string_lossy().to_string());
+    }
+
+    if let Some(sp) = system_prompt.filter(|s| !s.trim().is_empty()) {
+        params["developerInstructions"] = Value::String(sp.to_string());
+    }
+
+    if let Some(mcp_config) = mcp_config {
+        params["config"] = mcp_config.thread_config();
+    }
 }
 
 async fn stdin_writer_task(
@@ -1212,6 +1232,7 @@ mod tests {
             &profile,
             Some(Path::new("/tmp/project")),
             Some("system prompt"),
+            None,
         );
         assert_eq!(params["cwd"], "/tmp/project");
         assert_eq!(params["model"], "gpt-5.5");
@@ -1231,7 +1252,12 @@ mod tests {
         };
         assert!(CodexAppPool::supports_persistent(&profile));
 
-        let params = thread_start_params(&profile, Some(Path::new("/tmp/project")), Some("system"));
+        let params = thread_start_params(
+            &profile,
+            Some(Path::new("/tmp/project")),
+            Some("system"),
+            None,
+        );
         assert_eq!(params["cwd"], "/tmp/project");
         assert_eq!(params["model"], "gpt-5.5");
         assert_eq!(params["permissionMode"], "auto");
@@ -1276,6 +1302,97 @@ mod tests {
         );
     }
 
+    #[test]
+    fn codex_app_server_command_uses_plain_app_server_args() {
+        let profile = CliProfile::Codex {
+            bin: "codex".into(),
+            model: None,
+            sandbox: "workspace-write".into(),
+            stream_json: true,
+            extra_args: vec![],
+            skip_git_repo_check: false,
+            ephemeral: true,
+        };
+
+        let cmd = build_app_server_command(&profile, None, None, None)
+            .expect("codex should support app-server command");
+        let args: Vec<_> = cmd
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().to_string())
+            .collect();
+
+        assert_eq!(args, ["app-server", "--listen", "stdio://"]);
+        assert!(!args.contains(&"-c".to_string()));
+    }
+
+    #[test]
+    fn codex_thread_start_includes_gateway_mcp_config() {
+        let profile = CliProfile::Codex {
+            bin: "codex".into(),
+            model: None,
+            sandbox: "workspace-write".into(),
+            stream_json: true,
+            extra_args: vec![],
+            skip_git_repo_check: false,
+            ephemeral: true,
+        };
+        let config = CodexMcpConfig {
+            command: "/tmp/astra-gateway".into(),
+            args: vec!["mcp-serve".into()],
+            env: [("GW_MCP_CHAT_ID".to_string(), "chat-1".to_string())].into(),
+        };
+
+        let params = thread_start_params(&profile, None, None, Some(&config));
+
+        assert_eq!(
+            params["config"]["mcp_servers"]["gateway"]["command"],
+            "/tmp/astra-gateway"
+        );
+        assert_eq!(
+            params["config"]["mcp_servers"]["gateway"]["args"],
+            serde_json::json!(["mcp-serve"])
+        );
+        assert_eq!(
+            params["config"]["mcp_servers"]["gateway"]["env"]["GW_MCP_CHAT_ID"],
+            "chat-1"
+        );
+    }
+
+    #[test]
+    fn codex_thread_resume_includes_gateway_mcp_config() {
+        let profile = CliProfile::Codex {
+            bin: "codex".into(),
+            model: None,
+            sandbox: "workspace-write".into(),
+            stream_json: true,
+            extra_args: vec![],
+            skip_git_repo_check: false,
+            ephemeral: true,
+        };
+        let config = CodexMcpConfig {
+            command: "/tmp/astra-gateway".into(),
+            args: vec!["mcp-serve".into()],
+            env: [("GW_MCP_CHAT_ID".to_string(), "chat-1".to_string())].into(),
+        };
+
+        let params = thread_resume_params("thread-1", &profile, None, None, Some(&config));
+
+        assert_eq!(params["threadId"], "thread-1");
+        assert_eq!(
+            params["config"]["mcp_servers"]["gateway"]["command"],
+            "/tmp/astra-gateway"
+        );
+        assert_eq!(
+            params["config"]["mcp_servers"]["gateway"]["args"],
+            serde_json::json!(["mcp-serve"])
+        );
+        assert_eq!(
+            params["config"]["mcp_servers"]["gateway"]["env"]["GW_MCP_CHAT_ID"],
+            "chat-1"
+        );
+    }
+
     #[tokio::test]
     #[ignore]
     async fn live_astra_app_server_pool_streams_turn() {
@@ -1297,6 +1414,7 @@ mod tests {
                 None,
                 Some(workspace.path()),
                 Some("你是一个端到端验证助手，回答必须尽量简短。"),
+                None,
                 None,
                 None,
             )
@@ -1523,7 +1641,7 @@ mod tests {
             skip_git_repo_check: false,
             ephemeral: false,
         };
-        let params = thread_resume_params("thread-1", &profile, None, None);
+        let params = thread_resume_params("thread-1", &profile, None, None, None);
         assert_eq!(params["threadId"], "thread-1");
         assert_eq!(params["excludeTurns"], true);
         assert_eq!(params["persistExtendedHistory"], false);

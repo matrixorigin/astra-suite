@@ -1245,8 +1245,9 @@ impl GatewayRunner {
 
         let use_claude_pool = supports_claude_pool;
         let use_codex_app_pool = supports_codex_app_pool;
+        let use_codex_mcp = matches!(&cli_profile, CliProfile::Codex { .. });
 
-        let mcp_config_path = if use_claude_pool {
+        let mcp_config = if use_claude_pool || use_codex_mcp {
             let storage_env = match &self.config.storage {
                 crate::store::StorageConfig::Mysql { url }
                 | crate::store::StorageConfig::MatrixOne { url } => {
@@ -1264,7 +1265,7 @@ impl GatewayRunner {
                     sqlite_path: None,
                 },
             };
-            crate::mcp::config::generate_mcp_config(
+            crate::mcp::config::generate_gateway_mcp_config(
                 &storage_env,
                 msg.platform,
                 &effective_chat_id,
@@ -1289,7 +1290,9 @@ impl GatewayRunner {
             let token = access_token.clone();
             let gh_token = github_token.clone();
             let kill_token = cancel_token.clone();
-            let mcp_cfg = mcp_config_path.clone();
+            let mcp_config_path = mcp_config
+                .as_ref()
+                .map(|config| config.claude_config_path.clone());
             let pc = provider_config.clone();
             let sid = sid.clone();
             let pool_store = self.store.clone();
@@ -1312,7 +1315,7 @@ impl GatewayRunner {
                             Some(&sp),
                             token.as_deref(),
                             gh_token.as_deref(),
-                            mcp_cfg.as_deref(),
+                            mcp_config_path.as_deref(),
                             pc.as_ref(),
                         )
                         .await?;
@@ -1510,6 +1513,7 @@ impl GatewayRunner {
             let kill_token = cancel_token.clone();
             let token = access_token.clone();
             let gh_token = github_token.clone();
+            let codex_mcp_config = mcp_config.as_ref().map(|config| config.codex.clone());
             let pc = provider_config.clone();
 
             tokio::spawn(async move {
@@ -1525,6 +1529,7 @@ impl GatewayRunner {
                             Some(&sp),
                             pc.as_ref(),
                             gh_token.as_deref(),
+                            codex_mcp_config.as_ref(),
                         )
                         .await
                 };
