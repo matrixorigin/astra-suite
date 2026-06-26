@@ -716,29 +716,16 @@ impl GatewayRunner {
         // Apply per-user model override scoped to this CLI. Empty string is the
         // "use default" sentinel written by `/model 默认` — treat as no override.
         let model_key = store::model_preference_key(profile.name(), Some(chat_id));
-        let entries = crate::commands::all_model_entries(&self.config, profile.name());
         if let Some(ref store) = self.store
             && let Ok(Some(model_name)) = store
                 .get_user_preference(platform, user_id, &model_key)
                 .await
             && !model_name.is_empty()
         {
-            let is_supported_codex_model = crate::commands::has_model_id(&model_name, &entries);
-            if profile.name() != "codex" || is_supported_codex_model {
-                profile.set_model_override(model_name);
-            } else {
-                tracing::warn!(
-                    cli = profile.name(),
-                    model = %model_name,
-                    "ignoring stale model override not supported by active CLI"
-                );
-            }
+            profile.set_model_override(model_name);
         }
 
-        let provider = profile
-            .model_name()
-            .and_then(|mid| crate::commands::model_provider(mid, &entries))
-            .and_then(|pn| self.config.providers.get(&pn).cloned());
+        let provider = crate::cli_bridge::provider_for_cli_profile(&self.config, &profile);
 
         (profile, provider)
     }
@@ -805,10 +792,6 @@ impl GatewayRunner {
         let (cli_profile, provider_config) = self
             .resolve_cli_profile(msg.platform, &msg.user_id, &effective_chat_id)
             .await;
-        let entries = crate::commands::all_model_entries(&self.config, cli_profile.name());
-        let provider_name = cli_profile
-            .model_name()
-            .and_then(|mid| crate::commands::model_provider(mid, &entries));
 
         let trimmed = msg.text.trim();
 
@@ -846,7 +829,6 @@ impl GatewayRunner {
                     chat_id: &effective_chat_id,
                     user_id: &msg.user_id,
                     resolved_cli: &cli_profile,
-                    resolved_provider: provider_name.as_deref(),
                     resolved_provider_config: provider_config.as_ref(),
                     trace_repo: self
                         .trace_repo
@@ -893,7 +875,6 @@ impl GatewayRunner {
             chat_id: &effective_chat_id,
             user_id: &msg.user_id,
             resolved_cli: &cli_profile,
-            resolved_provider: provider_name.as_deref(),
             resolved_provider_config: provider_config.as_ref(),
             trace_repo: self
                 .trace_repo
@@ -919,11 +900,10 @@ impl GatewayRunner {
                 // resolved to a valid model. Otherwise the user just gets an
                 // error message back and the existing session stays warm.
                 let should_kill = if let Some(arg) = msg.text.strip_prefix("/model ") {
-                    let entries = commands::all_model_entries(&self.config, cli_profile.name());
-                    !matches!(
-                        commands::resolve_model_input(arg, &entries),
-                        commands::ResolvedModel::Unrecognized
-                    )
+                    let arg = arg.trim();
+                    !arg.eq_ignore_ascii_case("refresh")
+                        && !response.starts_with("⚠️ 未识别模型")
+                        && !response.starts_with("⚠️ 模型设置失败")
                 } else {
                     true
                 };

@@ -838,6 +838,66 @@ pub(crate) fn apply_provider_environment(
     Ok(())
 }
 
+pub(crate) fn provider_for_cli_profile(
+    config: &crate::config::GatewayConfig,
+    profile: &CliProfile,
+) -> Option<crate::config::ProviderConfig> {
+    if !matches!(profile, CliProfile::Claude { .. }) || profile_has_own_provider_env(profile) {
+        return None;
+    }
+
+    const PREFERRED_ANTHROPIC_PROVIDERS: &[&str] = &["dashscope", "bedrock"];
+
+    PREFERRED_ANTHROPIC_PROVIDERS
+        .iter()
+        .filter_map(|name| config.providers.get(*name))
+        .chain(
+            config
+                .providers
+                .iter()
+                .filter(|(name, _)| !PREFERRED_ANTHROPIC_PROVIDERS.contains(&name.as_str()))
+                .map(|(_, provider)| provider),
+        )
+        .find(|provider| provider.enabled && provider_has_anthropic_env(provider))
+        .cloned()
+}
+
+fn profile_has_own_provider_env(profile: &CliProfile) -> bool {
+    match profile {
+        CliProfile::Claude { env, env_file, .. } | CliProfile::Copilot { env, env_file, .. } => {
+            env_file
+                .as_deref()
+                .is_some_and(|path| !path.trim().is_empty())
+                || env.keys().any(|key| is_anthropic_env_key(key))
+        }
+        _ => false,
+    }
+}
+
+fn provider_has_anthropic_env(provider: &crate::config::ProviderConfig) -> bool {
+    provider.env.keys().any(|key| is_anthropic_env_key(key))
+        || provider
+            .env_file
+            .as_deref()
+            .is_some_and(|path| !path.trim().is_empty())
+}
+
+fn is_anthropic_env_key(key: &str) -> bool {
+    matches!(
+        key,
+        "ANTHROPIC_BASE_URL"
+            | "ANTHROPIC_AUTH_TOKEN"
+            | "ANTHROPIC_API_KEY"
+            | "ANTHROPIC_MODEL"
+            | "ANTHROPIC_DEFAULT_OPUS_MODEL"
+            | "ANTHROPIC_DEFAULT_SONNET_MODEL"
+            | "ANTHROPIC_DEFAULT_HAIKU_MODEL"
+            | "CLAUDE_CODE_USE_BEDROCK"
+            | "AWS_REGION"
+            | "AWS_BEARER_TOKEN_BEDROCK"
+    )
+}
+
 // ─── JSON parsers ───────────────────────────────────────────────────────────
 
 const ASTRA_REQUIRED_FIELDS: &[&str] = &[
