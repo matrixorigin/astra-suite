@@ -314,6 +314,7 @@ async fn run_jsonl_reader(
                     chat_id,
                     user_id,
                     text,
+                    attachments: Vec::new(),
                     msg_id: if msg_id.is_empty() {
                         format!("whatsapp-web-{}", Uuid::new_v4())
                     } else {

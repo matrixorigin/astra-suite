@@ -168,6 +168,7 @@ pub struct InboundMessage {
     pub chat_id: String,
     pub user_id: String,
     pub text: String,
+    pub attachments: Vec<InboundAttachment>,
     pub msg_id: String,
     pub chat_type: ChatType,
     /// WeCom: the inbound req_id, needed for group responds.
@@ -180,6 +181,18 @@ pub struct InboundMessage {
     /// Platform-side feedback for a previous AI response. Feedback messages are
     /// recorded by the runner and do not go through the CLI slow path.
     pub feedback: Option<FeedbackEvent>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InboundAttachment {
+    pub kind: AttachmentKind,
+    pub name: Option<String>,
+    pub media_id: Option<String>,
+    pub url: Option<String>,
+    pub local_path: Option<String>,
+    pub mime_type: Option<String>,
+    pub size_bytes: Option<u64>,
+    pub raw: serde_json::Value,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -48,6 +48,7 @@ const INITIAL_ACK_DELAY: Duration = Duration::from_secs(3);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(25);
 const WECOM_STREAM_CUTOFF: Duration = Duration::from_secs(9 * 60 + 30);
 const WECOM_POST_STREAM_HEARTBEAT: Duration = Duration::from_secs(120);
+const ATTACHMENT_PREPARE_CONCURRENCY: usize = 4;
 #[allow(dead_code)]
 const PROGRESSIVE_FLUSH_INTERVAL: Duration = Duration::from_secs(8);
 const PROGRESSIVE_MIN_CHARS: usize = 200;
@@ -393,6 +394,7 @@ pub struct GatewayRunner {
     queue_senders:
         tokio::sync::Mutex<HashMap<ConversationKey, tokio::sync::mpsc::Sender<QueuedRequest>>>,
     global_run_limiter: Arc<tokio::sync::Semaphore>,
+    attachment_prepare_limiter: Arc<tokio::sync::Semaphore>,
     cli_availability: Vec<(String, cli_bridge::CliAvailability)>,
     /// Tracks consecutive auth failures per CLI profile name.
     /// Value: (failure_count, last_failure_time).
@@ -443,11 +445,54 @@ impl PlatformAdapter for NullAdapter {
 /// Response from a background CLI task, routed back to the adapter.
 type CliResponse = OutboundMessage;
 
-#[derive(Debug)]
 struct QueuedRequest {
     msg: InboundMessage,
     conversation: ConversationKey,
     trace: Option<OutboxDeliveryTrace>,
+    attachment_prepare: Option<tokio::task::JoinHandle<(InboundMessage, Option<String>)>>,
+}
+
+struct AttachmentCleanup {
+    paths: Vec<std::path::PathBuf>,
+}
+
+impl AttachmentCleanup {
+    fn new(msg: &InboundMessage) -> Self {
+        let paths = msg
+            .attachments
+            .iter()
+            .filter_map(|attachment| attachment.local_path.as_deref())
+            .map(std::path::PathBuf::from)
+            .collect();
+        Self { paths }
+    }
+}
+
+impl Drop for AttachmentCleanup {
+    fn drop(&mut self) {
+        for path in &self.paths {
+            if let Err(e) = std::fs::remove_file(path)
+                && e.kind() != std::io::ErrorKind::NotFound
+            {
+                tracing::debug!(path = %path.display(), error = %e, "attachment cleanup failed");
+            }
+            if let Some(parent) = path.parent()
+                && let Err(e) = std::fs::remove_dir(parent)
+                && e.kind() != std::io::ErrorKind::NotFound
+                && e.kind() != std::io::ErrorKind::DirectoryNotEmpty
+            {
+                tracing::debug!(dir = %parent.display(), error = %e, "attachment directory cleanup failed");
+            }
+        }
+    }
+}
+
+impl Drop for QueuedRequest {
+    fn drop(&mut self) {
+        if let Some(handle) = self.attachment_prepare.take() {
+            handle.abort();
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -559,6 +604,9 @@ impl GatewayRunner {
             trace_repo,
             queue_senders: tokio::sync::Mutex::new(HashMap::new()),
             global_run_limiter: Arc::new(tokio::sync::Semaphore::new(max_concurrent_runs)),
+            attachment_prepare_limiter: Arc::new(tokio::sync::Semaphore::new(
+                ATTACHMENT_PREPARE_CONCURRENCY,
+            )),
             cli_availability,
             auth_failures: Arc::new(dashmap::DashMap::new()),
             shared_auth,
@@ -771,7 +819,7 @@ impl GatewayRunner {
         };
 
         // Bare @mention with no content → treat as greeting
-        let msg = &if msg.text.is_empty() {
+        let msg = &if msg.text.is_empty() && msg.attachments.is_empty() {
             let mut m = msg.clone();
             m.text = "你好".to_string();
             m
@@ -914,6 +962,9 @@ impl GatewayRunner {
             }
             return Ok(Some(response));
         }
+        if let Some(response) = image_attachment_guard_message(msg, &cmd_ctx).await {
+            return Ok(Some(response));
+        }
 
         // Not a slash command — needs CLI (slow path)
         Err(msg.clone())
@@ -936,10 +987,25 @@ impl GatewayRunner {
         adapter: &dyn PlatformAdapter,
         trace: Option<OutboxDeliveryTrace>,
     ) -> Option<OutboundMessage> {
+        let mut msg = msg.clone();
         if let Some(feedback) = msg.feedback.as_ref() {
-            self.record_feedback(msg, feedback).await;
+            self.record_feedback(&msg, feedback).await;
             return None;
         }
+        if let Some(text) = prepare_inbound_attachments(&mut msg).await {
+            let _attachment_cleanup = AttachmentCleanup::new(&msg);
+            return Some(
+                self.outbound_response(
+                    trace.as_ref(),
+                    msg.platform,
+                    &msg.chat_id,
+                    msg.reply_token.clone(),
+                    text,
+                )
+                .await,
+            );
+        }
+        let _attachment_cleanup = AttachmentCleanup::new(&msg);
 
         // Group chat: per-user session isolation
         let effective_chat_id = if msg.chat_type == crate::platforms::ChatType::Group
@@ -953,6 +1019,39 @@ impl GatewayRunner {
         let (cli_profile, provider_config) = self
             .resolve_cli_profile(msg.platform, &msg.user_id, &effective_chat_id)
             .await;
+
+        let cmd_ctx = CommandContext {
+            astra: &self.thin,
+            config: &self.config,
+            store: self.store.as_deref(),
+            platform: msg.platform,
+            chat_id: &effective_chat_id,
+            user_id: &msg.user_id,
+            resolved_cli: &cli_profile,
+            resolved_provider_config: provider_config.as_ref(),
+            trace_repo: self
+                .trace_repo
+                .as_ref()
+                .map(|repo| repo.as_ref() as &dyn TraceRepository),
+            project_dirs: &self.config.project_dirs,
+            cli_availability: &self.cli_availability,
+            auth_status: self.auth_status_line(cli_profile.name()),
+            active_requests: Some(&self.active_requests),
+            codex_app_pool: Some(&self.codex_app_pool),
+            gateway_start: self.gateway_start,
+        };
+        if let Some(text) = image_attachment_guard_message(&msg, &cmd_ctx).await {
+            return Some(
+                self.outbound_response(
+                    trace.as_ref(),
+                    msg.platform,
+                    &msg.chat_id,
+                    msg.reply_token.clone(),
+                    text,
+                )
+                .await,
+            );
+        }
 
         // Check first-time user BEFORE upsert (upsert creates the row)
         let is_first = if let Some(ref store) = self.store {
@@ -1206,7 +1305,7 @@ impl GatewayRunner {
         };
 
         // Run CLI with rich progress heartbeats and a bounded lifetime.
-        let message_text = msg.text.clone();
+        let message_text = message_text_for_cli(&msg);
         let sid = session_id.clone();
         let chat_id = effective_chat_id.clone();
         let reply_token = msg.reply_token.clone();
@@ -2201,7 +2300,7 @@ impl GatewayRunner {
             };
             result = match cli_bridge::run_cli_with_context(
                 &cli_profile,
-                &msg.text,
+                &message_text,
                 None,
                 workspace.as_deref(),
                 None,
@@ -2935,10 +3034,30 @@ impl GatewayRunner {
         } else {
             None
         };
+        let attachment_prepare = if msg.attachments.is_empty() {
+            None
+        } else {
+            let mut prepare_msg = msg.clone();
+            let limiter = self.attachment_prepare_limiter.clone();
+            Some(tokio::spawn(async move {
+                let Ok(_permit) = limiter.acquire_owned().await else {
+                    return (
+                        prepare_msg,
+                        Some(
+                            "收到附件，但当前无法读取该附件内容。请重新发送可下载的图片或文件。"
+                                .to_string(),
+                        ),
+                    );
+                };
+                let response = prepare_inbound_attachments(&mut prepare_msg).await;
+                (prepare_msg, response)
+            }))
+        };
         QueuedRequest {
             msg,
             conversation,
             trace,
+            attachment_prepare,
         }
     }
 
@@ -2998,7 +3117,7 @@ impl GatewayRunner {
         cli_resp_tx: tokio::sync::mpsc::Sender<CliResponse>,
     ) {
         loop {
-            let queued = match tokio::time::timeout(CONVERSATION_QUEUE_IDLE_TIMEOUT, rx.recv())
+            let mut queued = match tokio::time::timeout(CONVERSATION_QUEUE_IDLE_TIMEOUT, rx.recv())
                 .await
             {
                 Ok(Some(queued)) => queued,
@@ -3015,12 +3134,25 @@ impl GatewayRunner {
                     }
                 }
             };
-            let Ok(_permit) = self.global_run_limiter.clone().acquire_owned().await else {
-                break;
-            };
             if !self.should_execute_queued(&queued).await {
                 continue;
             }
+            if let Some(text) = self.finish_attachment_prepare(&mut queued).await {
+                let outbound = self
+                    .outbound_response(
+                        queued.trace.as_ref(),
+                        queued.msg.platform,
+                        &queued.msg.chat_id,
+                        queued.msg.reply_token.clone(),
+                        text,
+                    )
+                    .await;
+                let _ = cli_resp_tx.send(outbound).await;
+                continue;
+            }
+            let Ok(_permit) = self.global_run_limiter.clone().acquire_owned().await else {
+                break;
+            };
             match self
                 .handle_message_inner(&queued.msg, &NullAdapter, queued.trace.clone())
                 .await
@@ -3104,6 +3236,20 @@ impl GatewayRunner {
                 // Execute on DB error rather than silently dropping the request
                 tracing::warn!(error = %e, "failed to verify queued request status; executing anyway");
                 true
+            }
+        }
+    }
+
+    async fn finish_attachment_prepare(&self, queued: &mut QueuedRequest) -> Option<String> {
+        let handle = queued.attachment_prepare.take()?;
+        match handle.await {
+            Ok((msg, response)) => {
+                queued.msg = msg;
+                response
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "attachment preparation task failed");
+                Some("收到附件，但当前无法读取该附件内容。请重新发送可下载的图片或文件。".into())
             }
         }
     }
@@ -4122,6 +4268,146 @@ fn strip_think_blocks(text: &str) -> String {
         }
     }
     result
+}
+
+async fn image_attachment_guard_message(
+    msg: &InboundMessage,
+    ctx: &CommandContext<'_>,
+) -> Option<String> {
+    let has_image = msg
+        .attachments
+        .iter()
+        .any(|attachment| attachment.kind == crate::platforms::AttachmentKind::Image);
+    if !has_image {
+        return None;
+    }
+
+    let resolved_model = commands::current_resolved_model_id_for_context(ctx)
+        .await
+        .ok()
+        .flatten();
+    image_attachment_guard_response(resolved_model.as_deref(), &ctx.config.vision_models)
+}
+
+fn image_attachment_guard_response(
+    resolved_model: Option<&str>,
+    vision_models: &[String],
+) -> Option<String> {
+    match crate::model_vision::vision_capability_with_supported_models(
+        resolved_model,
+        vision_models,
+    ) {
+        crate::model_vision::VisionCapability::Supported => None,
+        crate::model_vision::VisionCapability::Unsupported => {
+            let model = resolved_model.unwrap_or("当前模型");
+            Some(format!(
+                "当前模型 `{model}` 不支持图片识别。请切换到支持视觉能力的模型后再发送图片。"
+            ))
+        }
+        crate::model_vision::VisionCapability::Unknown => {
+            let model = resolved_model.unwrap_or("当前模型");
+            Some(format!(
+                "无法确认 `{model}` 支持图片识别。请先用 `/model refresh` 刷新模型信息，或切换到明确支持视觉能力的模型后再发送图片。"
+            ))
+        }
+    }
+}
+
+async fn prepare_inbound_attachments(msg: &mut InboundMessage) -> Option<String> {
+    if msg.attachments.is_empty() {
+        return None;
+    }
+
+    let result = match msg.platform {
+        "wecom" => {
+            crate::platforms::wecom::prepare_inbound_attachments(&mut msg.attachments, &msg.msg_id)
+                .await
+        }
+        _ => crate::platforms::wecom::AttachmentPrepareResult {
+            dropped: 0,
+            failures: Vec::new(),
+        },
+    };
+    if result.dropped == 0 {
+        return None;
+    }
+
+    let detail = attachment_prepare_failure_detail(&result.failures);
+    if msg.attachments.is_empty() {
+        Some(format!(
+            "收到附件，但当前无法读取该附件内容。{detail}请重新发送可下载的图片或文件。"
+        ))
+    } else {
+        Some(format!(
+            "收到 {} 个附件，但无法读取其中部分内容。{detail}请重新发送可下载的图片或文件。",
+            result.dropped
+        ))
+    }
+}
+
+fn attachment_prepare_failure_detail(failures: &[String]) -> String {
+    if failures.is_empty() {
+        return String::new();
+    }
+    let mut unique = Vec::new();
+    for failure in failures {
+        if !unique.contains(failure) {
+            unique.push(failure.clone());
+        }
+        if unique.len() >= 3 {
+            break;
+        }
+    }
+    format!("原因：{}。", unique.join("；"))
+}
+
+fn message_text_for_cli(msg: &InboundMessage) -> String {
+    if msg.attachments.is_empty() {
+        return msg.text.clone();
+    }
+
+    let mut text = if msg.text.trim().is_empty() {
+        "The user sent attachment(s).".to_string()
+    } else {
+        msg.text.clone()
+    };
+    text.push_str("\n\nAttachments:");
+    for (idx, attachment) in msg.attachments.iter().enumerate() {
+        text.push_str(&format!(
+            "\n{}. type: {}",
+            idx + 1,
+            attachment_kind_label(attachment.kind)
+        ));
+        if let Some(name) = attachment.name.as_deref() {
+            text.push_str(&format!(", name: {name}"));
+        }
+        let has_local_path = attachment.local_path.is_some();
+        if let Some(path) = attachment.local_path.as_deref() {
+            text.push_str(&format!(", local_path: {path}"));
+        } else if let Some(url) = attachment.url.as_deref() {
+            text.push_str(&format!(", url: {url}"));
+        }
+        if !has_local_path && let Some(media_id) = attachment.media_id.as_deref() {
+            text.push_str(&format!(", media_id: {media_id}"));
+        }
+        if let Some(mime) = attachment.mime_type.as_deref() {
+            text.push_str(&format!(", mime_type: {mime}"));
+        }
+        if let Some(size) = attachment.size_bytes {
+            text.push_str(&format!(", size_bytes: {size}"));
+        }
+    }
+    text
+}
+
+fn attachment_kind_label(kind: crate::platforms::AttachmentKind) -> &'static str {
+    match kind {
+        crate::platforms::AttachmentKind::Image => "image",
+        crate::platforms::AttachmentKind::File => "file",
+        crate::platforms::AttachmentKind::Video => "video",
+        crate::platforms::AttachmentKind::Audio => "audio",
+        crate::platforms::AttachmentKind::Unknown => "unknown",
+    }
 }
 
 /// Derive a short request tag like `#A7` from the first two hex digits of a
@@ -5350,6 +5636,190 @@ async fn handle_fast_slash_command_returns_ok() {
     assert!(result.is_ok());
     let result = adapter.send_typing("chat").await;
     assert!(result.is_ok());
+}
+
+#[test]
+fn image_attachment_guard_rejects_unknown_model() {
+    let text = image_attachment_guard_response(Some("haiku"), &[]).unwrap();
+    assert!(text.contains("无法确认"));
+    assert!(text.contains("haiku"));
+}
+
+#[test]
+fn image_attachment_guard_allows_known_vision_model() {
+    assert!(image_attachment_guard_response(Some("qwen2.5-vl"), &[]).is_none());
+}
+
+#[test]
+fn image_attachment_guard_uses_configured_vision_rules() {
+    let vision_models = vec!["haiku".into()];
+    assert!(image_attachment_guard_response(Some("haiku"), &vision_models).is_none());
+}
+
+#[tokio::test]
+async fn wecom_media_id_only_attachment_is_rejected_before_cli() {
+    let mut msg = InboundMessage {
+        platform: "wecom",
+        chat_id: "chat".into(),
+        user_id: "user".into(),
+        text: String::new(),
+        attachments: vec![crate::platforms::InboundAttachment {
+            kind: crate::platforms::AttachmentKind::Image,
+            name: Some("image".into()),
+            media_id: Some("media-only".into()),
+            url: None,
+            local_path: None,
+            mime_type: Some("image/png".into()),
+            size_bytes: None,
+            raw: serde_json::json!({"media_id": "media-only"}),
+        }],
+        msg_id: "msg-media-only".into(),
+        chat_type: crate::platforms::ChatType::DirectMessage,
+        reply_token: None,
+        route_override: None,
+        feedback: None,
+    };
+
+    let text = prepare_inbound_attachments(&mut msg).await.unwrap();
+    assert!(text.contains("无法读取"));
+    assert!(text.contains("缺少可下载链接"));
+    assert!(msg.attachments.is_empty());
+}
+
+#[tokio::test]
+async fn wecom_url_attachment_is_downloaded_before_cli_text() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut buf = [0_u8; 1024];
+        let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
+        let body = b"\x89PNG\r\n\x1a\n";
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        );
+        tokio::io::AsyncWriteExt::write_all(&mut stream, response.as_bytes())
+            .await
+            .unwrap();
+        tokio::io::AsyncWriteExt::write_all(&mut stream, body)
+            .await
+            .unwrap();
+    });
+
+    let mut msg = InboundMessage {
+        platform: "wecom",
+        chat_id: "chat".into(),
+        user_id: "user".into(),
+        text: "看图".into(),
+        attachments: vec![crate::platforms::InboundAttachment {
+            kind: crate::platforms::AttachmentKind::Image,
+            name: Some("shot".into()),
+            media_id: Some("media-with-url".into()),
+            url: Some(format!("http://{addr}/shot.png")),
+            local_path: None,
+            mime_type: Some("image/png".into()),
+            size_bytes: None,
+            raw: serde_json::json!({}),
+        }],
+        msg_id: format!("msg-download-{}", uuid::Uuid::new_v4()),
+        chat_type: crate::platforms::ChatType::DirectMessage,
+        reply_token: None,
+        route_override: None,
+        feedback: None,
+    };
+
+    assert!(prepare_inbound_attachments(&mut msg).await.is_none());
+    server.await.unwrap();
+    let cli_text = message_text_for_cli(&msg);
+    assert!(cli_text.contains("local_path:"));
+    assert!(!cli_text.contains("url: http://"));
+    assert!(!cli_text.contains("media_id:"));
+}
+
+#[tokio::test]
+async fn prepared_wecom_attachment_is_not_downloaded_again() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let hit_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let server_hits = hit_count.clone();
+    let server = tokio::spawn(async move {
+        if let Ok(accept) =
+            tokio::time::timeout(std::time::Duration::from_millis(150), listener.accept()).await
+        {
+            let (mut stream, _) = accept.unwrap();
+            server_hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let _ = tokio::io::AsyncWriteExt::write_all(
+                &mut stream,
+                b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n",
+            )
+            .await;
+        }
+    });
+
+    let local_file = tempfile::NamedTempFile::new().unwrap();
+    let mut msg = InboundMessage {
+        platform: "wecom",
+        chat_id: "chat".into(),
+        user_id: "user".into(),
+        text: "看图".into(),
+        attachments: vec![crate::platforms::InboundAttachment {
+            kind: crate::platforms::AttachmentKind::Image,
+            name: Some("shot.png".into()),
+            media_id: Some("media-with-url".into()),
+            url: Some(format!("http://{addr}/shot.png")),
+            local_path: Some(local_file.path().to_string_lossy().to_string()),
+            mime_type: Some("image/png".into()),
+            size_bytes: Some(8),
+            raw: serde_json::json!({}),
+        }],
+        msg_id: format!("msg-prepared-{}", uuid::Uuid::new_v4()),
+        chat_type: crate::platforms::ChatType::DirectMessage,
+        reply_token: None,
+        route_override: None,
+        feedback: None,
+    };
+
+    assert!(prepare_inbound_attachments(&mut msg).await.is_none());
+    server.await.unwrap();
+    assert_eq!(hit_count.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
+#[test]
+fn attachment_cleanup_removes_local_files_and_empty_parent() {
+    let dir = tempfile::tempdir().unwrap();
+    let attachment_dir = dir.path().join("msg-1");
+    std::fs::create_dir(&attachment_dir).unwrap();
+    let path = attachment_dir.join("1-shot.png");
+    std::fs::write(&path, b"image").unwrap();
+    let msg = InboundMessage {
+        platform: "wecom",
+        chat_id: "chat".into(),
+        user_id: "user".into(),
+        text: String::new(),
+        attachments: vec![crate::platforms::InboundAttachment {
+            kind: crate::platforms::AttachmentKind::Image,
+            name: Some("shot.png".into()),
+            media_id: None,
+            url: None,
+            local_path: Some(path.to_string_lossy().to_string()),
+            mime_type: Some("image/png".into()),
+            size_bytes: Some(5),
+            raw: serde_json::json!({}),
+        }],
+        msg_id: "msg-1".into(),
+        chat_type: crate::platforms::ChatType::DirectMessage,
+        reply_token: None,
+        route_override: None,
+        feedback: None,
+    };
+
+    {
+        let _cleanup = AttachmentCleanup::new(&msg);
+    }
+
+    assert!(!path.exists());
+    assert!(!attachment_dir.exists());
 }
 
 #[tokio::test]

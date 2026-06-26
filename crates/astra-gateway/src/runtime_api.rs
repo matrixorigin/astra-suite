@@ -139,6 +139,7 @@ async fn handle_connection(
                 chat_id: req.chat_id,
                 user_id: req.user_id,
                 text: req.text,
+                attachments: Vec::new(),
                 msg_id: format!("inject-{}", uuid::Uuid::new_v4()),
                 chat_type: if req.group.unwrap_or(false) {
                     ChatType::Group

@@ -48,6 +48,9 @@ pub struct GatewayConfig {
     /// `system_prompt_extra`, or from `system_prompt_extra.md` beside the
     /// gateway config when the config field is absent.
     pub system_prompt_extra: Option<String>,
+    /// Extra model id patterns that should be treated as vision-capable.
+    /// Matched before the built-in table.
+    pub vision_models: Vec<String>,
     /// WeCom user id -> GitHub token mapping. `remark` is for operators only;
     /// `token` is injected into CLI process env as GH_TOKEN/GITHUB_TOKEN.
     pub github_tokens: std::collections::BTreeMap<String, GitHubTokenConfig>,
@@ -99,6 +102,8 @@ struct RawGatewayConfig {
     working_dir: Option<String>,
     #[serde(default)]
     system_prompt_extra: Option<String>,
+    #[serde(default)]
+    vision_models: Vec<String>,
     #[serde(default)]
     github_tokens: std::collections::BTreeMap<String, GitHubTokenConfig>,
     #[serde(default)]
@@ -385,6 +390,12 @@ impl TryFrom<RawGatewayConfig> for GatewayConfig {
             project_dirs: raw.project_dirs,
             working_dir: raw.working_dir,
             system_prompt_extra: raw.system_prompt_extra,
+            vision_models: raw
+                .vision_models
+                .into_iter()
+                .map(|model| model.trim().to_string())
+                .filter(|model| !model.is_empty())
+                .collect(),
             github_tokens: raw
                 .github_tokens
                 .into_iter()
@@ -790,6 +801,17 @@ github_tokens:
         );
         assert!(!cfg.github_tokens.contains_key(""));
         assert!(!cfg.github_tokens.contains_key("wecom-empty"));
+    }
+
+    #[test]
+    fn load_vision_models_from_config() {
+        let yaml = r#"
+vision_models:
+  - qwen3.7
+  - ""
+"#;
+        let cfg: GatewayConfig = serde_yaml_ng::from_str(yaml).unwrap();
+        assert_eq!(cfg.vision_models, vec!["qwen3.7"]);
     }
 
     #[test]
