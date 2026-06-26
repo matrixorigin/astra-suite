@@ -639,14 +639,19 @@ async fn main() {
     // Load .env file if present (before logging init so RUST_LOG works)
     let _ = dotenvy::dotenv();
 
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info,astra_gateway=debug".parse().unwrap()),
-        )
-        .init();
-
     let cli = Cli::parse();
+    let is_mcp_stdio = matches!(&cli.command, Some(Command::McpServe { .. }));
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| "info,astra_gateway=debug".parse().unwrap());
+
+    if is_mcp_stdio {
+        tracing_subscriber::fmt()
+            .with_env_filter(env_filter)
+            .with_writer(std::io::stderr)
+            .init();
+    } else {
+        tracing_subscriber::fmt().with_env_filter(env_filter).init();
+    }
 
     if let Some(Command::McpServe {
         database_url,
