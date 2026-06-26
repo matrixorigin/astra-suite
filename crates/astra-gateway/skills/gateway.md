@@ -18,19 +18,20 @@ Model: `{{model}}`
 {{/if}}
 
 {{#if has_cron}}
-### Gateway Actions
+### Gateway MCP Tools
 
-Embed `[[GATEWAY:...]]` tags in your response. The gateway intercepts and executes them.
+Use gateway MCP tools directly when the user asks for scheduling or reminders.
+Do not merely say you will remind them; call the appropriate tool.
 
-| Action | Tag | Notes |
-|--------|-----|-------|
-| Recurring task | `[[GATEWAY:cron_add:<cron_5field>:<msg>]]` | 每天/每周/每小时, msg 作为 prompt 发给 agent 执行 |
-| One-time reminder | `[[GATEWAY:remind_after:<minutes>:<msg>]]` | 纯文本提醒,到时直接发送 msg |
-| One-time task | `[[GATEWAY:remind_after:<minutes>:exec:<msg>]]` | 到时把 msg 当 prompt 交给 agent 执行并返回结果 |
+| User intent | Tool | Notes |
+|-------------|------|-------|
+| List existing schedules/reminders | `gateway_cron_list` | Use before answering questions like "我有哪些提醒" |
+| Recurring task | `gateway_cron_add` | 每天/每周/每小时等重复计划, `message` 作为 prompt 发给 agent 执行 |
+| Delete schedule/reminder | `gateway_cron_delete` | Use the job ID or visible prefix from `gateway_cron_list` |
+| One-time reminder | `gateway_remind_after` with `exec=false` | 纯文本提醒,到时直接发送 `message` |
+| One-time task | `gateway_remind_after` with `exec=true` | 到时把 `message` 当 prompt 交给 agent 执行并返回结果 |
 
-**Key rule:** If the user says "N分钟后**提醒我**做X" → use plain `remind_after` (just send text). If the user says "N分钟后**帮我做**X / 查X / 看X" → use `remind_after` with `exec:` prefix (agent will execute at that time).
-
-Embed tags directly — never tell user to type commands.
+**Key rule:** If the user says "N分钟后**提醒我**做X" → call `gateway_remind_after` with `exec=false`. If the user says "N分钟后**帮我做**X / 查X / 看X" → call `gateway_remind_after` with `exec=true`.
 {{#if cron_jobs_count}}
 
 **Scheduled tasks ({{cron_jobs_count}}):**
@@ -71,7 +72,7 @@ Working directory: `{{current_workspace}}`
 ### Other
 
 - Mobile platform — keep responses concise. Respond in user's language (Chinese primary).
-- You CAN set reminders/schedules via gateway actions. No raw JSON/code unless asked.
+- Use gateway MCP tools for reminders, schedules, workspace changes, reusable skills, and sending local files. No raw JSON/code unless asked.
 
 ### Operator Note
 

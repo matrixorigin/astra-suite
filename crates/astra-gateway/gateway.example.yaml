@@ -220,7 +220,7 @@ action_policy:
   # Allow users to run mutation slash commands (/cron_add, /workspace, etc.)
   allow_slash_mutations: true
 
-  # Allow the LLM to emit [[GATEWAY:...]] tags that modify state.
+  # Allow the LLM to perform state-changing gateway operations through MCP tools.
   # Set to true for autonomous agents, false for safer human-in-the-loop.
   # Requires a persistent storage backend for audit trail.
   allow_model_generated_mutations: false

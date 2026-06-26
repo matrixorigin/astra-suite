@@ -99,8 +99,8 @@ Users switch at runtime with `/cli claude`, `/cli codex`, `/cli copilot`, etc.
 | `/cron list\|add\|del`         | Scheduled tasks |
 | `/usage`                       | Token / cost statistics |
 
-Natural language also works — the agent can emit gateway action tags to
-schedule cron jobs or set reminders on your behalf.
+Natural language also works — when MCP is enabled, the agent can call gateway
+tools to schedule cron jobs or set reminders on your behalf.
 
 ## Configuration
 

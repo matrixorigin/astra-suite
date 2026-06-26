@@ -105,7 +105,7 @@ impl GatewayMcpServer {
 
     #[tool(
         name = "gateway_cron_list",
-        description = "List all scheduled tasks (cron jobs and one-time reminders) for the current conversation"
+        description = "List scheduled tasks and one-time reminders for the current conversation. Use this when the user asks what reminders, schedules, cron jobs, or timed tasks are active."
     )]
     async fn cron_list(&self) -> Json<TextResult> {
         let result = tools_cron::cron_list(Some(&*self.store), &self.platform, &self.chat_id).await;
@@ -114,7 +114,7 @@ impl GatewayMcpServer {
 
     #[tool(
         name = "gateway_cron_add",
-        description = "Create a recurring scheduled task. cron_expr is a standard 5-field cron expression (minute hour day month weekday). message is the prompt to execute on each trigger."
+        description = "Create a recurring scheduled task. Use this when the user asks for repeated reminders or repeated work, such as daily, weekly, every weekday, every hour, or at a regular time. cron_expr is a standard 5-field cron expression (minute hour day month weekday). message is the prompt to execute on each trigger."
     )]
     async fn cron_add(&self, Parameters(params): Parameters<CronAddParams>) -> Json<TextResult> {
         let result = tools_cron::cron_add(
@@ -131,7 +131,7 @@ impl GatewayMcpServer {
 
     #[tool(
         name = "gateway_cron_delete",
-        description = "Delete a scheduled task by job ID (prefix match supported)"
+        description = "Delete a scheduled task or reminder by job ID. Prefix match is supported. Use gateway_cron_list first if the user identifies the task by description rather than ID."
     )]
     async fn cron_delete(
         &self,
@@ -149,7 +149,7 @@ impl GatewayMcpServer {
 
     #[tool(
         name = "gateway_remind_after",
-        description = "Set a one-time reminder or task. minutes: delay in minutes (1-10080). message: content. exec: if true, the message is executed as a prompt by an agent at trigger time; if false, it's sent as plain text reminder."
+        description = "Set a one-time reminder or one-time delayed task. Use this when the user asks for a relative-time reminder, such as in 10 minutes, after half an hour, tomorrow, or later today. minutes: delay in minutes (1-10080). message: content. exec=false sends plain reminder text; exec=true runs the message as an agent prompt at trigger time."
     )]
     async fn remind_after(
         &self,
