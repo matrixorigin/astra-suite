@@ -2660,7 +2660,15 @@ pub(crate) fn resolve_model_input(input: &str, entries: &[ModelEntry]) -> Resolv
         }
     }
 
+    if is_explicit_model_id(trimmed) {
+        return ResolvedModel::Id(trimmed.to_string());
+    }
+
     ResolvedModel::Unrecognized
+}
+
+fn is_explicit_model_id(input: &str) -> bool {
+    !input.chars().any(char::is_whitespace) && input.contains('.')
 }
 
 fn strip_whitespace(s: &str) -> String {
@@ -3041,6 +3049,10 @@ mod tests {
             id(resolve_model_input("deepseek-v4-pro", &e)),
             "deepseek-v4-pro"
         );
+        assert_eq!(
+            id(resolve_model_input("vendor.model-v1", &e)),
+            "vendor.model-v1"
+        );
         assert!(matches!(
             resolve_model_input("xyz-model", &e),
             ResolvedModel::Unrecognized
@@ -3058,7 +3070,7 @@ mod tests {
             ResolvedModel::Unrecognized
         ));
         assert!(matches!(
-            resolve_model_input("us.anthropic.claude-opus-9-9", &e),
+            resolve_model_input("claude-opus-9-9", &e),
             ResolvedModel::Unrecognized
         ));
     }

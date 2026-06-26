@@ -975,7 +975,7 @@ async fn handle_fast_upserts_user_for_first_time_slash_command() {
     );
 
     // Very first message — straight to a mutation slash command.
-    let m = msg("chat-nc", "newcomer", "/model opus");
+    let m = msg("chat-nc", "newcomer", "/model us.anthropic.claude-opus-4-7");
     let result = gw.runner.handle_fast(&m).await;
     assert!(result.is_ok());
     let response = result.unwrap().expect("slash command must respond");
@@ -1011,7 +1011,11 @@ async fn per_user_model_override_isolated() {
     let gw = TestGateway::new().await;
 
     // User A sets model
-    let m = msg("chat-model-a", "alice", "/model opus");
+    let m = msg(
+        "chat-model-a",
+        "alice",
+        "/model us.anthropic.claude-opus-4-7",
+    );
     let result = gw.runner.handle_fast(&m).await;
     assert!(result.is_ok());
     let text = result.unwrap();
@@ -1046,8 +1050,12 @@ async fn same_user_model_override_is_scoped_by_chat() {
     let store = gw.runner.store().unwrap();
     let cli_name = gw.runner.cli_profile().name();
 
-    let first = msg("chat-one", "alice", "/model opus");
-    let second = msg("chat-two", "alice", "/model haiku");
+    let first = msg("chat-one", "alice", "/model us.anthropic.claude-opus-4-7");
+    let second = msg(
+        "chat-two",
+        "alice",
+        "/model us.anthropic.claude-haiku-4-5-20251001-v1:0",
+    );
     assert!(gw.runner.handle_fast(&first).await.unwrap().is_some());
     assert!(gw.runner.handle_fast(&second).await.unwrap().is_some());
 
@@ -1210,7 +1218,11 @@ async fn slash_model_switch_persists() {
     gw.runner.handle_message(&m0, &adapter).await;
 
     // Switch model
-    let m = msg("chat-model", "user-1", "/model opus");
+    let m = msg(
+        "chat-model",
+        "user-1",
+        "/model us.anthropic.claude-opus-4-7",
+    );
     let result = gw.runner.handle_fast(&m).await;
     assert!(result.is_ok());
     let text = result.unwrap();
@@ -1219,7 +1231,7 @@ async fn slash_model_switch_persists() {
     let t = text.unwrap();
     // It either confirms the switch or shows current model
     assert!(
-        t.contains("opus") || t.contains("模型") || t.contains("model"),
+        t.contains("us.anthropic.claude-opus-4-7") || t.contains("模型") || t.contains("model"),
         "model response should reference the model: {t}"
     );
 }
