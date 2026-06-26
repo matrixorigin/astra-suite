@@ -802,7 +802,7 @@ impl GatewayRunner {
         };
 
         // Resolve active CLI profile
-        let (cli_profile, _provider_config) = self
+        let (cli_profile, provider_config) = self
             .resolve_cli_profile(msg.platform, &msg.user_id, &effective_chat_id)
             .await;
         let entries = crate::commands::all_model_entries(&self.config, cli_profile.name());
@@ -847,6 +847,7 @@ impl GatewayRunner {
                     user_id: &msg.user_id,
                     resolved_cli: &cli_profile,
                     resolved_provider: provider_name.as_deref(),
+                    resolved_provider_config: provider_config.as_ref(),
                     trace_repo: self
                         .trace_repo
                         .as_ref()
@@ -893,6 +894,7 @@ impl GatewayRunner {
             user_id: &msg.user_id,
             resolved_cli: &cli_profile,
             resolved_provider: provider_name.as_deref(),
+            resolved_provider_config: provider_config.as_ref(),
             trace_repo: self
                 .trace_repo
                 .as_ref()

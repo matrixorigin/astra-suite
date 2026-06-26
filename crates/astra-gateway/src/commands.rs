@@ -9,8 +9,27 @@ use crate::trace_model::{
     ActiveRequestSummary, CancelRequestOutcome, ConversationKey, GatewayEvent, GatewayEventKind,
     OutboxStatus, RequestStatus, TraceId, TraceRepository,
 };
-use std::{sync::Arc, time::Duration};
+use serde_json::Value;
+use std::{
+    collections::HashMap,
+    sync::{Arc, LazyLock},
+    time::{Duration, Instant},
+};
 use tokio::sync::Mutex;
+
+static MODEL_ENTRY_CACHE: LazyLock<Mutex<HashMap<String, ModelEntryCacheValue>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+#[derive(Clone)]
+struct ModelEntryCacheValue {
+    entries: Vec<ModelEntry>,
+    created_at: Instant,
+}
+
+struct ModelEntriesResult {
+    entries: Vec<ModelEntry>,
+    cache_age: Option<Duration>,
+}
 
 pub struct CommandContext<'a> {
     pub astra: &'a astra::Client,
@@ -22,6 +41,10 @@ pub struct CommandContext<'a> {
     pub resolved_cli: &'a crate::cli_bridge::CliProfile,
     /// Resolved provider name for the active model (e.g. "bedrock", "dashscope").
     pub resolved_provider: Option<&'a str>,
+    /// Provider environment resolved for the active CLI run. Model discovery
+    /// uses this same environment so `/model` reflects how the CLI is actually
+    /// launched by gateway.
+    pub resolved_provider_config: Option<&'a crate::config::ProviderConfig>,
     pub trace_repo: Option<&'a dyn TraceRepository>,
     pub project_dirs: &'a [String],
     pub cli_availability: &'a [(String, crate::cli_bridge::CliAvailability)],
@@ -408,16 +431,33 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
             // user has no per-user override, resolve_cli_profile returns this
             // untouched, so current_model == config_default_model.
             let config_default_model = ctx.config.cli.model_name();
-            let entries = match model_entries_for_context(ctx, arg).await {
-                Ok(entries) => entries,
+            let refresh = arg.eq_ignore_ascii_case("refresh");
+            let model_list = match model_entries_for_context(ctx, arg, refresh).await {
+                Ok(model_list) => model_list,
                 Err(e) => return Some(format!("⚠️ 获取模型列表失败: {e}")),
             };
+            let entries = model_list.entries;
 
-            if arg.is_empty() {
+            if arg.is_empty() || refresh {
                 let current_display = current_model
                     .map(|m| display_model_name(m, &entries))
                     .unwrap_or_else(|| "默认".to_string());
-                let mut lines = vec![format!("🤖 当前: **{current_display}**"), String::new()];
+                let mut lines = if refresh {
+                    vec![
+                        format!("🤖 当前: **{current_display}**"),
+                        "缓存 已刷新 · `/model refresh`".to_string(),
+                        String::new(),
+                    ]
+                } else {
+                    vec![
+                        format!("🤖 当前: **{current_display}**"),
+                        format!(
+                            "缓存 {} · `/model refresh`",
+                            format_cache_age(model_list.cache_age)
+                        ),
+                        String::new(),
+                    ]
+                };
                 for (i, entry) in entries.iter().enumerate() {
                     let mark = if entry.matches_current(current_model) {
                         " ✓"
@@ -449,16 +489,6 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
                 }
                 lines.push(String::new());
                 lines.push("切换: `/model <编号|名称|完整id>`".into());
-                lines.push("例: `/model 2`  `/model opus`  `/model gpt-5.5`".into());
-                if let Some(example_id) = entries.iter().find_map(|e| {
-                    if e.label == "Opus 4.7" {
-                        e.full_id.as_deref()
-                    } else {
-                        None
-                    }
-                }) {
-                    lines.push(format!("    `/model {example_id}`"));
-                }
                 return Some(lines.join("\n"));
             }
 
@@ -709,7 +739,7 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
              `/session switch <id>` — 切换会话\n\n\
              **模型**\n\
              `/model` — 当前模型 + 快捷列表\n\
-             `/model <name>` — 切换 (默认/Sonnet/Haiku/Opus/Opus 4.7/Opus 4.6)\n\n\
+             `/model <name>` — 切换模型 (默认/编号/名称/完整 id)\n\n\
              **CLI & 工作区**\n\
              `/cli` — 查看当前 CLI + 能力 + 工作目录\n\
              `/cli <name>` — 切换 CLI (astra/claude)\n\
@@ -2029,6 +2059,7 @@ fn format_duration(ms: u64) -> String {
 }
 
 /// An entry in the `/model` selection list.
+#[derive(Clone)]
 pub(crate) struct ModelEntry {
     label: String,
     desc: String,
@@ -2170,22 +2201,185 @@ fn model_entries() -> Vec<ModelEntry> {
             provider: Some("openai-codex".into()),
             aliases: vec!["gpt54".into()],
         },
+        ModelEntry {
+            label: "GPT-5.4-Mini".into(),
+            desc: "OpenAI small/fast coding".into(),
+            full_id: Some("gpt-5.4-mini".into()),
+            provider: Some("openai-codex".into()),
+            aliases: vec!["gpt54mini".into()],
+        },
+        ModelEntry {
+            label: "GPT-5.3-Codex-Spark".into(),
+            desc: "OpenAI ultra-fast coding".into(),
+            full_id: Some("gpt-5.3-codex-spark".into()),
+            provider: Some("openai-codex".into()),
+            aliases: vec!["spark".into(), "gpt53codexspark".into()],
+        },
     ]
 }
 
 async fn model_entries_for_context(
     ctx: &CommandContext<'_>,
     arg: &str,
-) -> Result<Vec<ModelEntry>, String> {
-    if matches!(
-        ctx.resolved_cli,
-        crate::cli_bridge::CliProfile::Astra { .. }
-    ) && arg.trim() != "默认"
-        && !arg.trim().eq_ignore_ascii_case("default")
-    {
-        astra_model_entries(ctx.resolved_cli).await
-    } else {
-        Ok(all_model_entries(ctx.config, ctx.resolved_cli.name()))
+    force_refresh: bool,
+) -> Result<ModelEntriesResult, String> {
+    let trimmed = arg.trim();
+    if trimmed == "默认" || trimmed.eq_ignore_ascii_case("default") {
+        return Ok(ModelEntriesResult {
+            entries: vec![default_model_entry()],
+            cache_age: None,
+        });
+    }
+
+    let Some(cache_key) = model_entries_cache_key(ctx) else {
+        return Ok(ModelEntriesResult {
+            entries: model_entries_uncached(ctx).await?,
+            cache_age: None,
+        });
+    };
+    if force_refresh {
+        MODEL_ENTRY_CACHE.lock().await.remove(&cache_key);
+    } else if let Some(cached) = MODEL_ENTRY_CACHE.lock().await.get(&cache_key).cloned() {
+        let age = cached.created_at.elapsed();
+        tracing::debug!(
+            cli = ctx.resolved_cli.name(),
+            age_ms = age.as_millis(),
+            "using cached model entries"
+        );
+        return Ok(ModelEntriesResult {
+            entries: cached.entries,
+            cache_age: Some(age),
+        });
+    }
+
+    let entries = model_entries_uncached(ctx).await?;
+    MODEL_ENTRY_CACHE.lock().await.insert(
+        cache_key,
+        ModelEntryCacheValue {
+            entries: entries.clone(),
+            created_at: Instant::now(),
+        },
+    );
+    Ok(ModelEntriesResult {
+        entries,
+        cache_age: None,
+    })
+}
+
+async fn model_entries_uncached(ctx: &CommandContext<'_>) -> Result<Vec<ModelEntry>, String> {
+    match ctx.resolved_cli {
+        crate::cli_bridge::CliProfile::Astra { .. } => astra_model_entries(ctx.resolved_cli).await,
+        crate::cli_bridge::CliProfile::Claude { .. } => claude_model_entries(ctx).await,
+        crate::cli_bridge::CliProfile::Codex { .. } => codex_model_entries(ctx.resolved_cli).await,
+        _ => Ok(all_model_entries(ctx.config, ctx.resolved_cli.name())),
+    }
+}
+
+fn model_entries_cache_key(ctx: &CommandContext<'_>) -> Option<String> {
+    match ctx.resolved_cli {
+        crate::cli_bridge::CliProfile::Claude { .. } => {
+            let base = base_profile_for_model_probe(ctx);
+            Some(format!(
+                "claude:{}:{}",
+                cli_profile_model_cache_key(&base),
+                provider_model_cache_key(ctx.resolved_provider_config)
+            ))
+        }
+        crate::cli_bridge::CliProfile::Codex { .. } => Some(format!(
+            "codex:{}",
+            cli_profile_model_cache_key(ctx.resolved_cli)
+        )),
+        crate::cli_bridge::CliProfile::Astra { .. } => Some(format!(
+            "astra:{}",
+            cli_profile_model_cache_key(ctx.resolved_cli)
+        )),
+        _ => None,
+    }
+}
+
+fn cli_profile_model_cache_key(profile: &crate::cli_bridge::CliProfile) -> String {
+    match profile {
+        crate::cli_bridge::CliProfile::Astra {
+            bin,
+            model,
+            permission_mode,
+            app_server_url,
+        } => format!(
+            "bin={bin};model={model:?};permission={permission_mode};app_server={app_server_url:?}"
+        ),
+        crate::cli_bridge::CliProfile::Claude {
+            bin,
+            model,
+            stream_json,
+            extra_args,
+            env,
+            env_file,
+        } => format!(
+            "bin={bin};model={model:?};stream={stream_json};extra={extra_args:?};env_file={env_file:?};env={}",
+            env_cache_key(env)
+        ),
+        crate::cli_bridge::CliProfile::Codex {
+            bin,
+            model,
+            sandbox,
+            stream_json,
+            extra_args,
+            skip_git_repo_check,
+            ephemeral,
+        } => format!(
+            "bin={bin};model={model:?};sandbox={sandbox};stream={stream_json};extra={extra_args:?};skip_git={skip_git_repo_check};ephemeral={ephemeral}"
+        ),
+        crate::cli_bridge::CliProfile::Copilot {
+            bin,
+            model,
+            env,
+            env_file,
+            launcher,
+            stream_json,
+            allow_all_tools,
+            extra_args,
+        } => format!(
+            "bin={bin};model={model:?};stream={stream_json};allow_all={allow_all_tools};extra={extra_args:?};env_file={env_file:?};launcher={launcher:?};env={}",
+            env_cache_key(env)
+        ),
+        crate::cli_bridge::CliProfile::Custom {
+            bin,
+            args_template,
+            json_output,
+            session_id_field,
+            text_field,
+        } => format!(
+            "bin={bin};args={args_template:?};json={json_output};session={session_id_field:?};text={text_field:?}"
+        ),
+    }
+}
+
+fn provider_model_cache_key(pc: Option<&crate::config::ProviderConfig>) -> String {
+    match pc {
+        Some(pc) => format!(
+            "enabled={};env_file={:?};env={}",
+            pc.enabled,
+            pc.env_file,
+            env_cache_key(&pc.env)
+        ),
+        None => "none".into(),
+    }
+}
+
+fn env_cache_key(env: &std::collections::BTreeMap<String, String>) -> String {
+    env.iter()
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect::<Vec<_>>()
+        .join(";")
+}
+
+fn default_model_entry() -> ModelEntry {
+    ModelEntry {
+        label: "默认".into(),
+        desc: "跟随配置".into(),
+        full_id: None,
+        provider: None,
+        aliases: vec![],
     }
 }
 
@@ -2231,13 +2425,7 @@ async fn astra_model_entries(
     let items: Vec<AstraModelListItem> = serde_json::from_slice(&output.stdout)
         .map_err(|e| format!("解析 `{bin} model list` 输出: {e}"))?;
 
-    let mut entries = vec![ModelEntry {
-        label: "默认".into(),
-        desc: "跟随配置".into(),
-        full_id: None,
-        provider: None,
-        aliases: vec![],
-    }];
+    let mut entries = vec![default_model_entry()];
     for item in items.into_iter().filter(|m| m.is_active) {
         let provider = item.provider.unwrap_or_else(|| "unknown".into());
         let mut desc = provider;
@@ -2262,6 +2450,259 @@ async fn astra_model_entries(
         return Err("Astra 返回的 active 模型列表为空".into());
     }
     Ok(entries)
+}
+
+async fn claude_model_entries(ctx: &CommandContext<'_>) -> Result<Vec<ModelEntry>, String> {
+    let base = base_profile_for_model_probe(ctx);
+    let mut entries = vec![default_model_entry()];
+    if let Some(model) = probe_claude_model(&base, None, ctx.resolved_provider_config).await? {
+        entries[0].desc = format!("当前默认 → {model}");
+    }
+
+    let candidates = [
+        ("opus", "Claude alias: opus", vec!["opus"]),
+        (
+            "opus[1m]",
+            "Claude alias: opus[1m]",
+            vec!["opus1m", "opus 1m"],
+        ),
+        ("sonnet", "Claude alias: sonnet", vec!["sonnet"]),
+        (
+            "sonnet[1m]",
+            "Claude alias: sonnet[1m]",
+            vec!["sonnet1m", "sonnet 1m"],
+        ),
+        ("haiku", "Claude alias: haiku", vec!["haiku"]),
+    ];
+
+    for (candidate, desc, aliases) in candidates {
+        if let Some(model) =
+            probe_claude_model(&base, Some(candidate), ctx.resolved_provider_config).await?
+        {
+            push_unique_model_entry(
+                &mut entries,
+                ModelEntry {
+                    label: model.clone(),
+                    desc: desc.into(),
+                    full_id: Some(model),
+                    provider: ctx.resolved_provider.map(str::to_string),
+                    aliases: aliases.into_iter().map(str::to_string).collect(),
+                },
+            );
+        }
+    }
+
+    for model in claude_custom_env_models(&base, ctx.resolved_provider_config) {
+        push_unique_model_entry(
+            &mut entries,
+            ModelEntry {
+                label: model.clone(),
+                desc: "Claude custom model".into(),
+                full_id: Some(model),
+                provider: ctx.resolved_provider.map(str::to_string),
+                aliases: vec!["custom".into()],
+            },
+        );
+    }
+
+    if entries.len() == 1 {
+        return Err("Claude 未返回可用模型".into());
+    }
+    Ok(entries)
+}
+
+fn base_profile_for_model_probe(ctx: &CommandContext<'_>) -> crate::cli_bridge::CliProfile {
+    let active_name = ctx.resolved_cli.name();
+    if ctx.config.cli.name() == active_name {
+        return ctx.config.cli.clone();
+    }
+    ctx.config
+        .cli_profiles
+        .values()
+        .find(|profile| profile.name() == active_name)
+        .cloned()
+        .unwrap_or_else(|| ctx.resolved_cli.clone())
+}
+
+async fn probe_claude_model(
+    base: &crate::cli_bridge::CliProfile,
+    model_arg: Option<&str>,
+    provider_config: Option<&crate::config::ProviderConfig>,
+) -> Result<Option<String>, String> {
+    let mut profile = base.clone();
+    if let Some(model) = model_arg {
+        profile.set_model_override(model.to_string());
+    }
+    let mut command = profile.build_command_with_context("/model", None, None, None);
+    profile
+        .apply_runtime_environment(&mut command)
+        .map_err(|e| {
+            format!(
+                "failed to prepare `{}` CLI environment for model probe: {e}",
+                profile.name()
+            )
+        })?;
+    if let Some(pc) = provider_config {
+        crate::cli_bridge::apply_provider_environment(&mut command, pc).map_err(|e| {
+            format!(
+                "failed to prepare provider environment for `{}` model probe: {e}",
+                profile.name()
+            )
+        })?;
+    }
+
+    let output = tokio::time::timeout(Duration::from_secs(8), command.output())
+        .await
+        .map_err(|_| "Claude model probe 超时".to_string())?
+        .map_err(|e| format!("运行 Claude model probe: {e}"))?;
+    if let Some(model) = parse_claude_init_model(&output.stdout) {
+        return Ok(Some(model));
+    }
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "Claude model probe 退出码 {}: {}",
+            output.status.code().unwrap_or(-1),
+            stderr.trim()
+        ));
+    }
+    Ok(None)
+}
+
+fn parse_claude_init_model(stdout: &[u8]) -> Option<String> {
+    let text = std::str::from_utf8(stdout).ok()?;
+    for line in text.lines() {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if value["type"] == "system"
+            && value["subtype"] == "init"
+            && let Some(model) = value["model"].as_str()
+            && !model.trim().is_empty()
+        {
+            return Some(model.to_string());
+        }
+    }
+    None
+}
+
+fn claude_custom_env_models(
+    profile: &crate::cli_bridge::CliProfile,
+    provider_config: Option<&crate::config::ProviderConfig>,
+) -> Vec<String> {
+    let mut models = Vec::new();
+    if let Some(model) = cli_profile_env_value(profile, "ANTHROPIC_MODEL") {
+        models.push(model);
+    }
+    if let Some(pc) = provider_config
+        && let Some(model) = pc.env.get("ANTHROPIC_MODEL")
+        && !model.trim().is_empty()
+    {
+        models.push(model.trim().to_string());
+    }
+    models.sort();
+    models.dedup();
+    models
+}
+
+fn cli_profile_env_value(profile: &crate::cli_bridge::CliProfile, key: &str) -> Option<String> {
+    match profile {
+        crate::cli_bridge::CliProfile::Claude { env, .. }
+        | crate::cli_bridge::CliProfile::Copilot { env, .. } => env
+            .get(key)
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty()),
+        _ => None,
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct CodexModelCatalog {
+    models: Vec<CodexModelItem>,
+}
+
+#[derive(serde::Deserialize)]
+struct CodexModelItem {
+    slug: String,
+    display_name: Option<String>,
+    description: Option<String>,
+    visibility: Option<String>,
+}
+
+async fn codex_model_entries(
+    profile: &crate::cli_bridge::CliProfile,
+) -> Result<Vec<ModelEntry>, String> {
+    let crate::cli_bridge::CliProfile::Codex { bin, .. } = profile else {
+        return Ok(Vec::new());
+    };
+
+    let output = tokio::time::timeout(
+        Duration::from_secs(8),
+        tokio::process::Command::new(bin)
+            .arg("debug")
+            .arg("models")
+            .output(),
+    )
+    .await
+    .map_err(|_| format!("`{bin} debug models` 超时"))?
+    .map_err(|e| format!("运行 `{bin} debug models`: {e}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "`{bin} debug models` 退出码 {}: {}",
+            output.status.code().unwrap_or(-1),
+            stderr.trim()
+        ));
+    }
+
+    let catalog: CodexModelCatalog = serde_json::from_slice(&output.stdout)
+        .map_err(|e| format!("解析 `{bin} debug models` 输出: {e}"))?;
+    let mut entries = vec![default_model_entry()];
+    for item in catalog
+        .models
+        .into_iter()
+        .filter(|item| item.visibility.as_deref() == Some("list"))
+    {
+        let aliases = codex_model_aliases(&item.slug);
+        push_unique_model_entry(
+            &mut entries,
+            ModelEntry {
+                label: item.display_name.unwrap_or_else(|| item.slug.clone()),
+                desc: item.description.unwrap_or_else(|| "Codex model".into()),
+                full_id: Some(item.slug),
+                provider: Some("openai-codex".into()),
+                aliases,
+            },
+        );
+    }
+    if entries.len() == 1 {
+        return Err("Codex 返回的模型列表为空".into());
+    }
+    Ok(entries)
+}
+
+fn codex_model_aliases(slug: &str) -> Vec<String> {
+    let mut aliases = vec![slug.replace(['-', '.'], "")];
+    if slug == "gpt-5.5" {
+        aliases.push("gpt55".into());
+    } else if slug == "gpt-5.4" {
+        aliases.push("gpt54".into());
+    }
+    aliases.sort();
+    aliases.dedup();
+    aliases
+}
+
+fn push_unique_model_entry(entries: &mut Vec<ModelEntry>, entry: ModelEntry) {
+    if let Some(id) = entry.full_id.as_deref()
+        && entries
+            .iter()
+            .any(|existing| existing.full_id.as_deref() == Some(id))
+    {
+        return;
+    }
+    entries.push(entry);
 }
 
 fn astra_model_aliases(name: &str) -> Vec<String> {
@@ -2290,6 +2731,22 @@ fn format_context_window(n: u64) -> String {
         format!("{}k", n / 1_000)
     } else {
         n.to_string()
+    }
+}
+
+fn format_cache_age(age: Option<Duration>) -> String {
+    let Some(age) = age else {
+        return "刚刚".into();
+    };
+    let secs = age.as_secs();
+    if secs < 60 {
+        "刚刚".into()
+    } else if secs < 3600 {
+        format!("{}分钟前", secs / 60)
+    } else if secs < 86_400 {
+        format!("{}小时前", secs / 3600)
+    } else {
+        format!("{}天前", secs / 86_400)
     }
 }
 
@@ -2528,6 +2985,15 @@ mod tests {
         assert_eq!(format_duration(125_000), "2m 5s");
     }
 
+    #[test]
+    fn format_cache_age_values() {
+        assert_eq!(format_cache_age(None), "刚刚");
+        assert_eq!(format_cache_age(Some(Duration::from_secs(59))), "刚刚");
+        assert_eq!(format_cache_age(Some(Duration::from_secs(120))), "2分钟前");
+        assert_eq!(format_cache_age(Some(Duration::from_secs(7200))), "2小时前");
+        assert_eq!(format_cache_age(Some(Duration::from_secs(172800))), "2天前");
+    }
+
     // ── Harness snapshot tests ──────────────────────────────────
 
     fn test_snapshot() -> HarnessSnapshot {
@@ -2735,6 +3201,7 @@ mod tests {
                     user_id: "user_1",
                     resolved_cli: &cli,
                     resolved_provider: None,
+                    resolved_provider_config: None,
                     trace_repo: None,
                     project_dirs: &config.project_dirs,
                     cli_availability: &[],
@@ -2790,6 +3257,7 @@ mod tests {
             user_id: "user_1",
             resolved_cli: &cli,
             resolved_provider: None,
+            resolved_provider_config: None,
             trace_repo: None,
             project_dirs: &config.project_dirs,
             cli_availability: &[],
@@ -2801,8 +3269,8 @@ mod tests {
         let r = handle_command(&ctx, "/model").await;
         let s = r.unwrap();
         assert!(s.contains("当前"));
-        assert!(s.contains("Haiku"));
-        assert!(s.contains("Opus"));
+        assert!(s.contains("haiku"));
+        assert!(s.contains("opus"));
         assert!(s.contains("默认"));
         assert!(s.contains("切换"));
     }
@@ -2969,7 +3437,17 @@ mod tests {
                 .iter()
                 .any(|e| e.full_id.as_deref() == Some("gpt-5.4"))
         );
-        assert_eq!(entries.len(), 3);
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.full_id.as_deref() == Some("gpt-5.4-mini"))
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.full_id.as_deref() == Some("gpt-5.3-codex-spark"))
+        );
+        assert_eq!(entries.len(), 5);
 
         // Enable dashscope provider → DashScope models appear for claude CLI.
         config
@@ -2996,7 +3474,17 @@ mod tests {
                 .iter()
                 .any(|e| e.full_id.as_deref() == Some("gpt-5.4"))
         );
-        assert_eq!(codex_entries.len(), 3);
+        assert!(
+            codex_entries
+                .iter()
+                .any(|e| e.full_id.as_deref() == Some("gpt-5.4-mini"))
+        );
+        assert!(
+            codex_entries
+                .iter()
+                .any(|e| e.full_id.as_deref() == Some("gpt-5.3-codex-spark"))
+        );
+        assert_eq!(codex_entries.len(), 5);
 
         // Even if TAAS is configured, codex does not consume it.
         config.providers.insert("taas".into(), Default::default());
@@ -3012,7 +3500,7 @@ mod tests {
                 .iter()
                 .all(|e| e.provider.as_deref() != Some("taas"))
         );
-        assert_eq!(codex_entries.len(), 3);
+        assert_eq!(codex_entries.len(), 5);
 
         // Aliases resolve against the filtered list
         fn id(r: ResolvedModel) -> String {
@@ -3058,6 +3546,26 @@ mod tests {
             "Sonnet"
         );
         assert_eq!(display_model_name("unknown-id", &entries), "unknown-id");
+    }
+
+    #[test]
+    fn dynamic_claude_entries_display_resolved_model_id() {
+        let entries = vec![
+            default_model_entry(),
+            ModelEntry {
+                label: "qwen3.7-max".into(),
+                desc: "Claude alias: haiku".into(),
+                full_id: Some("qwen3.7-max".into()),
+                provider: Some("dashscope".into()),
+                aliases: vec!["haiku".into()],
+            },
+        ];
+
+        assert_eq!(display_model_name("qwen3.7-max", &entries), "qwen3.7-max");
+        assert!(matches!(
+            resolve_model_input("haiku", &entries),
+            ResolvedModel::Id(id) if id == "qwen3.7-max"
+        ));
     }
     cmd_test!(
         cmd_model_set_without_db_still_succeeds,
@@ -3133,6 +3641,7 @@ mod tests {
             user_id: "user_1",
             resolved_cli: &cli,
             resolved_provider: None,
+            resolved_provider_config: None,
             trace_repo: None,
             project_dirs: &config.project_dirs,
             cli_availability: &[],
@@ -3633,6 +4142,7 @@ mod tests {
             user_id: "user_1",
             resolved_cli: cli,
             resolved_provider: None,
+            resolved_provider_config: None,
             trace_repo: Some(repo),
             project_dirs: &config.project_dirs,
             cli_availability: &[],
