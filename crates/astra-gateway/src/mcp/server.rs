@@ -351,6 +351,7 @@ fn resolve_allowed_attachment_path(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run_stdio_server(
     database_url: Option<String>,
     sqlite_path: Option<String>,
