@@ -80,7 +80,6 @@ then instantiate it in `main.rs`.
 See `crates/astra-gateway/src/store/`. A new backend must implement:
 
 - `GatewayStore` (defined in `store/mod.rs`)
-- `DurableTaskStore` (defined in `durable_task_store.rs`)
 - `TraceRepository` (defined in `trace_model.rs`)
 
 Wire it into `StorageConfig` and `open_store_bundle` in `store/mod.rs`.

@@ -604,33 +604,9 @@ async fn session_switch_restores_previous() {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 #[tokio::test]
-async fn durable_task_created_via_gateway_action() {
-    let fake_cli = create_fake_cli_script(
-        "Done. [[GATEWAY:dtask_create:test-migration:migrating users to new schema]]",
-    );
-    let mut config = TestGateway::build_config(&script_path(&fake_cli));
-    config.action_policy.allow_model_generated_mutations = true;
-    let gw = TestGateway::with_config(config).await;
-    let outputs = Arc::new(Mutex::new(Vec::new()));
-    let adapter = MockPlatformAdapter::new(mpsc::channel(1).1, outputs.clone());
-
-    let m = msg("chat-task", "user-1", "create a migration task");
-    let response = gw.runner.handle_message(&m, &adapter).await;
-    assert!(response.is_some());
-    // The response should mention task creation
-    let text = response.unwrap();
-    // Gateway action tags get processed; the response includes action results
-    assert!(
-        text.contains("task") || text.contains("Done") || text.contains("创建"),
-        "response should acknowledge task: {text}"
-    );
-}
-
-#[tokio::test]
-async fn durable_task_slash_list_shows_running_tasks() {
+async fn task_slash_list_shows_scheduled_tasks() {
     let gw = TestGateway::new().await;
 
-    // The /task list command requires trace_repo. With SQLite :memory: we have it.
     let m = msg("chat-tl", "user-1", "/task list");
     let result = gw.runner.handle_fast(&m).await;
     assert!(result.is_ok());
@@ -640,8 +616,7 @@ async fn durable_task_slash_list_shows_running_tasks() {
 }
 
 #[tokio::test]
-async fn durable_task_suspend_on_cli_failure() {
-    // When CLI exits non-zero, running tasks for that conversation should be suspended.
+async fn cli_failure_returns_error_response() {
     let fake_cli = create_failing_cli_script(1, "segfault");
     let config = TestGateway::build_config(&script_path(&fake_cli));
     let gw = TestGateway::with_config(config).await;
@@ -657,14 +632,6 @@ async fn durable_task_suspend_on_cli_failure() {
         text.contains("segfault") || text.contains("错误") || text.contains("⚠"),
         "should report CLI failure: {text}"
     );
-}
-
-#[tokio::test]
-async fn durable_task_sweep_on_startup() {
-    // sweep_stale_tasks is called during run() but we can call it directly
-    let gw = TestGateway::new().await;
-    // This should not panic even with no tasks
-    gw.runner.sweep_stale_tasks().await;
 }
 
 #[tokio::test]
@@ -751,13 +718,6 @@ async fn runner_init_invalid_config_errors() {
 
     let result = GatewayRunner::new(config).await;
     assert!(result.is_err(), "should fail with invalid MySQL connection");
-}
-
-#[tokio::test]
-async fn runner_suspend_stale_tasks_on_startup() {
-    let gw = TestGateway::new().await;
-    // Should complete without error
-    gw.runner.sweep_stale_tasks().await;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

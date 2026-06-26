@@ -5,8 +5,8 @@
 //! commands are sent to the sidecar over the same JSONL command protocol.
 
 use super::{
-    AdapterCapability, AdapterHealthEvent, AdapterHealthEventType, ChatType, InboundMessage,
-    PlatformAdapter, emit_adapter_health,
+    AdapterCapability, AdapterHealthEvent, AdapterHealthEventType, AttachmentKind, ChatType,
+    InboundMessage, OutboundAttachment, PlatformAdapter, emit_adapter_health,
 };
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -20,6 +20,7 @@ use uuid::Uuid;
 const WHATSAPP_WEB_CAPABILITIES: &[AdapterCapability] = &[
     AdapterCapability::ReceiveText,
     AdapterCapability::SendText,
+    AdapterCapability::SendAttachment,
     AdapterCapability::SendTyping,
 ];
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(15);
@@ -122,8 +123,45 @@ impl PlatformAdapter for WhatsAppWebAdapter {
         .await
     }
 
+    async fn send_attachment(
+        &self,
+        chat_id: &str,
+        attachment: &OutboundAttachment,
+        _reply_token: Option<&str>,
+    ) -> Result<(), String> {
+        let path = attachment.required_local_path("whatsapp_web")?;
+        send_command(
+            &self.socket_path,
+            SidecarCommand::SendAttachment {
+                id: Uuid::new_v4().to_string(),
+                to: chat_id.to_string(),
+                path: path.to_string_lossy().to_string(),
+                filename: attachment.name.clone(),
+                mime: attachment.mime_type.clone(),
+                kind: whatsapp_kind(attachment.kind),
+            },
+        )
+        .await
+        .map(|_| {
+            emit_adapter_health(AdapterHealthEvent::new(
+                "whatsapp_web",
+                AdapterHealthEventType::SendAck,
+                Some(chat_id.to_string()),
+            ));
+        })
+    }
+
     async fn recv(&self) -> Option<InboundMessage> {
         self.msg_rx.lock().await.recv().await
+    }
+}
+
+fn whatsapp_kind(kind: AttachmentKind) -> &'static str {
+    match kind {
+        AttachmentKind::Image => "image",
+        AttachmentKind::Video => "video",
+        AttachmentKind::Audio => "audio",
+        AttachmentKind::File | AttachmentKind::Unknown => "document",
     }
 }
 
@@ -185,6 +223,16 @@ enum SidecarCommand<'a> {
         id: String,
         to: String,
         text: String,
+    },
+    SendAttachment {
+        id: String,
+        to: String,
+        path: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        filename: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        mime: Option<String>,
+        kind: &'a str,
     },
     Typing {
         id: String,
@@ -349,4 +397,42 @@ async fn write_json_line<T: Serialize>(stream: &mut UnixStream, value: &T) -> Re
         .write_all(&encoded)
         .await
         .map_err(|e| format!("write whatsapp_web command failed: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn capabilities_include_attachment_send() {
+        assert!(WHATSAPP_WEB_CAPABILITIES.contains(&AdapterCapability::SendAttachment));
+    }
+
+    #[test]
+    fn attachment_kind_maps_to_baileys_payload_kind() {
+        assert_eq!(whatsapp_kind(AttachmentKind::Image), "image");
+        assert_eq!(whatsapp_kind(AttachmentKind::Video), "video");
+        assert_eq!(whatsapp_kind(AttachmentKind::Audio), "audio");
+        assert_eq!(whatsapp_kind(AttachmentKind::File), "document");
+        assert_eq!(whatsapp_kind(AttachmentKind::Unknown), "document");
+    }
+
+    #[test]
+    fn send_attachment_command_serializes_for_sidecar() {
+        let command = SidecarCommand::SendAttachment {
+            id: "cmd-1".into(),
+            to: "chat@s.whatsapp.net".into(),
+            path: "/tmp/report.pdf".into(),
+            filename: Some("report.pdf".into()),
+            mime: Some("application/pdf".into()),
+            kind: "document",
+        };
+        let json = serde_json::to_value(command).unwrap();
+        assert_eq!(json["type"], "send_attachment");
+        assert_eq!(json["to"], "chat@s.whatsapp.net");
+        assert_eq!(json["path"], "/tmp/report.pdf");
+        assert_eq!(json["filename"], "report.pdf");
+        assert_eq!(json["mime"], "application/pdf");
+        assert_eq!(json["kind"], "document");
+    }
 }

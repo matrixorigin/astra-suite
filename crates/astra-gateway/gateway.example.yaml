@@ -15,13 +15,13 @@
 # ─── Storage ─────────────────────────────────────────────────────────────────
 #
 # Controls persistence for sessions, cron jobs, reminders, usage tracking,
-# credentials, durable tasks, and trace/audit events.
+# credentials, and trace/audit events.
 #
 # Available backends:
 #
 #   sqlite    — Lightweight single-file DB (DEFAULT). Zero external deps.
 #               Full support: sessions, cron, reminders, usage, credentials,
-#               trace (observability), durable tasks.
+#               trace (observability).
 #
 #   mysql     — Same feature set as sqlite, backed by MySQL/MariaDB.
 #               Use when multiple gateway instances share one database.
@@ -30,7 +30,7 @@
 #
 #   file      — JSON files on disk. Single-user friendly, NOT for production.
 #               Supports: sessions, cron, reminders, usage.
-#               Does NOT support: trace, durable tasks.
+#               Does NOT support: trace.
 #
 #   none      — No persistence. State is lost on restart; no cron / reminders.
 #
@@ -225,7 +225,7 @@ action_policy:
   # Requires a persistent storage backend for audit trail.
   allow_model_generated_mutations: false
 
-  # Restrict /workspace and [[GATEWAY:workspace_set]] to these directories.
+  # Restrict /workspace slash commands to these directories.
   # Empty = unrestricted (any path allowed).
   workspace_roots: []
   # workspace_roots:

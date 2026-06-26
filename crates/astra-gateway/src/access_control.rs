@@ -46,7 +46,6 @@ pub enum ActionSource {
 pub enum ActionCapability {
     SessionMutation,
     CronMutation,
-    DurableTaskMutation,
     SkillMutation,
     WorkspaceMutation,
     CliMutation,
@@ -61,7 +60,7 @@ pub struct ActionPolicy {
     /// Allow model-generated [[GATEWAY:...]] mutation tags. Slash commands stay allowed.
     #[serde(default = "default_allow_model_generated_mutations")]
     pub allow_model_generated_mutations: bool,
-    /// If non-empty, /workspace and workspace_set may only target these roots.
+    /// If non-empty, /workspace slash commands may only target these roots.
     #[serde(default)]
     pub workspace_roots: Vec<String>,
 }
@@ -129,7 +128,6 @@ impl ActionCapability {
             self,
             Self::SessionMutation
                 | Self::CronMutation
-                | Self::DurableTaskMutation
                 | Self::SkillMutation
                 | Self::WorkspaceMutation
                 | Self::CliMutation

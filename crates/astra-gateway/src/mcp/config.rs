@@ -13,6 +13,8 @@ pub fn generate_mcp_config(
     chat_id: &str,
     user_id: &str,
     project_dirs: &[String],
+    runtime_api_url: Option<&str>,
+    runtime_api_token: Option<&str>,
 ) -> Result<PathBuf, std::io::Error> {
     let gateway_bin = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("astra-gateway"));
 
@@ -47,6 +49,18 @@ pub fn generate_mcp_config(
         env.insert(
             "GW_MCP_PROJECT_DIRS".into(),
             serde_json::Value::String(project_dirs.join(":")),
+        );
+    }
+    if let Some(url) = runtime_api_url.filter(|s| !s.trim().is_empty()) {
+        env.insert(
+            "GW_MCP_RUNTIME_API_URL".into(),
+            serde_json::Value::String(url.to_string()),
+        );
+    }
+    if let Some(token) = runtime_api_token.filter(|s| !s.trim().is_empty()) {
+        env.insert(
+            "GW_MCP_RUNTIME_API_TOKEN".into(),
+            serde_json::Value::String(token.to_string()),
         );
     }
 

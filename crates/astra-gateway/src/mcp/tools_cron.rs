@@ -1,6 +1,9 @@
 use crate::store::{self, GatewayStore};
 
-pub async fn cron_list(store: &dyn GatewayStore, platform: &str, chat_id: &str) -> String {
+pub async fn cron_list(store: Option<&dyn GatewayStore>, platform: &str, chat_id: &str) -> String {
+    let Some(store) = store else {
+        return "Error: storage not configured".into();
+    };
     match store.list_cron_jobs(platform, chat_id).await {
         Ok(jobs) if jobs.is_empty() => "No scheduled tasks.".into(),
         Ok(jobs) => {
@@ -20,7 +23,7 @@ pub async fn cron_list(store: &dyn GatewayStore, platform: &str, chat_id: &str) 
 }
 
 pub async fn cron_add(
-    store: &dyn GatewayStore,
+    store: Option<&dyn GatewayStore>,
     platform: &str,
     chat_id: &str,
     user_id: &str,
@@ -35,6 +38,9 @@ pub async fn cron_add(
             "Error: invalid cron expression `{cron_expr}` (need 5 fields: min hour day month weekday)"
         );
     }
+    let Some(store) = store else {
+        return "Error: storage not configured".into();
+    };
 
     let job_id = uuid::Uuid::new_v4().to_string();
     match store
@@ -58,7 +64,7 @@ pub async fn cron_add(
 }
 
 pub async fn cron_delete(
-    store: &dyn GatewayStore,
+    store: Option<&dyn GatewayStore>,
     platform: &str,
     chat_id: &str,
     job_id: &str,
@@ -66,6 +72,9 @@ pub async fn cron_delete(
     if job_id.is_empty() {
         return "Error: job_id cannot be empty".into();
     }
+    let Some(store) = store else {
+        return "Error: storage not configured".into();
+    };
     match store.list_cron_jobs(platform, chat_id).await {
         Ok(jobs) => {
             let matched = jobs
@@ -86,7 +95,7 @@ pub async fn cron_delete(
 }
 
 pub async fn remind_after(
-    store: &dyn GatewayStore,
+    store: Option<&dyn GatewayStore>,
     platform: &str,
     chat_id: &str,
     user_id: &str,
@@ -103,6 +112,9 @@ pub async fn remind_after(
     if minutes > 1440 * 7 {
         return "Error: maximum 7 days (10080 minutes)".into();
     }
+    let Some(store) = store else {
+        return "Error: storage not configured".into();
+    };
 
     let (cron_type, stored_message) = if exec {
         ("once_exec", message.to_string())

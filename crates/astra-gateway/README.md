@@ -3,7 +3,7 @@
 A chat-platform gateway that bridges WeChat / WeCom (and more) to AI agent CLIs —
 **Claude Code**, **Codex**, **GitHub Copilot CLI**, and **Astra**. Point it at your chat
 bot and talk to an agent CLI from any chat app, with per-user sessions,
-scheduled tasks, durable long-running jobs, and full observability.
+scheduled tasks, and full observability.
 
 ## Features
 
@@ -12,7 +12,7 @@ scheduled tasks, durable long-running jobs, and full observability.
 | **Multi-CLI**      | claude / codex / copilot / astra — switch at runtime via `/cli`. |
 | **Multi-model**    | `/model haiku\|sonnet\|opus\|minimax\|deepseek\|qwen\|glm` |
 | **Sessions**       | Per-user isolation, auto-reset (daily / idle), history, switch. |
-| **Cron & tasks**   | Recurring jobs, one-time reminders, durable tasks with checkpoint / resume. |
+| **Cron & tasks**   | Recurring jobs and one-time reminders. |
 | **Workspace**      | `/workspace <path>` to switch project dirs, auto-discovery from configured roots. |
 | **Observability**  | `/trace`, `/running`, `/inspect` (harness), `/audit` (decision chain), `/usage` (cost). |
 | **Skills**         | Built-in gateway skill + user-defined `.md` files, agent self-authoring. |
@@ -72,7 +72,7 @@ Users switch at runtime with `/cli claude`, `/cli codex`, `/cli copilot`, etc.
 
 | Backend     | Use when                                | Supports |
 |-------------|-----------------------------------------|----------|
-| `sqlite`    | **Default** — single-node, zero-config  | Everything including trace, durable tasks |
+| `sqlite`    | **Default** — single-node, zero-config  | Everything including trace |
 | `mysql`     | Multiple gateway instances share a DB   | Same as sqlite |
 | `matrixone` | Same as `mysql` (MySQL-protocol alias)  | Same as sqlite |
 | `file`      | Local dev / testing only                | Sessions, cron, reminders, usage |
@@ -95,13 +95,12 @@ Users switch at runtime with `/cli claude`, `/cli codex`, `/cli copilot`, etc.
 | `/running`                     | Queued / running gateway requests |
 | `/trace <id>`                  | Request lifecycle and events |
 | `/cancel <id>`                 | Cancel a queued request |
-| `/task list\|cancel\|resume`   | Durable task management |
+| `/task list\|cancel`           | Scheduled task / reminder management |
 | `/cron list\|add\|del`         | Scheduled tasks |
 | `/usage`                       | Token / cost statistics |
 
-Natural language also works — the agent can emit `[[GATEWAY:action]]` tags
-to schedule cron jobs, set reminders, open durable tasks, or change the
-workspace on your behalf.
+Natural language also works — the agent can emit gateway action tags to
+schedule cron jobs or set reminders on your behalf.
 
 ## Configuration
 
@@ -193,7 +192,6 @@ All tables are created automatically on first run. Prefix `gw_`:
 | `gw_users`                | Profiles + preferences (CLI, model, workspace) |
 | `gw_sessions`             | Chat → CLI session mapping (per-CLI isolation) |
 | `gw_cron_jobs`            | Recurring + one-time scheduled tasks |
-| `gw_durable_tasks`        | Checkpointable long-running tasks |
 | `gw_platform_credentials` | WeChat tokens, context tokens, sync cursors |
 | `gw_trace_requests`       | User / scheduler request state |
 | `gw_trace_runs`           | CLI / runtime attempt state |

@@ -321,34 +321,6 @@ Do it NOW for the user's request."#;
     );
 }
 
-// ─── Task management e2e tests ─────────────────────────────────────────────
-
-#[tokio::test]
-#[ignore]
-async fn e2e_astra_task_list_via_agent() {
-    use astra_gateway::cli_bridge::run_cli_with_context;
-    let profile = astra_profile();
-    let system = "When asked to list tasks, respond with exactly: [[GATEWAY:task_list]]";
-    let result = run_cli_with_context(
-        &profile,
-        "我有哪些定时任务？",
-        None,
-        None,
-        None,
-        Some(system),
-        None,
-        None,
-    )
-    .await
-    .expect("should succeed");
-    assert_eq!(result.exit_code, 0);
-    let text = result.text.unwrap_or_default();
-    assert!(
-        text.contains("[[GATEWAY:task_list]]"),
-        "agent should emit task_list tag. Got: {text}"
-    );
-}
-
 #[tokio::test]
 #[ignore]
 async fn e2e_astra_cron_add_via_agent() {

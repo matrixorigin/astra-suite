@@ -9,9 +9,6 @@ use crate::trace_model::{
     ActiveRequestSummary, CancelRequestOutcome, ConversationKey, GatewayEvent, GatewayEventKind,
     OutboxStatus, RequestStatus, TraceId, TraceRepository,
 };
-use astra_task_store::{
-    DurableTask, DurableTaskStatus, DurableTaskStore, TaskFilter, resolve_task_for_owner,
-};
 use std::{sync::Arc, time::Duration};
 use tokio::sync::Mutex;
 
@@ -25,13 +22,12 @@ pub struct CommandContext<'a> {
     pub resolved_cli: &'a crate::cli_bridge::CliProfile,
     /// Resolved provider name for the active model (e.g. "bedrock", "dashscope").
     pub resolved_provider: Option<&'a str>,
-    pub durable_store: Option<&'a dyn astra_task_store::DurableTaskStore>,
     pub trace_repo: Option<&'a dyn TraceRepository>,
     pub project_dirs: &'a [String],
     pub cli_availability: &'a [(String, crate::cli_bridge::CliAvailability)],
     pub auth_status: Option<String>,
     /// Active task registry — allows /esc to interrupt live CLI turns.
-    pub active_tasks: Option<&'a dashmap::DashMap<String, tokio_util::sync::CancellationToken>>,
+    pub active_requests: Option<&'a dashmap::DashMap<String, tokio_util::sync::CancellationToken>>,
     /// Long-lived Codex/Astra app-server pool, used by approval slash commands.
     pub(crate) codex_app_pool: Option<&'a Arc<Mutex<CodexAppPool>>>,
     /// Gateway process start time. Used by /running to flag zombie
@@ -57,16 +53,6 @@ macro_rules! require_trace_repo {
             None => return Some("⚠️ 此命令需要 MySQL 存储。当前没有启用 trace/durable 能力。".into()),
         }
     };
-}
-
-async fn resolve_owned_task(
-    store: &dyn DurableTaskStore,
-    owner_id: &str,
-    selector: &str,
-) -> Result<DurableTask, String> {
-    resolve_task_for_owner(store, owner_id, selector)
-        .await
-        .map_err(|e| format!("⚠️ {e}"))
 }
 
 pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<String> {
@@ -745,12 +731,9 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
              `/inspect` — harness 详情 (token/cost/tools/warnings)\n\
              `/audit` — 审计记录 (最近 N 轮决策链)\n\
              `/trace [id]` — 查看 trace 详情\n\n\
-             **持久任务**\n\
-             `/task list` — 查看任务\n\
-             `/task status <id>` — 任务状态\n\
-             `/task cancel <id>` — 取消任务\n\
-             `/task resume <id>` — 恢复任务\n\n\
              **定时任务**\n\
+             `/task list` — 查看定时任务/提醒\n\
+             `/task cancel <id>` — 取消定时任务/提醒\n\
              `/cron list` — 查看任务\n\
              `/cron add <expr> <msg>` — 创建\n\
              `/cron del <id>` — 删除\n\n\
@@ -761,8 +744,6 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
         ),
 
         "/task" => {
-            let owner_id = format!("{}:{}", ctx.platform, ctx.chat_id);
-
             if arg.is_empty() || arg == "list" {
                 let mut lines = Vec::new();
 
@@ -789,31 +770,6 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
                     }
                 }
 
-                // Durable tasks
-                if let Some(dstore) = ctx.durable_store {
-                    let filter = TaskFilter {
-                        owner_id: Some(owner_id.clone()),
-                        ..Default::default()
-                    };
-                    if let Ok(tasks) = dstore.list(filter).await {
-                        for t in &tasks {
-                            let short_id = &t.id.0[..8.min(t.id.0.len())];
-                            let icon = match t.status {
-                                astra_task_store::DurableTaskStatus::Running => "🔄",
-                                astra_task_store::DurableTaskStatus::Suspended => "⏸",
-                                astra_task_store::DurableTaskStatus::Completed => "✅",
-                                astra_task_store::DurableTaskStatus::Failed => "❌",
-                                astra_task_store::DurableTaskStatus::Cancelled => "🚫",
-                                _ => "📋",
-                            };
-                            lines.push(format!(
-                                "{icon} `{short_id}` | {} | {}%",
-                                t.name, t.progress_pct
-                            ));
-                        }
-                    }
-                }
-
                 if lines.is_empty() {
                     return Some("📋 没有任务。".into());
                 }
@@ -824,12 +780,8 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
                 .or_else(|| arg.strip_prefix("rm "))
                 .or_else(|| arg.strip_prefix("del "))
             {
-                if let Some(denial) = slash_denial(ctx, ActionCapability::DurableTaskMutation) {
-                    return Some(denial);
-                }
                 let id = id.trim();
 
-                // Try cron job first (covers reminders + recurring)
                 if let Some(store) = ctx.store {
                     let jobs = store
                         .list_cron_jobs(ctx.platform, ctx.chat_id)
@@ -844,79 +796,9 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
                     }
                 }
 
-                // Then try durable task
-                let Some(dstore) = ctx.durable_store else {
-                    return Some("❌ 找不到该任务".into());
-                };
-                let task = match resolve_owned_task(dstore, &owner_id, id).await {
-                    Ok(task) => task,
-                    Err(e) => return Some(e),
-                };
-                match dstore
-                    .update_status(&task.id, DurableTaskStatus::Cancelled, None)
-                    .await
-                {
-                    Ok(()) => Some("🚫 任务已取消".into()),
-                    Err(e) => Some(format!("⚠️ {e}")),
-                }
-            } else if let Some(id) = arg.strip_prefix("resume ") {
-                if let Some(denial) = slash_denial(ctx, ActionCapability::DurableTaskMutation) {
-                    return Some(denial);
-                }
-                let Some(dstore) = ctx.durable_store else {
-                    return Some("⚠️ 无持久任务存储".into());
-                };
-                let task = match resolve_owned_task(dstore, &owner_id, id).await {
-                    Ok(task) => task,
-                    Err(e) => return Some(e),
-                };
-                match dstore.resume(&task.id).await {
-                    Ok(Some(cp)) => {
-                        if let Err(e) = dstore
-                            .update_status(&task.id, DurableTaskStatus::Running, None)
-                            .await
-                        {
-                            return Some(format!("⚠️ 恢复失败: {e}"));
-                        }
-                        Some(format!(
-                            "▶️ 任务已恢复\n检查点:\n```\n{}\n```",
-                            serde_json::to_string_pretty(&cp).unwrap_or_default()
-                        ))
-                    }
-                    Ok(None) => {
-                        if let Err(e) = dstore
-                            .update_status(&task.id, DurableTaskStatus::Running, None)
-                            .await
-                        {
-                            return Some(format!("⚠️ 恢复失败: {e}"));
-                        }
-                        Some("▶️ 任务无检查点，将从头开始".into())
-                    }
-                    Err(e) => Some(format!("⚠️ {e}")),
-                }
-            } else if let Some(id) = arg.strip_prefix("status ") {
-                let Some(dstore) = ctx.durable_store else {
-                    return Some("⚠️ 无持久任务存储".into());
-                };
-                match resolve_owned_task(dstore, &owner_id, id).await {
-                    Ok(t) => {
-                        let mut lines = vec![
-                            format!("📋 **{}**", t.name),
-                            format!("- 状态: {}", t.status.as_str()),
-                            format!("- 进度: {}%", t.progress_pct),
-                        ];
-                        if let Some(ref step) = t.step_description {
-                            lines.push(format!("- 当前: {step}"));
-                        }
-                        if let Some(ref err) = t.error_message {
-                            lines.push(format!("- 信息: {err}"));
-                        }
-                        Some(lines.join("\n"))
-                    }
-                    Err(e) => Some(e),
-                }
+                Some("❌ 找不到该任务".into())
             } else {
-                Some("用法: `/task [list|cancel <id>|resume <id>|status <id>]`".into())
+                Some("用法: `/task [list|cancel <id>]`".into())
             }
         }
 
@@ -1045,7 +927,7 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
                     kill_or_cancel_all(
                         repo,
                         &conversation,
-                        ctx.active_tasks,
+                        ctx.active_requests,
                         "cancelled by user via /cancel all",
                     )
                     .await,
@@ -1122,7 +1004,7 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
                     kill_or_cancel_all(
                         repo,
                         &conversation,
-                        ctx.active_tasks,
+                        ctx.active_requests,
                         if command_name == "/kill" {
                             "interrupted by user via /esc all (/kill alias)"
                         } else {
@@ -1169,7 +1051,7 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
                     // this to their native Esc/interrupt protocol for the
                     // active turn; one-shot CLIs are terminated by the bridge.
                     let interrupted_live_turn = ctx
-                        .active_tasks
+                        .active_requests
                         .map(|tasks| {
                             if let Some((_, token)) = tasks.remove(row.trace_id.as_str()) {
                                 token.cancel();
@@ -1471,7 +1353,6 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
                     if caps.supports_harness { "✅" } else { "❌" }
                 ),
                 format!("- Cron/scheduling: {}", if has_store { "✅" } else { "❌" }),
-                format!("- Durable tasks: {}", if has_store { "✅" } else { "❌" }),
                 format!(
                     "- Tool execution: {}",
                     if caps.supports_tools { "✅" } else { "❌" }
@@ -1491,7 +1372,7 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
             lines.push("| `/ws <name>` | Switch workspace |".to_string());
             lines.push("| `/session list` | Session history |".to_string());
             lines.push("| `/cron list` | Scheduled tasks |".to_string());
-            lines.push("| `/task list` | Durable tasks |".to_string());
+            lines.push("| `/task list` | Scheduled tasks/reminders |".to_string());
             lines.push("| `/running` | Active requests (numbered) |".to_string());
             lines.push("| `/cancel [N\\|text]` | Cancel queued request |".to_string());
             lines
@@ -1505,25 +1386,27 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
             lines.push("| `/auth` | Auth status + reset + auto-relogin |".to_string());
             lines.push("| `/gateway` | This context dump |".to_string());
 
-            if ctx.config.action_policy.allow_model_generated_mutations && has_store {
-                lines.push(String::new());
-                lines.push(
-                    "**Gateway Actions** (embed `[[GATEWAY:...]]` tags in response)".to_string(),
-                );
-                lines.push("| Tag | Effect |".to_string());
-                lines.push("|-----|--------|".to_string());
-                lines.push("| `cron_add:<expr>:<msg>` | Create recurring task |".to_string());
-                lines.push("| `remind_after:<min>:<msg>` | One-time reminder |".to_string());
-                lines.push("| `task_list` | List scheduled tasks |".to_string());
-                lines.push("| `task_del:<id>` | Delete task |".to_string());
-                lines.push("| `dtask_create:<name>:<desc>` | Create durable task |".to_string());
-                lines.push("| `dtask_checkpoint:<id>:<json>` | Save checkpoint |".to_string());
-                lines.push("| `dtask_complete:<id>` | Mark complete |".to_string());
-                lines.push("| `workspace_set:<path>` | Switch workspace |".to_string());
-                lines.push("| `skill_add:<name>:<md>` | Save reusable skill |".to_string());
-                lines.push("| `trace_kill:<trace_id>` | Interrupt request |".to_string());
-                lines.push("| `outbox_dismiss:<request_id>` | Dismiss failed outbox |".to_string());
-            }
+            lines.push(String::new());
+            lines.push("**MCP Tools**".to_string());
+            lines.push("| Tool | Description |".to_string());
+            lines.push("|------|-------------|".to_string());
+            lines.push("| `gateway_cron_list` | List scheduled tasks/reminders |".to_string());
+            lines.push("| `gateway_cron_add` | Create recurring scheduled task |".to_string());
+            lines
+                .push("| `gateway_cron_delete` | Delete scheduled task by ID prefix |".to_string());
+            lines.push(
+                "| `gateway_remind_after` | Create one-time reminder or scheduled exec |"
+                    .to_string(),
+            );
+            lines.push("| `gateway_skills_list` | List saved reusable skills |".to_string());
+            lines.push("| `gateway_skills_read` | Read saved skill content |".to_string());
+            lines.push("| `gateway_skills_add` | Save reusable skill |".to_string());
+            lines.push("| `gateway_skills_delete` | Delete saved skill |".to_string());
+            lines.push("| `gateway_workspace_current` | Show current workspace |".to_string());
+            lines.push("| `gateway_workspace_list` | List available workspaces |".to_string());
+            lines.push("| `gateway_workspace_switch` | Switch workspace |".to_string());
+            lines
+                .push("| `gateway_send_attachment` | Send a local file to this chat |".to_string());
 
             if let Some(store) = ctx.store {
                 let cron_jobs = store
@@ -1665,7 +1548,7 @@ pub fn is_zombie_request(created_at: &str, gateway_start: chrono::DateTime<chron
 
 /// Sweep every active request in `conversation`: force-fail in the DB,
 /// cancel the in-memory cancellation token (persistent CLIs translate that
-/// to native Esc/interrupt), and remove it from `active_tasks`. Returns a
+/// to native Esc/interrupt), and remove it from `active_requests`. Returns a
 /// user-facing summary with the count interrupted + the count of stale DB
 /// rows whose process was already gone (no token in the map — typical
 /// zombie case).
@@ -1675,7 +1558,7 @@ pub fn is_zombie_request(created_at: &str, gateway_start: chrono::DateTime<chron
 async fn kill_or_cancel_all(
     repo: &dyn TraceRepository,
     conversation: &ConversationKey,
-    active_tasks: Option<&dashmap::DashMap<String, tokio_util::sync::CancellationToken>>,
+    active_requests: Option<&dashmap::DashMap<String, tokio_util::sync::CancellationToken>>,
     reason: &str,
 ) -> String {
     let rows = match repo.list_active_requests(conversation, 200).await {
@@ -1705,7 +1588,7 @@ async fn kill_or_cancel_all(
                 );
             }
         }
-        if let Some(tasks) = active_tasks
+        if let Some(tasks) = active_requests
             && let Some((_, token)) = tasks.remove(row.trace_id.as_str())
         {
             token.cancel();
@@ -2852,12 +2735,11 @@ mod tests {
                     user_id: "user_1",
                     resolved_cli: &cli,
                     resolved_provider: None,
-                    durable_store: None,
                     trace_repo: None,
                     project_dirs: &config.project_dirs,
                     cli_availability: &[],
                     auth_status: None,
-                    active_tasks: None,
+                    active_requests: None,
                     codex_app_pool: None,
                     gateway_start: chrono::Utc::now(),
                 };
@@ -2908,12 +2790,11 @@ mod tests {
             user_id: "user_1",
             resolved_cli: &cli,
             resolved_provider: None,
-            durable_store: None,
             trace_repo: None,
             project_dirs: &config.project_dirs,
             cli_availability: &[],
             auth_status: None,
-            active_tasks: None,
+            active_requests: None,
             codex_app_pool: None,
             gateway_start: chrono::Utc::now(),
         };
@@ -3231,7 +3112,7 @@ mod tests {
             );
         }
     });
-    cmd_test!(cmd_task_requires_durable_store, "/task list", |r| {
+    cmd_test!(cmd_task_list_returns_response, "/task list", |r| {
         assert!(r.is_some());
     });
     cmd_test!(cmd_status_works_without_db, "/status", |r| {
@@ -3252,12 +3133,11 @@ mod tests {
             user_id: "user_1",
             resolved_cli: &cli,
             resolved_provider: None,
-            durable_store: None,
             trace_repo: None,
             project_dirs: &config.project_dirs,
             cli_availability: &[],
             auth_status: Some("⚠️ 暂停 (剩余 3m 42s)".to_string()),
-            active_tasks: None,
+            active_requests: None,
             codex_app_pool: None,
             gateway_start: chrono::Utc::now(),
         };
@@ -3422,9 +3302,6 @@ mod tests {
         let s = r.unwrap();
         assert!(s.contains("/manage"), "gateway should include /manage");
     });
-    // Note: trace_kill and outbox_dismiss GATEWAY action tags are only visible
-    // when model_generated_mutations is allowed AND store is available (tested below).
-
     // ── GAP 4: /gateway content completeness ────────────────────
 
     cmd_test!(cmd_gateway_content_completeness, "/gateway", |r| {
@@ -3745,7 +3622,7 @@ mod tests {
         cli: &'a crate::cli_bridge::CliProfile,
         astra: &'a astra::Client,
         repo: &'a dyn crate::trace_model::TraceRepository,
-        active_tasks: Option<&'a dashmap::DashMap<String, tokio_util::sync::CancellationToken>>,
+        active_requests: Option<&'a dashmap::DashMap<String, tokio_util::sync::CancellationToken>>,
     ) -> CommandContext<'a> {
         CommandContext {
             astra,
@@ -3756,12 +3633,11 @@ mod tests {
             user_id: "user_1",
             resolved_cli: cli,
             resolved_provider: None,
-            durable_store: None,
             trace_repo: Some(repo),
             project_dirs: &config.project_dirs,
             cli_availability: &[],
             auth_status: None,
-            active_tasks,
+            active_requests,
             codex_app_pool: None,
             gateway_start: chrono::Utc::now(),
         }
@@ -3853,14 +3729,14 @@ mod tests {
         let config = test_config();
         let cli = crate::cli_bridge::CliProfile::default();
         let astra = astra::Client::new("http://localhost:8080", None).unwrap();
-        let active_tasks: dashmap::DashMap<String, tokio_util::sync::CancellationToken> =
+        let active_requests: dashmap::DashMap<String, tokio_util::sync::CancellationToken> =
             dashmap::DashMap::new();
 
         let t1 = seed_running_request(&repo, cli.name(), "chat_kill_all", "live").await;
         let token = tokio_util::sync::CancellationToken::new();
-        active_tasks.insert(t1.as_str().to_string(), token.clone());
+        active_requests.insert(t1.as_str().to_string(), token.clone());
 
-        let ctx = build_ctx_with_repo(&config, &cli, &astra, &repo, Some(&active_tasks)).await;
+        let ctx = build_ctx_with_repo(&config, &cli, &astra, &repo, Some(&active_requests)).await;
         handle_command(&ctx, "/esc all").await.unwrap();
 
         assert!(
@@ -3869,8 +3745,8 @@ mod tests {
              live turn is interrupted — not just mark DB as failed"
         );
         assert!(
-            active_tasks.get(t1.as_str()).is_none(),
-            "cancelled token entry should be removed from active_tasks"
+            active_requests.get(t1.as_str()).is_none(),
+            "cancelled token entry should be removed from active_requests"
         );
     }
 

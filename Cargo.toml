@@ -2,7 +2,6 @@
 resolver = "2"
 members = [
     "crates/astra",
-    "crates/astra-task-store",
     "crates/astra-gateway",
 ]
 
@@ -15,7 +14,6 @@ repository = "https://github.com/XuPeng-SH/astra-suite"
 [workspace.dependencies]
 # Local crates
 astra = { path = "crates/astra" }
-astra-task-store = { path = "crates/astra-task-store" }
 
 async-trait = "0.1"
 
