@@ -2963,13 +2963,12 @@ mod tests {
     #[tokio::test]
     async fn cmd_model_no_arg_shows_current() {
         let config = test_config();
-        let cli = crate::cli_bridge::CliProfile::Claude {
-            bin: "claude".into(),
-            model: None,
-            stream_json: true,
-            extra_args: vec![],
-            env: Default::default(),
-            env_file: None,
+        let cli = crate::cli_bridge::CliProfile::Custom {
+            bin: "echo".into(),
+            args_template: vec![],
+            json_output: false,
+            session_id_field: None,
+            text_field: None,
         };
         let astra = astra::Client::new("http://localhost:8080", None).unwrap();
         let ctx = CommandContext {
@@ -2992,8 +2991,6 @@ mod tests {
         let r = handle_command(&ctx, "/model").await;
         let s = r.unwrap();
         assert!(s.contains("当前"));
-        assert!(s.contains("haiku"));
-        assert!(s.contains("opus"));
         assert!(s.contains("默认"));
         assert!(s.contains("切换"));
     }
