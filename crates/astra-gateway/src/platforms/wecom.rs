@@ -21,11 +21,7 @@ use reqwest::header::CONTENT_TYPE;
 use serde_json::{Value, json};
 #[cfg(not(test))]
 use std::net::IpAddr;
-#[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
 use std::time::Duration;
-use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio::sync::{Mutex, mpsc};
 use tokio_tungstenite::tungstenite::Message;
@@ -36,7 +32,6 @@ const PONG_TIMEOUT_SECS: u64 = 60;
 const MAX_TEXT_LENGTH: usize = 4000;
 const MEDIA_UPLOAD_CHUNK_BYTES: usize = 512 * 1024;
 const MEDIA_UPLOAD_MAX_CHUNKS: usize = 100;
-const MAX_INBOUND_ATTACHMENT_BYTES: u64 = 25 * 1024 * 1024;
 const ATTACHMENT_NAME_KEYS: &[&str] = &[
     "filename",
     "file_name",
@@ -418,7 +413,7 @@ async fn upload_wecom_media(
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
     let bytes = tokio::fs::read(path).await?;
     let filename = attachment.filename_or_default(path, "attachment");
-    let filename = ensure_attachment_extension(
+    let filename = crate::inbound_attachments::ensure_extension(
         &filename,
         attachment.mime_type.as_deref(),
         attachment.kind,
@@ -694,101 +689,6 @@ fn attach_body_feedback(frame: &mut Value, feedback_id: Option<&str>) {
     }
 }
 
-fn ensure_attachment_extension(
-    filename: &str,
-    mime_type: Option<&str>,
-    kind: AttachmentKind,
-    bytes: &[u8],
-) -> String {
-    let Some(ext) = attachment_extension(mime_type, kind, bytes) else {
-        return filename.to_string();
-    };
-    let path = Path::new(filename);
-    let current_ext = path
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .map(|ext| ext.to_ascii_lowercase());
-    if current_ext
-        .as_deref()
-        .is_some_and(|current| current == ext && is_trusted_attachment_extension(current))
-    {
-        return filename.to_string();
-    }
-    if let Some(stem) = path.file_stem().and_then(|stem| stem.to_str())
-        && current_ext
-            .as_deref()
-            .is_some_and(|current| !is_trusted_attachment_extension(current))
-    {
-        return format!("{stem}.{ext}");
-    }
-    format!("{filename}.{ext}")
-}
-
-fn is_trusted_attachment_extension(ext: &str) -> bool {
-    matches!(
-        ext,
-        "png"
-            | "jpg"
-            | "jpeg"
-            | "gif"
-            | "webp"
-            | "pdf"
-            | "html"
-            | "htm"
-            | "txt"
-            | "mp4"
-            | "mov"
-            | "mp3"
-            | "wav"
-            | "m4a"
-            | "ogg"
-    )
-}
-
-fn attachment_extension(
-    mime_type: Option<&str>,
-    kind: AttachmentKind,
-    bytes: &[u8],
-) -> Option<&'static str> {
-    if bytes.starts_with(b"%PDF-") {
-        return Some("pdf");
-    }
-    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
-        return Some("png");
-    }
-    if bytes.starts_with(b"\xff\xd8\xff") {
-        return Some("jpg");
-    }
-    if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
-        return Some("gif");
-    }
-    if bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP") {
-        return Some("webp");
-    }
-    let sample_len = bytes.len().min(512);
-    let sample = String::from_utf8_lossy(&bytes[..sample_len]).to_ascii_lowercase();
-    if sample.contains("<!doctype html") || sample.contains("<html") {
-        return Some("html");
-    }
-    let mime = mime_type.unwrap_or("").trim().to_ascii_lowercase();
-    match mime.as_str() {
-        "text/html" | "application/xhtml+xml" => return Some("html"),
-        "application/pdf" => return Some("pdf"),
-        "image/png" => return Some("png"),
-        "image/jpeg" | "image/jpg" => return Some("jpg"),
-        "image/gif" => return Some("gif"),
-        "image/webp" => return Some("webp"),
-        "text/plain" => return Some("txt"),
-        _ => {}
-    }
-    match kind {
-        AttachmentKind::Video => Some("mp4"),
-        AttachmentKind::Audio => Some("audio"),
-        AttachmentKind::File | AttachmentKind::Unknown => None,
-        AttachmentKind::Image => None,
-    }
-}
-
 async fn handle_wecom_message(
     data: &Value,
     msg_tx: &mpsc::Sender<InboundMessage>,
@@ -973,7 +873,7 @@ fn extract_wecom_attachments(body: &Value) -> Vec<InboundAttachment> {
         let attachment = InboundAttachment {
             kind,
             name: first_string(section, ATTACHMENT_NAME_KEYS)
-                .or_else(|| infer_name_from_url(url.as_deref())),
+                .or_else(|| crate::inbound_attachments::infer_name_from_url(url.as_deref())),
             media_id: first_string(section, ATTACHMENT_MEDIA_ID_KEYS),
             url,
             local_path: None,
@@ -1006,6 +906,10 @@ fn wecom_mixed_items(body: &Value) -> Option<&Vec<Value>> {
         .or_else(|| body["mixed"].as_array())
         .or_else(|| body["mixed"]["item_list"].as_array())
         .or_else(|| body["mixed"]["items"].as_array())
+        .or_else(|| body["mixed"]["itemlist"].as_array())
+        .or_else(|| body["mixed"]["item"].as_array())
+        .or_else(|| body["mixed"]["msg_item"].as_array())
+        .or_else(|| body["mixed"]["message_items"].as_array())
 }
 
 fn wecom_mixed_item_text(item: &Value) -> Option<String> {
@@ -1111,7 +1015,7 @@ fn wecom_mixed_kind(item: &Value) -> Option<WeComMixedKind> {
                 _ => None,
             };
         }
-        return match value.as_str() {
+        let kind = match value.as_str() {
             "text" => Some(WeComMixedKind::Text),
             "image" | "pic" | "picture" => Some(WeComMixedKind::Image),
             "voice" | "audio" => Some(WeComMixedKind::Voice),
@@ -1119,6 +1023,25 @@ fn wecom_mixed_kind(item: &Value) -> Option<WeComMixedKind> {
             "video" => Some(WeComMixedKind::Video),
             _ => None,
         };
+        if kind.is_some() {
+            return kind;
+        }
+        for (suffix, kind) in [
+            ("text", WeComMixedKind::Text),
+            ("image", WeComMixedKind::Image),
+            ("pic", WeComMixedKind::Image),
+            ("picture", WeComMixedKind::Image),
+            ("voice", WeComMixedKind::Voice),
+            ("audio", WeComMixedKind::Voice),
+            ("file", WeComMixedKind::File),
+            ("document", WeComMixedKind::File),
+            ("doc", WeComMixedKind::File),
+            ("video", WeComMixedKind::Video),
+        ] {
+            if value.ends_with(suffix) {
+                return Some(kind);
+            }
+        }
     }
     None
 }
@@ -1192,7 +1115,7 @@ fn attachment_from_wecom_item(
     let url = first_string(media, &url_keys()).or_else(|| first_string(section, &url_keys()));
     let name = first_string(section, ATTACHMENT_NAME_KEYS)
         .or_else(|| first_string(item, name_fallbacks))
-        .or_else(|| infer_name_from_url(url.as_deref()));
+        .or_else(|| crate::inbound_attachments::infer_name_from_url(url.as_deref()));
     InboundAttachment {
         kind,
         name,
@@ -1212,13 +1135,13 @@ pub(crate) async fn prepare_inbound_attachments(
     attachments: &mut Vec<InboundAttachment>,
     msg_id: &str,
 ) -> Option<String> {
-    let mut dir_guard = AttachmentPrepareDirGuard::new(attachment_dir(msg_id));
+    let mut dir_guard =
+        crate::inbound_attachments::PrepareDirGuard::new(crate::inbound_attachments::dir(msg_id));
     let mut failures = Vec::new();
     for (idx, attachment) in attachments.iter().enumerate() {
         if attachment.local_path.is_none() && attachment.url.is_none() {
-            failures.push(format!(
-                "{} 缺少可下载链接",
-                attachment_label(attachment, idx)
+            failures.push(crate::inbound_attachments::missing_url_failure(
+                attachment, idx,
             ));
         }
     }
@@ -1228,71 +1151,11 @@ pub(crate) async fn prepare_inbound_attachments(
     if !attachments.is_empty() {
         dir_guard.disarm();
     }
-    attachment_prepare_response(
+    crate::inbound_attachments::prepare_response(
         before - attachments.len(),
         attachments.is_empty(),
         &failures,
     )
-}
-
-fn attachment_prepare_response(
-    dropped: usize,
-    all_dropped: bool,
-    failures: &[String],
-) -> Option<String> {
-    if dropped == 0 {
-        return None;
-    }
-    let detail = attachment_prepare_failure_detail(failures);
-    Some(if all_dropped {
-        format!("收到附件，但当前无法读取该附件内容。{detail}请重新发送可下载的图片或文件。")
-    } else {
-        format!(
-            "收到 {dropped} 个附件，但无法读取其中部分内容。{detail}请重新发送可下载的图片或文件。"
-        )
-    })
-}
-
-fn attachment_prepare_failure_detail(failures: &[String]) -> String {
-    let mut unique = Vec::new();
-    for failure in failures {
-        if !unique.contains(failure) {
-            unique.push(failure.clone());
-        }
-        if unique.len() >= 3 {
-            break;
-        }
-    }
-    if unique.is_empty() {
-        String::new()
-    } else {
-        format!("原因：{}。", unique.join("；"))
-    }
-}
-
-struct AttachmentPrepareDirGuard(Option<PathBuf>);
-
-impl AttachmentPrepareDirGuard {
-    fn new(dir: PathBuf) -> Self {
-        Self(Some(dir))
-    }
-
-    fn disarm(&mut self) {
-        self.0 = None;
-    }
-}
-
-impl Drop for AttachmentPrepareDirGuard {
-    fn drop(&mut self) {
-        let Some(dir) = self.0.as_ref() else {
-            return;
-        };
-        if let Err(e) = std::fs::remove_dir_all(dir)
-            && e.kind() != std::io::ErrorKind::NotFound
-        {
-            tracing::debug!(dir = %dir.display(), error = %e, "wecom attachment prepare dir cleanup failed");
-        }
-    }
 }
 
 async fn download_wecom_attachments(
@@ -1307,7 +1170,7 @@ async fn download_wecom_attachments(
         return;
     }
 
-    let dir = attachment_dir(msg_id);
+    let dir = crate::inbound_attachments::dir(msg_id);
     let client = match reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .redirect(reqwest::redirect::Policy::none())
@@ -1331,7 +1194,7 @@ async fn download_wecom_attachments(
         if !is_safe_attachment_url(url) {
             failures.push(format!(
                 "{} 链接地址不安全或协议不支持",
-                attachment_label(attachment, idx)
+                crate::inbound_attachments::label(attachment, idx)
             ));
             continue;
         }
@@ -1340,7 +1203,10 @@ async fn download_wecom_attachments(
             Ok(response) => response,
             Err(e) => {
                 tracing::warn!(url, error = %e, "wecom attachment download failed");
-                failures.push(format!("{} 下载失败", attachment_label(attachment, idx)));
+                failures.push(format!(
+                    "{} 下载失败",
+                    crate::inbound_attachments::label(attachment, idx)
+                ));
                 continue;
             }
         };
@@ -1353,21 +1219,23 @@ async fn download_wecom_attachments(
             );
             failures.push(format!(
                 "{} 下载返回 HTTP {}",
-                attachment_label(attachment, idx),
+                crate::inbound_attachments::label(attachment, idx),
                 status.as_u16()
             ));
             continue;
         }
         if let Some(len) = response.content_length()
-            && len > MAX_INBOUND_ATTACHMENT_BYTES
+            && len > crate::inbound_attachments::MAX_INBOUND_ATTACHMENT_BYTES
         {
             tracing::warn!(
                 url,
                 content_length = len,
-                max_bytes = MAX_INBOUND_ATTACHMENT_BYTES,
+                max_bytes = crate::inbound_attachments::MAX_INBOUND_ATTACHMENT_BYTES,
                 "wecom attachment too large"
             );
-            failures.push(attachment_too_large_failure(attachment, idx));
+            failures.push(crate::inbound_attachments::too_large_failure(
+                attachment, idx,
+            ));
             continue;
         }
         let response_mime = response
@@ -1377,14 +1245,24 @@ async fn download_wecom_attachments(
             .and_then(normalize_content_type);
 
         let raw_bytes = match response.bytes().await {
-            Ok(bytes) if bytes.len() as u64 <= MAX_INBOUND_ATTACHMENT_BYTES => bytes.to_vec(),
+            Ok(bytes)
+                if bytes.len() as u64
+                    <= crate::inbound_attachments::MAX_INBOUND_ATTACHMENT_BYTES =>
+            {
+                bytes.to_vec()
+            }
             Ok(_) => {
-                failures.push(attachment_too_large_failure(attachment, idx));
+                failures.push(crate::inbound_attachments::too_large_failure(
+                    attachment, idx,
+                ));
                 continue;
             }
             Err(e) => {
                 tracing::warn!(url, error = %e, "wecom attachment body read failed");
-                failures.push(format!("{} 读取失败", attachment_label(attachment, idx)));
+                failures.push(format!(
+                    "{} 读取失败",
+                    crate::inbound_attachments::label(attachment, idx)
+                ));
                 continue;
             }
         };
@@ -1398,66 +1276,41 @@ async fn download_wecom_attachments(
                 Ok(bytes) => bytes,
                 Err(e) => {
                     tracing::warn!(url, error = %e, "wecom attachment decrypt failed");
-                    failures.push(format!("{} 解密失败", attachment_label(attachment, idx)));
+                    failures.push(format!(
+                        "{} 解密失败",
+                        crate::inbound_attachments::label(attachment, idx)
+                    ));
                     continue;
                 }
             }
         } else {
             raw_bytes
         };
-        if let Some(mime_type) = detect_mime_from_bytes(&bytes, attachment.mime_type.as_deref()) {
+        if let Some(mime_type) = crate::inbound_attachments::detect_mime_from_bytes(
+            &bytes,
+            attachment.mime_type.as_deref(),
+        ) {
             attachment.mime_type = Some(mime_type.to_string());
         }
 
-        if let Err(e) = ensure_private_dir(&dir).await {
+        if let Err(e) = crate::inbound_attachments::ensure_private_dir(&dir).await {
             tracing::warn!(dir = %dir.display(), error = %e, "wecom attachment dir create failed");
             failures.push("附件目录创建失败".into());
             return;
         }
-        let filename = attachment_filename(attachment, idx, &bytes);
+        let filename = crate::inbound_attachments::filename(attachment, idx, &bytes);
         let path = dir.join(filename);
-        if let Err(e) = write_private_file(&path, &bytes).await {
+        if let Err(e) = crate::inbound_attachments::write_private_file(&path, &bytes).await {
             tracing::warn!(path = %path.display(), error = %e, "wecom attachment write failed");
-            failures.push(format!("{} 写入失败", attachment_label(attachment, idx)));
+            failures.push(format!(
+                "{} 写入失败",
+                crate::inbound_attachments::label(attachment, idx)
+            ));
             continue;
         }
         attachment.size_bytes.get_or_insert(bytes.len() as u64);
         attachment.local_path = Some(path.to_string_lossy().to_string());
     }
-}
-
-fn attachment_too_large_failure(attachment: &InboundAttachment, idx: usize) -> String {
-    format!(
-        "{} 超过大小上限 {}MB",
-        attachment_label(attachment, idx),
-        MAX_INBOUND_ATTACHMENT_BYTES / 1024 / 1024
-    )
-}
-
-async fn ensure_private_dir(dir: &Path) -> std::io::Result<()> {
-    tokio::fs::create_dir_all(dir).await?;
-    #[cfg(unix)]
-    if let Err(e) = tokio::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).await {
-        tracing::debug!(dir = %dir.display(), error = %e, "wecom attachment dir chmod failed");
-    }
-    Ok(())
-}
-
-async fn write_private_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    let mut file = tokio::fs::OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .open(path)
-        .await?;
-    #[cfg(unix)]
-    if let Err(e) = file
-        .set_permissions(std::fs::Permissions::from_mode(0o600))
-        .await
-    {
-        tracing::debug!(path = %path.display(), error = %e, "wecom attachment chmod failed");
-    }
-    file.write_all(bytes).await
 }
 
 fn is_safe_attachment_url(url: &str) -> bool {
@@ -1568,58 +1421,6 @@ fn decode_wecom_aes_key(aes_key: &str) -> Result<Vec<u8>, String> {
         .map_err(|e| format!("invalid base64 aeskey: {e}"))
 }
 
-fn attachment_dir(msg_id: &str) -> PathBuf {
-    run_dir()
-        .join(".attachments")
-        .join(sanitize_path_part(msg_id))
-}
-
-fn run_dir() -> PathBuf {
-    std::env::var_os("GATEWAY_RUN_DIR")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".astra-gateway")))
-        .unwrap_or_else(|| PathBuf::from(".astra-gateway"))
-}
-
-fn attachment_filename(attachment: &InboundAttachment, idx: usize, bytes: &[u8]) -> String {
-    let inferred_name = infer_name_from_url(attachment.url.as_deref());
-    let base = attachment
-        .name
-        .as_deref()
-        .or(inferred_name.as_deref())
-        .map(sanitize_path_part)
-        .filter(|name| !name.is_empty())
-        .unwrap_or_else(|| format!("attachment-{idx}"));
-    let filename = ensure_attachment_extension(
-        &base,
-        attachment.mime_type.as_deref(),
-        attachment.kind,
-        bytes,
-    );
-    format!("{}-{}", idx + 1, filename)
-}
-
-fn attachment_label(attachment: &InboundAttachment, idx: usize) -> String {
-    attachment
-        .name
-        .as_deref()
-        .filter(|name| !name.trim().is_empty())
-        .map(|name| format!("附件 `{}`", name.trim()))
-        .unwrap_or_else(|| format!("第 {} 个附件", idx + 1))
-}
-
-fn sanitize_path_part(input: &str) -> String {
-    input
-        .chars()
-        .map(|ch| match ch {
-            'a'..='z' | 'A'..='Z' | '0'..='9' | '.' | '-' | '_' => ch,
-            _ => '_',
-        })
-        .collect::<String>()
-        .trim_matches('_')
-        .to_string()
-}
-
 fn first_string(value: &Value, keys: &[&str]) -> Option<String> {
     for key in keys {
         if let Some(s) = value.get(*key).and_then(Value::as_str) {
@@ -1659,30 +1460,6 @@ fn normalize_content_type(value: &str) -> Option<String> {
     }
 }
 
-fn detect_mime_from_bytes<'a>(bytes: &[u8], fallback: Option<&'a str>) -> Option<&'a str> {
-    if bytes.starts_with(b"%PDF-") {
-        return Some("application/pdf");
-    }
-    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
-        return Some("image/png");
-    }
-    if bytes.starts_with(b"\xff\xd8\xff") {
-        return Some("image/jpeg");
-    }
-    if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
-        return Some("image/gif");
-    }
-    if bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP") {
-        return Some("image/webp");
-    }
-    let sample_len = bytes.len().min(512);
-    let sample = String::from_utf8_lossy(&bytes[..sample_len]).to_ascii_lowercase();
-    if sample.contains("<!doctype html") || sample.contains("<html") {
-        return Some("text/html");
-    }
-    fallback
-}
-
 fn first_u64(value: &Value, keys: &[&str]) -> Option<u64> {
     for key in keys {
         if let Some(n) = value.get(*key).and_then(Value::as_u64) {
@@ -1707,16 +1484,6 @@ fn url_keys() -> [&'static str; 7] {
         "picurl",
         "image_url",
     ]
-}
-
-fn infer_name_from_url(url: Option<&str>) -> Option<String> {
-    let path = url?.split('?').next().unwrap_or_default();
-    let name = path.rsplit('/').next()?.trim();
-    if name.is_empty() {
-        None
-    } else {
-        Some(name.to_string())
-    }
 }
 
 fn parse_feedback_event(body: &Value) -> Option<FeedbackEvent> {
@@ -2090,6 +1857,50 @@ mod tests {
     }
 
     #[test]
+    fn parse_mixed_item_container_and_prefixed_msgtype() {
+        let data: Value = serde_json::from_str(
+            r#"{
+            "cmd": "aibot_msg_callback",
+            "headers": {"req_id": "req-mixed-prefixed"},
+            "body": {
+                "msgid": "mixed-prefixed",
+                "from": {"userid": "u1"},
+                "chatid": "c1",
+                "chattype": "single",
+                "msgtype": "mixed",
+                "mixed": {
+                    "item": [
+                        {"msgtype": "mixed_text", "text": {"content": "这是什么菜"}},
+                        {"msgtype": "mixed_image", "image": {
+                            "media": {
+                                "url": "https://cdn.example.com/dish.jpg",
+                                "media_id": "media-dish",
+                                "mime_type": "image/jpeg"
+                            }
+                        }}
+                    ]
+                }
+            }
+        }"#,
+        )
+        .unwrap();
+
+        let (tx, mut rx) = mpsc::channel(10);
+        let mut dedup = MessageDeduplicator::new();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            handle_wecom_message(&data, &tx, &mut dedup).await;
+            let msg = rx.recv().await.unwrap();
+            assert_eq!(msg.text, "这是什么菜");
+            assert_eq!(msg.attachments.len(), 1);
+            assert_eq!(msg.attachments[0].media_id.as_deref(), Some("media-dish"));
+        });
+    }
+
+    #[test]
     fn attachment_filename_prefixes_index_to_avoid_collisions() {
         let attachment = InboundAttachment {
             kind: AttachmentKind::Image,
@@ -2103,11 +1914,11 @@ mod tests {
         };
 
         assert_eq!(
-            attachment_filename(&attachment, 0, b"\x89PNG\r\n\x1a\n"),
+            crate::inbound_attachments::filename(&attachment, 0, b"\x89PNG\r\n\x1a\n"),
             "1-shot.png"
         );
         assert_eq!(
-            attachment_filename(&attachment, 1, b"\x89PNG\r\n\x1a\n"),
+            crate::inbound_attachments::filename(&attachment, 1, b"\x89PNG\r\n\x1a\n"),
             "2-shot.png"
         );
     }
@@ -2126,7 +1937,7 @@ mod tests {
         };
 
         assert_eq!(
-            attachment_filename(&attachment, 0, b"\x89PNG\r\n\x1a\nrest"),
+            crate::inbound_attachments::filename(&attachment, 0, b"\x89PNG\r\n\x1a\nrest"),
             "1-7655903806783167482.png"
         );
     }
