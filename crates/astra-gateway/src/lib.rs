@@ -8,6 +8,7 @@ pub mod dedup;
 pub mod gateway_context;
 pub mod github_tokens;
 pub mod health;
+pub(crate) mod inbound_attachments;
 pub mod markdown;
 pub mod mcp;
 pub mod model_vision;
