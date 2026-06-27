@@ -13,6 +13,7 @@ const BUILTIN_SUPPORTED_MODELS: &[&str] = &[
     "o3",
     "o4",
     "claude-3",
+    "claude-fable-5",
     "claude-opus-4",
     "claude-sonnet-4",
     "qwen2.5-vl",
@@ -71,6 +72,7 @@ mod tests {
     fn known_vision_models_are_supported() {
         for model in [
             "claude-sonnet-4-20250514",
+            "claude-fable-5-20260609",
             "qwen2.5-vl-72b-instruct",
             "gpt-5.5",
         ] {
