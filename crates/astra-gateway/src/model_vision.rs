@@ -6,60 +6,34 @@ pub enum VisionCapability {
     Unknown,
 }
 
-#[derive(Debug, Clone, Copy)]
-struct ModelVisionRule {
-    pattern: &'static str,
-    capability: VisionCapability,
-}
-
-const MODEL_VISION_RULES: &[ModelVisionRule] = &[
-    // OpenAI multimodal families.
-    supported("gpt-4o"),
-    supported("gpt-4.1"),
-    supported("gpt-5"),
-    supported("o3"),
-    supported("o4"),
-    // Anthropic Claude 3+ families.
-    supported("claude-3"),
-    supported("claude-opus-4"),
-    supported("claude-sonnet-4"),
-    // Chinese multimodal model families.
-    supported("qwen2.5-vl"),
-    supported("qwen2-vl"),
-    supported("qwen-vl"),
-    supported("qvq"),
-    supported("qwen-omni"),
-    supported("glm-4v"),
-    supported("glm-v"),
-    supported("glm-vision"),
-    supported("kimi-vl"),
-    // Known text-only families commonly exposed through Anthropic-compatible CLIs.
-    unsupported("qwen3"),
-    unsupported("qwen-max"),
-    unsupported("deepseek"),
-    unsupported("glm-5"),
-    unsupported("glm-4.5"),
-    unsupported("kimi-k2"),
-    unsupported("minimax-m"),
+const BUILTIN_SUPPORTED_MODELS: &[&str] = &[
+    "gpt-4o",
+    "gpt-4.1",
+    "gpt-5",
+    "o3",
+    "o4",
+    "claude-3",
+    "claude-opus-4",
+    "claude-sonnet-4",
+    "qwen2.5-vl",
+    "qwen2-vl",
+    "qwen-vl",
+    "qvq",
+    "qwen-omni",
+    "glm-4v",
+    "glm-v",
+    "glm-vision",
+    "kimi-vl",
 ];
-
-const fn supported(pattern: &'static str) -> ModelVisionRule {
-    ModelVisionRule {
-        pattern,
-        capability: VisionCapability::Supported,
-    }
-}
-
-const fn unsupported(pattern: &'static str) -> ModelVisionRule {
-    ModelVisionRule {
-        pattern,
-        capability: VisionCapability::Unsupported,
-    }
-}
-
-pub fn vision_capability(model: Option<&str>) -> VisionCapability {
-    vision_capability_with_supported_models(model, &[])
-}
+const BUILTIN_UNSUPPORTED_MODELS: &[&str] = &[
+    "qwen3",
+    "qwen-max",
+    "deepseek",
+    "glm-5",
+    "glm-4.5",
+    "kimi-k2",
+    "minimax-m",
+];
 
 pub fn vision_capability_with_supported_models(
     model: Option<&str>,
@@ -69,17 +43,24 @@ pub fn vision_capability_with_supported_models(
         return VisionCapability::Unknown;
     };
     let normalized = model.to_ascii_lowercase();
-    if supported_models.iter().any(|pattern| {
-        let pattern = pattern.trim().to_ascii_lowercase();
-        !pattern.is_empty() && normalized.contains(&pattern)
-    }) {
+    if supported_models
+        .iter()
+        .map(|pattern| pattern.trim().to_ascii_lowercase())
+        .any(|pattern| !pattern.is_empty() && normalized.contains(&pattern))
+        || BUILTIN_SUPPORTED_MODELS
+            .iter()
+            .any(|pattern| normalized.contains(pattern))
+    {
         return VisionCapability::Supported;
     }
-    MODEL_VISION_RULES
+    if BUILTIN_UNSUPPORTED_MODELS
         .iter()
-        .find(|rule| normalized.contains(rule.pattern))
-        .map(|rule| rule.capability)
-        .unwrap_or(VisionCapability::Unknown)
+        .any(|pattern| normalized.contains(pattern))
+    {
+        VisionCapability::Unsupported
+    } else {
+        VisionCapability::Unknown
+    }
 }
 
 #[cfg(test)]
@@ -88,43 +69,26 @@ mod tests {
 
     #[test]
     fn known_vision_models_are_supported() {
-        assert_eq!(
-            vision_capability(Some("claude-sonnet-4-20250514")),
-            VisionCapability::Supported
-        );
-        assert_eq!(
-            vision_capability(Some("qwen2.5-vl-72b-instruct")),
-            VisionCapability::Supported
-        );
-        assert_eq!(
-            vision_capability(Some("gpt-5.5")),
-            VisionCapability::Supported
-        );
+        for model in [
+            "claude-sonnet-4-20250514",
+            "qwen2.5-vl-72b-instruct",
+            "gpt-5.5",
+        ] {
+            assert_eq!(
+                vision_capability_with_supported_models(Some(model), &[]),
+                VisionCapability::Supported
+            );
+        }
     }
 
     #[test]
     fn known_text_only_models_are_unsupported() {
-        assert_eq!(
-            vision_capability(Some("qwen3.7-max")),
-            VisionCapability::Unsupported
-        );
-        assert_eq!(
-            vision_capability(Some("deepseek-v4-pro")),
-            VisionCapability::Unsupported
-        );
-        assert_eq!(
-            vision_capability(Some("glm-5.1")),
-            VisionCapability::Unsupported
-        );
-    }
-
-    #[test]
-    fn unknown_or_default_models_are_unknown() {
-        assert_eq!(vision_capability(None), VisionCapability::Unknown);
-        assert_eq!(
-            vision_capability(Some("vendor-model")),
-            VisionCapability::Unknown
-        );
+        for model in ["qwen3.7-max", "deepseek-v4-pro", "glm-5.1"] {
+            assert_eq!(
+                vision_capability_with_supported_models(Some(model), &[]),
+                VisionCapability::Unsupported
+            );
+        }
     }
 
     #[test]

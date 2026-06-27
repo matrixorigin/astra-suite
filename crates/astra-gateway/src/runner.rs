@@ -48,7 +48,6 @@ const INITIAL_ACK_DELAY: Duration = Duration::from_secs(3);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(25);
 const WECOM_STREAM_CUTOFF: Duration = Duration::from_secs(9 * 60 + 30);
 const WECOM_POST_STREAM_HEARTBEAT: Duration = Duration::from_secs(120);
-const ATTACHMENT_PREPARE_CONCURRENCY: usize = 4;
 #[allow(dead_code)]
 const PROGRESSIVE_FLUSH_INTERVAL: Duration = Duration::from_secs(8);
 const PROGRESSIVE_MIN_CHARS: usize = 200;
@@ -394,7 +393,6 @@ pub struct GatewayRunner {
     queue_senders:
         tokio::sync::Mutex<HashMap<ConversationKey, tokio::sync::mpsc::Sender<QueuedRequest>>>,
     global_run_limiter: Arc<tokio::sync::Semaphore>,
-    attachment_prepare_limiter: Arc<tokio::sync::Semaphore>,
     cli_availability: Vec<(String, cli_bridge::CliAvailability)>,
     /// Tracks consecutive auth failures per CLI profile name.
     /// Value: (failure_count, last_failure_time).
@@ -449,7 +447,6 @@ struct QueuedRequest {
     msg: InboundMessage,
     conversation: ConversationKey,
     trace: Option<OutboxDeliveryTrace>,
-    attachment_prepare: Option<tokio::task::JoinHandle<(InboundMessage, Option<String>)>>,
 }
 
 struct AttachmentCleanup {
@@ -483,14 +480,6 @@ impl Drop for AttachmentCleanup {
             {
                 tracing::debug!(dir = %parent.display(), error = %e, "attachment directory cleanup failed");
             }
-        }
-    }
-}
-
-impl Drop for QueuedRequest {
-    fn drop(&mut self) {
-        if let Some(handle) = self.attachment_prepare.take() {
-            handle.abort();
         }
     }
 }
@@ -604,9 +593,6 @@ impl GatewayRunner {
             trace_repo,
             queue_senders: tokio::sync::Mutex::new(HashMap::new()),
             global_run_limiter: Arc::new(tokio::sync::Semaphore::new(max_concurrent_runs)),
-            attachment_prepare_limiter: Arc::new(tokio::sync::Semaphore::new(
-                ATTACHMENT_PREPARE_CONCURRENCY,
-            )),
             cli_availability,
             auth_failures: Arc::new(dashmap::DashMap::new()),
             shared_auth,
@@ -962,10 +948,6 @@ impl GatewayRunner {
             }
             return Ok(Some(response));
         }
-        if let Some(response) = image_attachment_guard_message(msg, &cmd_ctx).await {
-            return Ok(Some(response));
-        }
-
         // Not a slash command — needs CLI (slow path)
         Err(msg.clone())
     }
@@ -3034,30 +3016,10 @@ impl GatewayRunner {
         } else {
             None
         };
-        let attachment_prepare = if msg.attachments.is_empty() {
-            None
-        } else {
-            let mut prepare_msg = msg.clone();
-            let limiter = self.attachment_prepare_limiter.clone();
-            Some(tokio::spawn(async move {
-                let Ok(_permit) = limiter.acquire_owned().await else {
-                    return (
-                        prepare_msg,
-                        Some(
-                            "收到附件，但当前无法读取该附件内容。请重新发送可下载的图片或文件。"
-                                .to_string(),
-                        ),
-                    );
-                };
-                let response = prepare_inbound_attachments(&mut prepare_msg).await;
-                (prepare_msg, response)
-            }))
-        };
         QueuedRequest {
             msg,
             conversation,
             trace,
-            attachment_prepare,
         }
     }
 
@@ -3117,7 +3079,7 @@ impl GatewayRunner {
         cli_resp_tx: tokio::sync::mpsc::Sender<CliResponse>,
     ) {
         loop {
-            let mut queued = match tokio::time::timeout(CONVERSATION_QUEUE_IDLE_TIMEOUT, rx.recv())
+            let queued = match tokio::time::timeout(CONVERSATION_QUEUE_IDLE_TIMEOUT, rx.recv())
                 .await
             {
                 Ok(Some(queued)) => queued,
@@ -3135,19 +3097,6 @@ impl GatewayRunner {
                 }
             };
             if !self.should_execute_queued(&queued).await {
-                continue;
-            }
-            if let Some(text) = self.finish_attachment_prepare(&mut queued).await {
-                let outbound = self
-                    .outbound_response(
-                        queued.trace.as_ref(),
-                        queued.msg.platform,
-                        &queued.msg.chat_id,
-                        queued.msg.reply_token.clone(),
-                        text,
-                    )
-                    .await;
-                let _ = cli_resp_tx.send(outbound).await;
                 continue;
             }
             let Ok(_permit) = self.global_run_limiter.clone().acquire_owned().await else {
@@ -3236,20 +3185,6 @@ impl GatewayRunner {
                 // Execute on DB error rather than silently dropping the request
                 tracing::warn!(error = %e, "failed to verify queued request status; executing anyway");
                 true
-            }
-        }
-    }
-
-    async fn finish_attachment_prepare(&self, queued: &mut QueuedRequest) -> Option<String> {
-        let handle = queued.attachment_prepare.take()?;
-        match handle.await {
-            Ok((msg, response)) => {
-                queued.msg = msg;
-                response
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "attachment preparation task failed");
-                Some("收到附件，但当前无法读取该附件内容。请重新发送可下载的图片或文件。".into())
             }
         }
     }
@@ -4317,48 +4252,13 @@ async fn prepare_inbound_attachments(msg: &mut InboundMessage) -> Option<String>
     if msg.attachments.is_empty() {
         return None;
     }
-
-    let result = match msg.platform {
+    match msg.platform {
         "wecom" => {
             crate::platforms::wecom::prepare_inbound_attachments(&mut msg.attachments, &msg.msg_id)
                 .await
         }
-        _ => crate::platforms::wecom::AttachmentPrepareResult {
-            dropped: 0,
-            failures: Vec::new(),
-        },
-    };
-    if result.dropped == 0 {
-        return None;
+        _ => None,
     }
-
-    let detail = attachment_prepare_failure_detail(&result.failures);
-    if msg.attachments.is_empty() {
-        Some(format!(
-            "收到附件，但当前无法读取该附件内容。{detail}请重新发送可下载的图片或文件。"
-        ))
-    } else {
-        Some(format!(
-            "收到 {} 个附件，但无法读取其中部分内容。{detail}请重新发送可下载的图片或文件。",
-            result.dropped
-        ))
-    }
-}
-
-fn attachment_prepare_failure_detail(failures: &[String]) -> String {
-    if failures.is_empty() {
-        return String::new();
-    }
-    let mut unique = Vec::new();
-    for failure in failures {
-        if !unique.contains(failure) {
-            unique.push(failure.clone());
-        }
-        if unique.len() >= 3 {
-            break;
-        }
-    }
-    format!("原因：{}。", unique.join("；"))
 }
 
 fn message_text_for_cli(msg: &InboundMessage) -> String {
