@@ -13,18 +13,19 @@ Astra is an AI agent runtime with planning, memory, tool orchestration, and mult
 A production-ready **chat-platform gateway** that bridges messaging apps to AI agent CLIs.
 
 ```
-WeChat / WeCom / (Feishu, WhatsApp planned)
+WeChat / WeCom / WhatsApp
         ↕
    Astra Gateway
         ↕
-Claude Code · Codex · Astra · Custom CLI
+Claude Code · Codex · Copilot · Astra · Custom CLI
 ```
 
 **Highlights:**
 
 - **Zero-config start** — SQLite storage, 3 commands to deploy
-- **Multi-backend** — switch between Claude, Codex, Astra at runtime (`/cli`, `/model`)
-- **Autonomous scheduling** — cron jobs that invoke the agent ("每晚 10 点检查 PR 列表并总结")
+- **Multi-backend** — switch between Claude, Codex, Copilot, Astra at runtime (`/cli`, `/model`)
+- **Gateway tools** — MCP-backed reminders, cron jobs, and file sending from the agent
+- **Attachments** — receive images/files from chat platforms and send local files back
 - **Full observability** — per-request trace, audit chain, durable outbox with retry
 - **Multi-user** — per-user sessions, access control, group chat isolation
 
@@ -91,9 +92,9 @@ make clean          # remove all build artifacts
 ## Roadmap
 
 - [x] Astra Gateway (WeChat + WeCom)
+- [x] WhatsApp platform adapters
+- [x] Copilot CLI backend
 - [ ] Feishu (飞书) platform adapter
-- [ ] WhatsApp platform adapter
-- [ ] Copilot CLI backend
 - [ ] `astra-bench` — agent evaluation harness
 - [ ] `astra-sync` — cross-device session sync
 

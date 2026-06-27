@@ -1,9 +1,9 @@
 # astra-gateway
 
-A chat-platform gateway that bridges WeChat / WeCom (and more) to AI agent CLIs —
+A chat-platform gateway that bridges WeChat / WeCom / WhatsApp to AI agent CLIs —
 **Claude Code**, **Codex**, **GitHub Copilot CLI**, and **Astra**. Point it at your chat
 bot and talk to an agent CLI from any chat app, with per-user sessions,
-scheduled tasks, and full observability.
+attachments, scheduled tasks, and full observability.
 
 ## Features
 
@@ -12,13 +12,15 @@ scheduled tasks, and full observability.
 | **Multi-CLI**      | claude / codex / copilot / astra — switch at runtime via `/cli`. |
 | **Multi-model**    | `/model haiku\|sonnet\|opus\|minimax\|deepseek\|qwen\|glm` |
 | **Sessions**       | Per-user isolation, auto-reset (daily / idle), history, switch. |
-| **Cron & tasks**   | Recurring jobs and one-time reminders. |
+| **MCP tools**      | Agent-callable reminders, cron jobs, workspace listing, and file sending. |
+| **Cron & tasks**   | Recurring jobs and one-time reminders, via slash commands or MCP tools. |
 | **Workspace**      | `/workspace <path>` to switch project dirs, auto-discovery from configured roots. |
 | **Observability**  | `/trace`, `/running`, `/inspect` (harness), `/audit` (decision chain), `/usage` (cost). |
 | **Skills**         | Built-in gateway skill + user-defined `.md` files, agent self-authoring. |
 | **Access control** | `allowlist` / `open` / `disabled` per gateway. |
 | **Groups**         | Per-user session isolation, `@mention` filtering. |
-| **WeChat UX**      | Typing indicator, markdown rendering, voice transcription, media. |
+| **Attachments**    | Receive chat images/files, guard image input by model vision support, send local files back. |
+| **Chat UX**        | Typing indicator, markdown rendering, voice transcription, feedback, media. |
 | **Reliability**    | Per-conversation queues, durable outbox, traceable retry / cancel, bounded parallelism. |
 
 ## Quick start
@@ -46,6 +48,7 @@ astra-gateway stop
 |---------------------------|-------------|
 | `astra-gateway init`      | Write `~/.astra-gateway/config.yaml` (WeCom + Claude/Bedrock + SQLite, 0600) |
 | `astra-gateway weixin login` | QR-code login for WeChat personal accounts |
+| `astra-gateway whatsapp login` | QR-code login for WhatsApp Web sidecar |
 | `astra-gateway start`     | Daemonize and run in background (idempotent) |
 | `astra-gateway status`    | Show whether the daemon is running, plus paths |
 | `astra-gateway stop`      | Graceful SIGTERM, escalates to SIGKILL after 15s |
@@ -68,6 +71,11 @@ astra-gateway stop
 
 Users switch at runtime with `/cli claude`, `/cli codex`, `/cli copilot`, etc.
 
+Gateway automatically writes per-conversation MCP config for Claude/Codex-style
+persistent backends when supported. The agent sees gateway tools such as
+`gateway_send_attachment`, cron scheduling, reminders, and workspace listing.
+State-changing model-generated tool calls are controlled by `action_policy`.
+
 ### Storage backends
 
 | Backend     | Use when                                | Supports |
@@ -77,6 +85,21 @@ Users switch at runtime with `/cli claude`, `/cli codex`, `/cli copilot`, etc.
 | `matrixone` | Same as `mysql` (MySQL-protocol alias)  | Same as sqlite |
 | `file`      | Local dev / testing only                | Sessions, cron, reminders, usage |
 | `none`      | Ephemeral — state lost on restart       | — |
+
+## Platforms
+
+| Platform       | Notes |
+|----------------|-------|
+| `wecom`        | Enterprise WeChat AI Bot over WebSocket. Supports text, feedback, streaming, and media. |
+| `weixin`       | WeChat personal account through iLink Bot API. Run `astra-gateway weixin login` first. |
+| `whatsapp`     | WhatsApp Business Cloud API webhook adapter. |
+| `whatsapp_web` | WhatsApp Web via bundled Baileys sidecar. Run `astra-gateway whatsapp login` first. |
+
+Inbound attachments are downloaded into the gateway run directory and passed to
+the selected CLI as local files. Images are accepted only when the current model
+is known or configured as vision-capable; unknown/text-only models get a clear
+chat response instead of a backend error. Outbound file sending is exposed to
+agents through `gateway_send_attachment`.
 
 ## User commands
 
@@ -133,9 +156,53 @@ sensitive (`init` chmods it to 0600).
 Environment variables (see [.env.example](.env.example)) still override
 YAML — useful for deployment-specific tweaks.
 
+### System prompt
+
+Gateway builds a system prompt for every normal agent turn. It includes the
+current user/chat context and available gateway capabilities. Add local
+instructions in either of these ways:
+
+```yaml
+system_prompt_extra: |
+  Extra gateway instructions here.
+```
+
+If `system_prompt_extra` is absent, gateway loads `system_prompt_extra.md` from
+the same directory as the config file. The YAML field wins when both exist.
+
+### Model vision allowlist
+
+Gateway has built-in model patterns for common vision-capable and text-only
+models. Add local overrides when a deployed model id is not covered:
+
+```yaml
+vision_models:
+  - qwen2.5-vl
+  - my-vision-model
+```
+
+Unknown image-capability models are treated as unsupported to avoid sending
+image files to backends that may reject them.
+
+### Per-user GitHub tokens
+
+Map chat user ids to GitHub tokens when the agent should operate GitHub as that
+user. The matched token is injected into CLI processes as `GH_TOKEN` and
+`GITHUB_TOKEN`. `default` is used when no user-specific entry exists.
+
+```yaml
+github_tokens:
+  default:
+    token: ghp_xxx
+    remark: matrix-meow
+  wom-o3DwAALoVyBSBHfVV03KgIa8BXVw:
+    token: ghp_xxx
+    remark: aptend
+```
+
 Reasoning blocks are opt-in per user. `/reasoning on` or
 `/cli <name> thinking-chain` forwards only reasoning/thinking events that the
-selected CLI explicitly exposes; WeChat renders them as separate text blocks.
+selected CLI explicitly exposes; chat platforms render them as separate text blocks.
 
 ## Development
 
@@ -159,7 +226,7 @@ cargo build --release -p astra-gateway
 ## Architecture
 
 ```
-WeChat/WeCom ──→ PlatformAdapter ──→ GatewayRunner
+WeChat/WeCom/WhatsApp ──→ PlatformAdapter ──→ GatewayRunner
                                          │
                     ┌────────────────────┤
                     ↓                    ↓
@@ -174,7 +241,7 @@ WeChat/WeCom ──→ PlatformAdapter ──→ GatewayRunner
                                          ↓
               ←── cli_resp channel ←─────┘
                     ↓
-              PlatformAdapter.send_text() ──→ WeChat/WeCom
+              PlatformAdapter.send_text() ──→ WeChat/WeCom/WhatsApp
 ```
 
 Slash commands respond instantly; regular chat requests serialize per
