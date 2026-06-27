@@ -11,11 +11,22 @@ type Aes128EcbDec = ecb::Decryptor<aes::Aes128>;
 const BLOCK_SIZE: usize = 16;
 const CDN_BASE_URL: &str = "https://novac2c.cdn.weixin.qq.com/c2c";
 
-/// Parse AES key from base64-encoded value.
+/// Parse AES key from iLink media metadata.
 /// Handles two formats:
+/// - 32 hex chars (direct key)
 /// - 16 raw bytes (direct key)
 /// - 32 bytes that are a hex string (decode hex → 16 bytes)
 pub fn parse_aes_key(aes_key_b64: &str) -> Result<[u8; 16], String> {
+    let aes_key_b64 = aes_key_b64.trim();
+    if aes_key_b64.len() == 32 && aes_key_b64.chars().all(|c| c.is_ascii_hexdigit()) {
+        let bytes = hex::decode(aes_key_b64).map_err(|e| format!("hex decode: {e}"))?;
+        if bytes.len() == 16 {
+            let mut key = [0u8; 16];
+            key.copy_from_slice(&bytes);
+            return Ok(key);
+        }
+    }
+
     use base64::Engine;
     let decoded = base64::engine::general_purpose::STANDARD
         .decode(aes_key_b64)
@@ -195,6 +206,14 @@ mod tests {
         let key = [0x42u8; 16];
         let b64 = base64::engine::general_purpose::STANDARD.encode(key);
         let parsed = parse_aes_key(&b64).unwrap();
+        assert_eq!(parsed, key);
+    }
+
+    #[test]
+    fn parse_key_direct_hex_32_chars() {
+        let key = [0x42u8; 16];
+        let hex_str = hex::encode(key);
+        let parsed = parse_aes_key(&hex_str).unwrap();
         assert_eq!(parsed, key);
     }
 

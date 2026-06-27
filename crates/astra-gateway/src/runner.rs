@@ -449,41 +449,6 @@ struct QueuedRequest {
     trace: Option<OutboxDeliveryTrace>,
 }
 
-struct AttachmentCleanup {
-    paths: Vec<std::path::PathBuf>,
-}
-
-impl AttachmentCleanup {
-    fn new(msg: &InboundMessage) -> Self {
-        let paths = msg
-            .attachments
-            .iter()
-            .filter_map(|attachment| attachment.local_path.as_deref())
-            .map(std::path::PathBuf::from)
-            .collect();
-        Self { paths }
-    }
-}
-
-impl Drop for AttachmentCleanup {
-    fn drop(&mut self) {
-        for path in &self.paths {
-            if let Err(e) = std::fs::remove_file(path)
-                && e.kind() != std::io::ErrorKind::NotFound
-            {
-                tracing::debug!(path = %path.display(), error = %e, "attachment cleanup failed");
-            }
-            if let Some(parent) = path.parent()
-                && let Err(e) = std::fs::remove_dir(parent)
-                && e.kind() != std::io::ErrorKind::NotFound
-                && e.kind() != std::io::ErrorKind::DirectoryNotEmpty
-            {
-                tracing::debug!(dir = %parent.display(), error = %e, "attachment directory cleanup failed");
-            }
-        }
-    }
-}
-
 #[derive(Debug, Clone)]
 struct OutboxDeliveryTrace {
     trace_id: TraceId,
@@ -975,7 +940,6 @@ impl GatewayRunner {
             return None;
         }
         if let Some(text) = prepare_inbound_attachments(&mut msg).await {
-            let _attachment_cleanup = AttachmentCleanup::new(&msg);
             return Some(
                 self.outbound_response(
                     trace.as_ref(),
@@ -987,7 +951,6 @@ impl GatewayRunner {
                 .await,
             );
         }
-        let _attachment_cleanup = AttachmentCleanup::new(&msg);
 
         // Group chat: per-user session isolation
         let effective_chat_id = if msg.chat_type == crate::platforms::ChatType::Group
@@ -4257,6 +4220,10 @@ async fn prepare_inbound_attachments(msg: &mut InboundMessage) -> Option<String>
             crate::platforms::wecom::prepare_inbound_attachments(&mut msg.attachments, &msg.msg_id)
                 .await
         }
+        "weixin" => {
+            crate::platforms::weixin::prepare_inbound_attachments(&mut msg.attachments, &msg.msg_id)
+                .await
+        }
         _ => None,
     }
 }
@@ -5683,43 +5650,6 @@ async fn prepared_wecom_attachment_is_not_downloaded_again() {
     assert!(prepare_inbound_attachments(&mut msg).await.is_none());
     server.await.unwrap();
     assert_eq!(hit_count.load(std::sync::atomic::Ordering::SeqCst), 0);
-}
-
-#[test]
-fn attachment_cleanup_removes_local_files_and_empty_parent() {
-    let dir = tempfile::tempdir().unwrap();
-    let attachment_dir = dir.path().join("msg-1");
-    std::fs::create_dir(&attachment_dir).unwrap();
-    let path = attachment_dir.join("1-shot.png");
-    std::fs::write(&path, b"image").unwrap();
-    let msg = InboundMessage {
-        platform: "wecom",
-        chat_id: "chat".into(),
-        user_id: "user".into(),
-        text: String::new(),
-        attachments: vec![crate::platforms::InboundAttachment {
-            kind: crate::platforms::AttachmentKind::Image,
-            name: Some("shot.png".into()),
-            media_id: None,
-            url: None,
-            local_path: Some(path.to_string_lossy().to_string()),
-            mime_type: Some("image/png".into()),
-            size_bytes: Some(5),
-            raw: serde_json::json!({}),
-        }],
-        msg_id: "msg-1".into(),
-        chat_type: crate::platforms::ChatType::DirectMessage,
-        reply_token: None,
-        route_override: None,
-        feedback: None,
-    };
-
-    {
-        let _cleanup = AttachmentCleanup::new(&msg);
-    }
-
-    assert!(!path.exists());
-    assert!(!attachment_dir.exists());
 }
 
 #[tokio::test]

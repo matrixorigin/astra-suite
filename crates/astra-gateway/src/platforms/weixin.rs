@@ -703,9 +703,9 @@ async fn poll_updates(
                 continue;
             }
 
-            // Extract text from item_list
             let text = extract_text(msg);
-            if text.is_empty() {
+            let attachments = extract_attachments(msg);
+            if text.is_empty() && attachments.is_empty() {
                 continue;
             }
 
@@ -756,7 +756,7 @@ async fn poll_updates(
                 chat_id,
                 user_id: from_id,
                 text,
-                attachments: Vec::new(),
+                attachments,
                 msg_id,
                 chat_type,
                 reply_token: None,
@@ -801,26 +801,6 @@ fn extract_text(msg: &Value) -> String {
                         && !t.trim().is_empty()
                     {
                         parts.push(format!("🎤 {t}"));
-                    } else {
-                        parts.push("🎤 [语音消息]".to_string());
-                    }
-                }
-                Some(2) => {
-                    if let Some(url) = item["image_item"]["media"]["full_url"].as_str() {
-                        parts.push(format!("🖼 [图片: {url}]"));
-                    } else {
-                        parts.push("🖼 [图片]".to_string());
-                    }
-                }
-                Some(4) => {
-                    let name = item["file_item"]["file_name"].as_str().unwrap_or("unknown");
-                    parts.push(format!("📎 [文件: {name}]"));
-                }
-                Some(5) => {
-                    if let Some(url) = item["video_item"]["media"]["full_url"].as_str() {
-                        parts.push(format!("🎬 [视频: {url}]"));
-                    } else {
-                        parts.push("🎬 [视频]".to_string());
                     }
                 }
                 _ => {}
@@ -828,6 +808,253 @@ fn extract_text(msg: &Value) -> String {
         }
     }
     parts.join("\n").trim().to_string()
+}
+
+fn extract_attachments(msg: &Value) -> Vec<super::InboundAttachment> {
+    let mut attachments = Vec::new();
+    let Some(items) = msg["item_list"].as_array() else {
+        return attachments;
+    };
+    for item in items {
+        let Some((kind, item_key)) = weixin_item_attachment_spec(item["type"].as_i64()) else {
+            continue;
+        };
+        let section = &item[item_key];
+        let media = &section["media"];
+        let url = if let Some(download_param) = first_string(media, &["encrypt_query_param"]) {
+            crate::weixin_media::cdn_download_url(&download_param)
+        } else if let Some(url) =
+            first_string(section, &["url", "full_url", "download_url", "downloadurl"]).or_else(
+                || first_string(media, &["url", "full_url", "download_url", "downloadurl"]),
+            )
+        {
+            url
+        } else {
+            continue;
+        };
+        let name = first_string(section, &["file_name", "filename", "name"])
+            .or_else(|| first_string(item, &["file_name", "filename", "name"]));
+        let mime_type = first_string(section, &["mime_type", "mimetype", "content_type"]);
+        let size_bytes = first_u64(section, &["rawsize", "raw_size", "len", "size"])
+            .or_else(|| first_u64(media, &["rawsize", "raw_size", "len", "size"]));
+        attachments.push(super::InboundAttachment {
+            kind,
+            name,
+            media_id: first_string(media, &["filekey", "media_id", "mediaid"]),
+            url: Some(url),
+            local_path: None,
+            mime_type,
+            size_bytes,
+            raw: item.clone(),
+        });
+    }
+    attachments
+}
+
+fn weixin_item_attachment_spec(item_type: Option<i64>) -> Option<(AttachmentKind, &'static str)> {
+    match item_type? {
+        ITEM_IMAGE => Some((AttachmentKind::Image, "image_item")),
+        3 => Some((AttachmentKind::Audio, "voice_item")),
+        ITEM_FILE => Some((AttachmentKind::File, "file_item")),
+        ITEM_VIDEO => Some((AttachmentKind::Video, "video_item")),
+        _ => None,
+    }
+}
+
+pub(crate) async fn prepare_inbound_attachments(
+    attachments: &mut Vec<super::InboundAttachment>,
+    msg_id: &str,
+) -> Option<String> {
+    if attachments.is_empty() {
+        return None;
+    }
+    let mut dir_guard =
+        crate::inbound_attachments::PrepareDirGuard::new(crate::inbound_attachments::dir(msg_id));
+    let mut failures = Vec::new();
+    download_weixin_attachments(attachments, msg_id, &mut failures).await;
+    let before = attachments.len();
+    attachments.retain(|attachment| attachment.local_path.is_some());
+    if !attachments.is_empty() {
+        dir_guard.disarm();
+    }
+    crate::inbound_attachments::prepare_response(
+        before - attachments.len(),
+        attachments.is_empty(),
+        &failures,
+    )
+}
+
+async fn download_weixin_attachments(
+    attachments: &mut [super::InboundAttachment],
+    msg_id: &str,
+    failures: &mut Vec<String>,
+) {
+    if attachments
+        .iter()
+        .all(|attachment| attachment.local_path.is_some() || attachment.url.is_none())
+    {
+        return;
+    }
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+    {
+        Ok(client) => client,
+        Err(e) => {
+            tracing::warn!(error = %e, "weixin attachment http client build failed");
+            failures.push("附件下载客户端创建失败".into());
+            return;
+        }
+    };
+    let dir = crate::inbound_attachments::dir(msg_id);
+    for (idx, attachment) in attachments.iter_mut().enumerate() {
+        if attachment.local_path.is_some() {
+            continue;
+        }
+        let Some(url) = attachment.url.as_deref() else {
+            failures.push(crate::inbound_attachments::missing_url_failure(
+                attachment, idx,
+            ));
+            continue;
+        };
+        let response = match client.get(url).send().await {
+            Ok(response) => response,
+            Err(e) => {
+                tracing::warn!(url, error = %e, "weixin attachment download failed");
+                failures.push(format!(
+                    "{} 下载失败",
+                    crate::inbound_attachments::label(attachment, idx)
+                ));
+                continue;
+            }
+        };
+        if !response.status().is_success() {
+            let status = response.status();
+            tracing::warn!(
+                url,
+                status = status.as_u16(),
+                "weixin attachment download returned non-success status"
+            );
+            failures.push(format!(
+                "{} 下载返回 HTTP {}",
+                crate::inbound_attachments::label(attachment, idx),
+                status.as_u16()
+            ));
+            continue;
+        }
+        if let Some(len) = response.content_length()
+            && len > crate::inbound_attachments::MAX_INBOUND_ATTACHMENT_BYTES
+        {
+            failures.push(crate::inbound_attachments::too_large_failure(
+                attachment, idx,
+            ));
+            continue;
+        }
+        let encrypted = match response.bytes().await {
+            Ok(bytes)
+                if bytes.len() as u64
+                    <= crate::inbound_attachments::MAX_INBOUND_ATTACHMENT_BYTES =>
+            {
+                bytes.to_vec()
+            }
+            Ok(_) => {
+                failures.push(crate::inbound_attachments::too_large_failure(
+                    attachment, idx,
+                ));
+                continue;
+            }
+            Err(e) => {
+                tracing::warn!(url, error = %e, "weixin attachment body read failed");
+                failures.push(format!(
+                    "{} 读取失败",
+                    crate::inbound_attachments::label(attachment, idx)
+                ));
+                continue;
+            }
+        };
+        let Some(aes_key) = find_string_deep(&attachment.raw, &["aes_key", "aeskey"]) else {
+            failures.push(format!(
+                "{} 缺少解密密钥",
+                crate::inbound_attachments::label(attachment, idx)
+            ));
+            continue;
+        };
+        let key = match crate::weixin_media::parse_aes_key(&aes_key) {
+            Ok(key) => key,
+            Err(e) => {
+                tracing::warn!(error = %e, "weixin attachment aes key parse failed");
+                failures.push(format!(
+                    "{} 解密密钥无效",
+                    crate::inbound_attachments::label(attachment, idx)
+                ));
+                continue;
+            }
+        };
+        let bytes = crate::weixin_media::aes128_ecb_decrypt(&encrypted, &key);
+        if let Some(mime) = crate::inbound_attachments::detect_mime_from_bytes(
+            &bytes,
+            attachment.mime_type.as_deref(),
+        ) {
+            attachment.mime_type = Some(mime.to_string());
+        }
+        if let Err(e) = crate::inbound_attachments::ensure_private_dir(&dir).await {
+            tracing::warn!(dir = %dir.display(), error = %e, "weixin attachment dir create failed");
+            failures.push("附件目录创建失败".into());
+            return;
+        }
+        let filename = crate::inbound_attachments::filename(attachment, idx, &bytes);
+        let path = dir.join(filename);
+        if let Err(e) = crate::inbound_attachments::write_private_file(&path, &bytes).await {
+            tracing::warn!(path = %path.display(), error = %e, "weixin attachment write failed");
+            failures.push(format!(
+                "{} 写入失败",
+                crate::inbound_attachments::label(attachment, idx)
+            ));
+            continue;
+        }
+        attachment.size_bytes.get_or_insert(bytes.len() as u64);
+        attachment.local_path = Some(path.to_string_lossy().to_string());
+    }
+}
+
+fn first_string(value: &Value, keys: &[&str]) -> Option<String> {
+    for key in keys {
+        if let Some(s) = value.get(*key).and_then(Value::as_str) {
+            let s = s.trim();
+            if !s.is_empty() {
+                return Some(s.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn find_string_deep(value: &Value, keys: &[&str]) -> Option<String> {
+    if let Some(text) = first_string(value, keys) {
+        return Some(text);
+    }
+    match value {
+        Value::Array(items) => items.iter().find_map(|item| find_string_deep(item, keys)),
+        Value::Object(object) => object
+            .values()
+            .find_map(|child| find_string_deep(child, keys)),
+        _ => None,
+    }
+}
+
+fn first_u64(value: &Value, keys: &[&str]) -> Option<u64> {
+    for key in keys {
+        if let Some(n) = value.get(*key).and_then(Value::as_u64) {
+            return Some(n);
+        }
+        if let Some(s) = value.get(*key).and_then(Value::as_str)
+            && let Ok(n) = s.trim().parse()
+        {
+            return Some(n);
+        }
+    }
+    None
 }
 
 // ─── QR Login ──────────────────────────────────────────────────────────────
@@ -1473,6 +1700,34 @@ mod tests {
     use tokio::sync::broadcast;
     use tokio::time::{Duration, timeout};
 
+    struct EnvGuard {
+        key: &'static str,
+        old: Option<String>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let old = std::env::var(key).ok();
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self { key, old }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.old {
+                Some(value) => unsafe {
+                    std::env::set_var(self.key, value);
+                },
+                None => unsafe {
+                    std::env::remove_var(self.key);
+                },
+            }
+        }
+    }
+
     #[test]
     fn config_debug_redacts_token() {
         let cfg = WeixinConfig {
@@ -1527,7 +1782,7 @@ mod tests {
         }"#,
         )
         .unwrap();
-        assert_eq!(extract_text(&msg), "line1\n🖼 [图片]\nline2");
+        assert_eq!(extract_text(&msg), "line1\nline2");
     }
 
     #[test]
@@ -1559,7 +1814,7 @@ mod tests {
         }"#,
         )
         .unwrap();
-        assert_eq!(extract_text(&msg), "🎤 [语音消息]");
+        assert_eq!(extract_text(&msg), "");
     }
 
     #[test]
@@ -1572,7 +1827,7 @@ mod tests {
         }"#,
         )
         .unwrap();
-        assert_eq!(extract_text(&msg), "🖼 [图片]");
+        assert_eq!(extract_text(&msg), "");
     }
 
     #[test]
@@ -1582,9 +1837,7 @@ mod tests {
                 {"type": 2, "image_item": {"media": {"full_url": "https://cdn.example.com/img.jpg"}}}
             ]
         }"#).unwrap();
-        let text = extract_text(&msg);
-        assert!(text.contains("🖼"));
-        assert!(text.contains("https://cdn.example.com/img.jpg"));
+        assert_eq!(extract_text(&msg), "");
     }
 
     #[test]
@@ -1597,7 +1850,122 @@ mod tests {
         }"#,
         )
         .unwrap();
-        assert_eq!(extract_text(&msg), "📎 [文件: report.pdf]");
+        assert_eq!(extract_text(&msg), "");
+    }
+
+    #[test]
+    fn extract_attachments_image_from_cdn_media() {
+        let msg: Value = serde_json::from_str(
+            r#"{
+            "item_list": [
+                {
+                    "type": 2,
+                    "image_item": {
+                        "aeskey": "00112233445566778899aabbccddeeff",
+                        "media": {
+                            "encrypt_query_param": "a b+c=d",
+                            "filekey": "img-key",
+                            "rawsize": 8
+                        }
+                    }
+                }
+            ]
+        }"#,
+        )
+        .unwrap();
+
+        let attachments = extract_attachments(&msg);
+        assert_eq!(attachments.len(), 1);
+        let attachment = &attachments[0];
+        assert_eq!(attachment.kind, AttachmentKind::Image);
+        assert_eq!(attachment.media_id.as_deref(), Some("img-key"));
+        assert_eq!(attachment.size_bytes, Some(8));
+        let url = attachment.url.as_deref().unwrap();
+        assert!(url.starts_with("https://novac2c.cdn.weixin.qq.com/c2c/download?"));
+        assert!(url.contains("encrypted_query_param="));
+    }
+
+    #[test]
+    fn extract_attachments_file_name_and_size() {
+        let msg: Value = serde_json::from_str(
+            r#"{
+            "item_list": [
+                {
+                    "type": 4,
+                    "file_item": {
+                        "file_name": "report.pdf",
+                        "len": "123",
+                        "media": {
+                            "encrypt_query_param": "file-param",
+                            "aes_key": "ABEiM0RVZneImaq7zN3u/w=="
+                        }
+                    }
+                }
+            ]
+        }"#,
+        )
+        .unwrap();
+
+        let attachments = extract_attachments(&msg);
+        assert_eq!(attachments.len(), 1);
+        let attachment = &attachments[0];
+        assert_eq!(attachment.kind, AttachmentKind::File);
+        assert_eq!(attachment.name.as_deref(), Some("report.pdf"));
+        assert_eq!(attachment.size_bytes, Some(123));
+    }
+
+    #[tokio::test]
+    async fn prepare_weixin_attachment_downloads_and_decrypts() {
+        let key = [0x42_u8; 16];
+        let plaintext = b"\x89PNG\r\n\x1a\nhello";
+        let encrypted = crate::weixin_media::aes128_ecb_encrypt(plaintext, &key);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = [0_u8; 1024];
+            let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\n\r\n",
+                encrypted.len()
+            );
+            tokio::io::AsyncWriteExt::write_all(&mut stream, response.as_bytes())
+                .await
+                .unwrap();
+            tokio::io::AsyncWriteExt::write_all(&mut stream, &encrypted)
+                .await
+                .unwrap();
+        });
+
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = EnvGuard::set("GATEWAY_RUN_DIR", tmp.path().to_str().unwrap());
+        let mut attachments = vec![crate::platforms::InboundAttachment {
+            kind: AttachmentKind::Image,
+            name: Some("shot".into()),
+            media_id: Some("img-key".into()),
+            url: Some(format!("http://{addr}/download")),
+            local_path: None,
+            mime_type: None,
+            size_bytes: None,
+            raw: serde_json::json!({
+                "image_item": {
+                    "aeskey": hex::encode(key)
+                }
+            }),
+        }];
+
+        assert!(
+            prepare_inbound_attachments(&mut attachments, "wx-msg-download")
+                .await
+                .is_none()
+        );
+        server.await.unwrap();
+        assert_eq!(attachments.len(), 1);
+        let path = attachments[0].local_path.as_deref().unwrap();
+        assert!(path.ends_with(".png"));
+        assert_eq!(tokio::fs::read(path).await.unwrap(), plaintext);
+        assert_eq!(attachments[0].mime_type.as_deref(), Some("image/png"));
+        assert_eq!(attachments[0].size_bytes, Some(plaintext.len() as u64));
     }
 
     #[test]
