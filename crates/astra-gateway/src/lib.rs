@@ -10,6 +10,7 @@ pub mod github_tokens;
 pub mod health;
 pub mod markdown;
 pub mod mcp;
+pub mod model_vision;
 pub mod platforms;
 pub mod runner;
 pub mod runtime_api;

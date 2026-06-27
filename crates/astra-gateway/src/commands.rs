@@ -2052,6 +2052,9 @@ pub(crate) struct ModelEntry {
     desc: String,
     /// Full model identifier, or `None` to mean "follow default".
     full_id: Option<String>,
+    /// Backend model id resolved by probing the CLI. This is populated for
+    /// default rows where `full_id` intentionally remains `None`.
+    resolved_id: Option<String>,
     /// Extra shorthand aliases for resolution (e.g. ["deepseek", "ds"]).
     aliases: Vec<String>,
 }
@@ -2112,6 +2115,41 @@ async fn model_entries_for_context(
         entries,
         cache_age: None,
     })
+}
+
+pub(crate) async fn current_resolved_model_id_for_context(
+    ctx: &CommandContext<'_>,
+) -> Result<Option<String>, String> {
+    let model_list = model_entries_for_context(ctx, "", false).await?;
+    let resolved =
+        resolved_model_id_from_entries(ctx.resolved_cli.model_name(), &model_list.entries)
+            .or_else(|| ctx.config.astra.default_model.clone())
+            .or_else(|| ctx.config.cli.model_name().map(str::to_string));
+    Ok(resolved)
+}
+
+fn resolved_model_id_from_entries(
+    current_model: Option<&str>,
+    entries: &[ModelEntry],
+) -> Option<String> {
+    if current_model.is_none()
+        && let Some(default) = entries.iter().find(|entry| entry.full_id.is_none())
+    {
+        return default.resolved_id.clone();
+    }
+
+    let current = current_model?;
+    match resolve_model_input(current, entries) {
+        ResolvedModel::Id(id) => Some(id),
+        ResolvedModel::Default => entries
+            .iter()
+            .find(|entry| entry.full_id.is_none())
+            .and_then(|entry| entry.resolved_id.clone()),
+        ResolvedModel::Unrecognized if looks_like_configured_model_id(current) => {
+            Some(current.into())
+        }
+        ResolvedModel::Unrecognized => None,
+    }
 }
 
 async fn model_entries_uncached(ctx: &CommandContext<'_>) -> Result<Vec<ModelEntry>, String> {
@@ -2226,6 +2264,7 @@ fn default_model_entry() -> ModelEntry {
         label: "默认".into(),
         desc: "跟随配置".into(),
         full_id: None,
+        resolved_id: None,
         aliases: vec![],
     }
 }
@@ -2288,6 +2327,7 @@ async fn astra_model_entries(
             label: item.name.clone(),
             desc,
             full_id: Some(item.name),
+            resolved_id: None,
             aliases,
         });
     }
@@ -2303,6 +2343,7 @@ async fn claude_model_entries(ctx: &CommandContext<'_>) -> Result<Vec<ModelEntry
     let mut entries = vec![default_model_entry()];
     if let Some(model) = probe_claude_model(&base, None, ctx.resolved_provider_config).await? {
         entries[0].desc = format!("当前默认 → {model}");
+        entries[0].resolved_id = Some(model);
     }
 
     let candidates = [
@@ -2331,6 +2372,7 @@ async fn claude_model_entries(ctx: &CommandContext<'_>) -> Result<Vec<ModelEntry
                     label: model.clone(),
                     desc: desc.into(),
                     full_id: Some(model),
+                    resolved_id: None,
                     aliases: aliases.into_iter().map(str::to_string).collect(),
                 },
             );
@@ -2344,6 +2386,7 @@ async fn claude_model_entries(ctx: &CommandContext<'_>) -> Result<Vec<ModelEntry
                 label: model.clone(),
                 desc: "Claude custom model".into(),
                 full_id: Some(model),
+                resolved_id: None,
                 aliases: vec!["custom".into()],
             },
         );
@@ -2515,6 +2558,7 @@ async fn codex_model_entries(
                 label: item.display_name.unwrap_or_else(|| item.slug.clone()),
                 desc: item.description.unwrap_or_else(|| "Codex model".into()),
                 full_id: Some(item.slug),
+                resolved_id: None,
                 aliases,
             },
         );
@@ -2669,6 +2713,11 @@ pub(crate) fn resolve_model_input(input: &str, entries: &[ModelEntry]) -> Resolv
 
 fn is_explicit_model_id(input: &str) -> bool {
     !input.chars().any(char::is_whitespace) && input.contains('.')
+}
+
+fn looks_like_configured_model_id(input: &str) -> bool {
+    !input.chars().any(char::is_whitespace)
+        && (input.contains('.') || input.contains('-') || input.chars().any(|c| c.is_ascii_digit()))
 }
 
 fn strip_whitespace(s: &str) -> String {
@@ -2913,6 +2962,7 @@ mod tests {
             project_dirs: vec![],
             working_dir: None,
             system_prompt_extra: None,
+            vision_models: Default::default(),
             github_tokens: Default::default(),
             api_port: None,
         }
@@ -3011,12 +3061,14 @@ mod tests {
                 label: "qwen3.7-max".into(),
                 desc: "Claude alias: haiku".into(),
                 full_id: Some("qwen3.7-max".into()),
+                resolved_id: None,
                 aliases: vec!["haiku".into()],
             },
             ModelEntry {
                 label: "deepseek-v4-pro".into(),
                 desc: "Claude custom model".into(),
                 full_id: Some("deepseek-v4-pro".into()),
+                resolved_id: None,
                 aliases: vec!["deepseek".into(), "ds".into()],
             },
         ];
@@ -3083,6 +3135,7 @@ mod tests {
                 label: "qwen3.7-max".into(),
                 desc: "Claude alias: haiku".into(),
                 full_id: Some("qwen3.7-max".into()),
+                resolved_id: None,
                 aliases: vec!["haiku".into()],
             },
         ];
@@ -3098,6 +3151,7 @@ mod tests {
                 label: "qwen3.7-max".into(),
                 desc: "Claude alias: haiku".into(),
                 full_id: Some("qwen3.7-max".into()),
+                resolved_id: None,
                 aliases: vec!["haiku".into()],
             },
         ];
@@ -3108,6 +3162,58 @@ mod tests {
             ResolvedModel::Id(id) if id == "qwen3.7-max"
         ));
     }
+
+    #[test]
+    fn current_model_resolution_uses_structured_default_probe_result() {
+        let mut default = default_model_entry();
+        default.resolved_id = Some("claude-sonnet-4-20250514".into());
+        let entries = vec![default];
+
+        assert_eq!(
+            resolved_model_id_from_entries(None, &entries),
+            Some("claude-sonnet-4-20250514".into())
+        );
+    }
+
+    #[test]
+    fn current_model_resolution_maps_alias_to_probe_result() {
+        let entries = vec![
+            default_model_entry(),
+            ModelEntry {
+                label: "qwen3.7-max".into(),
+                desc: "Claude alias: haiku".into(),
+                full_id: Some("qwen3.7-max".into()),
+                resolved_id: None,
+                aliases: vec!["haiku".into()],
+            },
+        ];
+
+        assert_eq!(
+            resolved_model_id_from_entries(Some("haiku"), &entries),
+            Some("qwen3.7-max".into())
+        );
+    }
+
+    #[test]
+    fn current_model_resolution_unknown_alias_is_unknown() {
+        let entries = vec![default_model_entry()];
+
+        assert_eq!(
+            resolved_model_id_from_entries(Some("haiku"), &entries),
+            None
+        );
+    }
+
+    #[test]
+    fn current_model_resolution_preserves_explicit_dash_model_id() {
+        let entries = vec![default_model_entry()];
+
+        assert_eq!(
+            resolved_model_id_from_entries(Some("claude-sonnet-4"), &entries),
+            Some("claude-sonnet-4".into())
+        );
+    }
+
     cmd_test!(
         cmd_model_set_without_db_still_succeeds,
         "/model default",

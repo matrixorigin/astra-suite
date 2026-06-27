@@ -399,6 +399,7 @@ fn extract_text_messages(payload: &Value) -> Vec<InboundMessage> {
                     chat_id: from.to_string(),
                     user_id: from.to_string(),
                     text: text.to_string(),
+                    attachments: Vec::new(),
                     msg_id: msg_id.to_string(),
                     chat_type: ChatType::DirectMessage,
                     reply_token: None,

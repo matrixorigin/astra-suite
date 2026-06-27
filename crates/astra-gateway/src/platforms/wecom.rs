@@ -5,17 +5,27 @@
 
 use super::{
     AdapterCapability, AdapterHealthEvent, AdapterHealthEventType, AttachmentKind, ChatType,
-    FeedbackEvent, InboundMessage, OutboundAttachment, PlatformAdapter, emit_adapter_health,
+    FeedbackEvent, InboundAttachment, InboundMessage, OutboundAttachment, PlatformAdapter,
+    emit_adapter_health,
 };
 use crate::config::WeComConfig;
 use crate::dedup::MessageDeduplicator;
+use aes::Aes256;
+use aes::cipher::{BlockDecrypt, KeyInit};
 use async_trait::async_trait;
 use base64::Engine;
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use md5::{Digest, Md5};
+use reqwest::header::CONTENT_TYPE;
 use serde_json::{Value, json};
+#[cfg(not(test))]
+use std::net::IpAddr;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
+use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio::sync::{Mutex, mpsc};
 use tokio_tungstenite::tungstenite::Message;
@@ -26,6 +36,18 @@ const PONG_TIMEOUT_SECS: u64 = 60;
 const MAX_TEXT_LENGTH: usize = 4000;
 const MEDIA_UPLOAD_CHUNK_BYTES: usize = 512 * 1024;
 const MEDIA_UPLOAD_MAX_CHUNKS: usize = 100;
+const MAX_INBOUND_ATTACHMENT_BYTES: u64 = 25 * 1024 * 1024;
+const ATTACHMENT_NAME_KEYS: &[&str] = &[
+    "filename",
+    "file_name",
+    "name",
+    "title",
+    "display_name",
+    "origin_name",
+];
+const ATTACHMENT_MEDIA_ID_KEYS: &[&str] = &["media_id", "mediaid", "file_id", "fileid"];
+const ATTACHMENT_MIME_KEYS: &[&str] = &["mime_type", "mimetype", "content_type"];
+const ATTACHMENT_SIZE_KEYS: &[&str] = &["size", "file_size", "filesize", "size_bytes"];
 const RECONNECT_DELAYS: &[u64] = &[2, 5, 10, 30, 60];
 const WECOM_CAPABILITIES: &[AdapterCapability] = &[
     AdapterCapability::ReceiveText,
@@ -678,13 +700,49 @@ fn ensure_attachment_extension(
     kind: AttachmentKind,
     bytes: &[u8],
 ) -> String {
-    if filename.contains('.') {
+    let Some(ext) = attachment_extension(mime_type, kind, bytes) else {
+        return filename.to_string();
+    };
+    let path = Path::new(filename);
+    let current_ext = path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.to_ascii_lowercase());
+    if current_ext
+        .as_deref()
+        .is_some_and(|current| current == ext && is_trusted_attachment_extension(current))
+    {
         return filename.to_string();
     }
-    match attachment_extension(mime_type, kind, bytes) {
-        Some(ext) => format!("{filename}.{ext}"),
-        None => filename.to_string(),
+    if let Some(stem) = path.file_stem().and_then(|stem| stem.to_str())
+        && current_ext
+            .as_deref()
+            .is_some_and(|current| !is_trusted_attachment_extension(current))
+    {
+        return format!("{stem}.{ext}");
     }
+    format!("{filename}.{ext}")
+}
+
+fn is_trusted_attachment_extension(ext: &str) -> bool {
+    matches!(
+        ext,
+        "png"
+            | "jpg"
+            | "jpeg"
+            | "gif"
+            | "webp"
+            | "pdf"
+            | "html"
+            | "htm"
+            | "txt"
+            | "mp4"
+            | "mov"
+            | "mp3"
+            | "wav"
+            | "m4a"
+            | "ogg"
+    )
 }
 
 fn attachment_extension(
@@ -692,6 +750,26 @@ fn attachment_extension(
     kind: AttachmentKind,
     bytes: &[u8],
 ) -> Option<&'static str> {
+    if bytes.starts_with(b"%PDF-") {
+        return Some("pdf");
+    }
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return Some("png");
+    }
+    if bytes.starts_with(b"\xff\xd8\xff") {
+        return Some("jpg");
+    }
+    if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        return Some("gif");
+    }
+    if bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP") {
+        return Some("webp");
+    }
+    let sample_len = bytes.len().min(512);
+    let sample = String::from_utf8_lossy(&bytes[..sample_len]).to_ascii_lowercase();
+    if sample.contains("<!doctype html") || sample.contains("<html") {
+        return Some("html");
+    }
     let mime = mime_type.unwrap_or("").trim().to_ascii_lowercase();
     match mime.as_str() {
         "text/html" | "application/xhtml+xml" => return Some("html"),
@@ -703,25 +781,11 @@ fn attachment_extension(
         "text/plain" => return Some("txt"),
         _ => {}
     }
-    if bytes.starts_with(b"%PDF-") {
-        return Some("pdf");
-    }
-    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
-        return Some("png");
-    }
-    if bytes.starts_with(b"\xff\xd8\xff") {
-        return Some("jpg");
-    }
-    let sample_len = bytes.len().min(512);
-    let sample = String::from_utf8_lossy(&bytes[..sample_len]).to_ascii_lowercase();
-    if sample.contains("<!doctype html") || sample.contains("<html") {
-        return Some("html");
-    }
     match kind {
-        AttachmentKind::Image => Some("image"),
-        AttachmentKind::Video => Some("video"),
+        AttachmentKind::Video => Some("mp4"),
         AttachmentKind::Audio => Some("audio"),
         AttachmentKind::File | AttachmentKind::Unknown => None,
+        AttachmentKind::Image => None,
     }
 }
 
@@ -779,6 +843,7 @@ async fn handle_wecom_message(
             chat_id,
             user_id,
             text: String::new(),
+            attachments: Vec::new(),
             msg_id,
             chat_type,
             reply_token: data["headers"]["req_id"].as_str().map(String::from),
@@ -807,15 +872,16 @@ async fn handle_wecom_message(
         return;
     }
 
-    let raw_text = body["text"]["content"]
-        .as_str()
-        .or_else(|| body["voice"]["content"].as_str())
-        .unwrap_or("")
-        .trim();
+    let text = extract_wecom_text(body);
+    let attachments = extract_wecom_attachments(body);
 
-    let text = raw_text.to_string();
-
-    if text.is_empty() {
+    if text.is_empty() && attachments.is_empty() {
+        tracing::debug!(
+            msg_id,
+            msgtype = body["msgtype"].as_str(),
+            keys = ?body.as_object().map(|object| object.keys().cloned().collect::<Vec<_>>()),
+            "wecom callback ignored because it contained no text or attachment"
+        );
         return;
     }
 
@@ -841,6 +907,7 @@ async fn handle_wecom_message(
         chat_id,
         user_id,
         text,
+        attachments,
         msg_id,
         chat_type,
         reply_token,
@@ -850,6 +917,805 @@ async fn handle_wecom_message(
 
     if msg_tx.send(msg).await.is_err() {
         tracing::warn!("wecom message channel full, dropping message");
+    }
+}
+
+fn extract_wecom_text(body: &Value) -> String {
+    let mut parts = Vec::new();
+
+    if let Some(text) = body["text"]["content"].as_str() {
+        push_nonempty_text(&mut parts, text);
+    }
+    if let Some(text) = body["voice"]["content"].as_str() {
+        push_nonempty_text(&mut parts, text);
+    }
+
+    if let Some(items) = wecom_mixed_items(body) {
+        for item in items {
+            if let Some(text) = wecom_mixed_item_text(item) {
+                push_nonempty_text(&mut parts, &text);
+                continue;
+            }
+            if wecom_mixed_kind(item) == Some(WeComMixedKind::Voice)
+                && let Some(section) = first_object_section(item, &["voice_item", "voice", "audio"])
+                && let Some(text) = first_text_string(section)
+            {
+                push_nonempty_text(&mut parts, &format!("voice: {}", text.trim()));
+            }
+        }
+    }
+
+    parts.join("\n")
+}
+
+fn push_nonempty_text(parts: &mut Vec<String>, text: &str) {
+    let text = text.trim();
+    if !text.is_empty() {
+        parts.push(text.to_string());
+    }
+}
+
+fn extract_wecom_attachments(body: &Value) -> Vec<InboundAttachment> {
+    let mut attachments = Vec::new();
+    for (key, kind) in [
+        ("image", AttachmentKind::Image),
+        ("file", AttachmentKind::File),
+        ("video", AttachmentKind::Video),
+        ("voice", AttachmentKind::Audio),
+    ] {
+        let Some(section) = body.get(key).filter(|value| value.is_object()) else {
+            continue;
+        };
+        let url = first_string(section, &url_keys());
+        if is_transcribed_voice_without_download(kind, section, url.as_deref(), &["content"]) {
+            continue;
+        }
+        let attachment = InboundAttachment {
+            kind,
+            name: first_string(section, ATTACHMENT_NAME_KEYS)
+                .or_else(|| infer_name_from_url(url.as_deref())),
+            media_id: first_string(section, ATTACHMENT_MEDIA_ID_KEYS),
+            url,
+            local_path: None,
+            mime_type: first_string(section, ATTACHMENT_MIME_KEYS),
+            size_bytes: first_u64(section, ATTACHMENT_SIZE_KEYS),
+            raw: section.clone(),
+        };
+        if attachment.media_id.is_some()
+            || attachment.url.is_some()
+            || attachment.name.is_some()
+            || kind != AttachmentKind::Audio
+        {
+            attachments.push(attachment);
+        }
+    }
+    if let Some(items) = wecom_mixed_items(body) {
+        for item in items {
+            if let Some(attachment) = extract_wecom_item_attachment(item) {
+                attachments.push(attachment);
+            }
+        }
+    }
+    dedupe_inbound_attachments(&mut attachments);
+    attachments
+}
+
+fn wecom_mixed_items(body: &Value) -> Option<&Vec<Value>> {
+    body["item_list"]
+        .as_array()
+        .or_else(|| body["mixed"].as_array())
+        .or_else(|| body["mixed"]["item_list"].as_array())
+        .or_else(|| body["mixed"]["items"].as_array())
+}
+
+fn wecom_mixed_item_text(item: &Value) -> Option<String> {
+    (wecom_mixed_kind(item) == Some(WeComMixedKind::Text))
+        .then(|| {
+            first_object_section(item, &["text_item", "text", "content_item"])
+                .and_then(first_text_string)
+                .or_else(|| first_text_string(item))
+        })
+        .flatten()
+}
+
+fn extract_wecom_item_attachment(item: &Value) -> Option<InboundAttachment> {
+    let (kind, item_keys, name_fallbacks) = wecom_item_attachment_spec(item)?;
+    let section = first_object_section(item, item_keys).unwrap_or(item);
+    let url =
+        first_string(&section["media"], &url_keys()).or_else(|| first_string(section, &url_keys()));
+    if is_transcribed_voice_without_download(kind, section, url.as_deref(), &["text"]) {
+        return None;
+    }
+    let attachment = attachment_from_wecom_item(item, kind, section, name_fallbacks);
+    if inbound_attachment_has_identity(&attachment) {
+        Some(attachment)
+    } else {
+        None
+    }
+}
+
+fn wecom_item_attachment_spec(
+    item: &Value,
+) -> Option<(
+    AttachmentKind,
+    &'static [&'static str],
+    &'static [&'static str],
+)> {
+    if wecom_mixed_kind(item) == Some(WeComMixedKind::Image)
+        || first_object_section(item, &["image_item", "image", "pic"]).is_some()
+    {
+        return Some((
+            AttachmentKind::Image,
+            &["image_item", "image", "pic"],
+            &["image"],
+        ));
+    }
+    if wecom_mixed_kind(item) == Some(WeComMixedKind::File)
+        || first_object_section(item, &["file_item", "file", "document"]).is_some()
+    {
+        return Some((
+            AttachmentKind::File,
+            &["file_item", "file", "document"],
+            &["file"],
+        ));
+    }
+    if wecom_mixed_kind(item) == Some(WeComMixedKind::Video)
+        || first_object_section(item, &["video_item", "video"]).is_some()
+    {
+        return Some((AttachmentKind::Video, &["video_item", "video"], &["video"]));
+    }
+    if wecom_mixed_kind(item) == Some(WeComMixedKind::Voice)
+        || first_object_section(item, &["voice_item", "voice", "audio"]).is_some()
+    {
+        return Some((
+            AttachmentKind::Audio,
+            &["voice_item", "voice", "audio"],
+            &["voice"],
+        ));
+    }
+    None
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WeComMixedKind {
+    Text,
+    Image,
+    Voice,
+    File,
+    Video,
+}
+
+fn wecom_mixed_kind(item: &Value) -> Option<WeComMixedKind> {
+    for key in ["type", "msgtype", "msg_type"] {
+        if let Some(code) = item[key].as_i64() {
+            return match code {
+                1 => Some(WeComMixedKind::Text),
+                2 => Some(WeComMixedKind::Image),
+                3 => Some(WeComMixedKind::Voice),
+                4 => Some(WeComMixedKind::File),
+                5 => Some(WeComMixedKind::Video),
+                _ => None,
+            };
+        }
+        let Some(value) = item[key].as_str() else {
+            continue;
+        };
+        let value = value.trim().to_ascii_lowercase();
+        if let Ok(code) = value.parse::<i64>() {
+            return match code {
+                1 => Some(WeComMixedKind::Text),
+                2 => Some(WeComMixedKind::Image),
+                3 => Some(WeComMixedKind::Voice),
+                4 => Some(WeComMixedKind::File),
+                5 => Some(WeComMixedKind::Video),
+                _ => None,
+            };
+        }
+        return match value.as_str() {
+            "text" => Some(WeComMixedKind::Text),
+            "image" | "pic" | "picture" => Some(WeComMixedKind::Image),
+            "voice" | "audio" => Some(WeComMixedKind::Voice),
+            "file" | "document" | "doc" => Some(WeComMixedKind::File),
+            "video" => Some(WeComMixedKind::Video),
+            _ => None,
+        };
+    }
+    None
+}
+
+fn first_object_section<'a>(value: &'a Value, keys: &[&str]) -> Option<&'a Value> {
+    keys.iter()
+        .find_map(|key| value.get(*key).filter(|section| section.is_object()))
+}
+
+fn first_text_string(value: &Value) -> Option<String> {
+    if let Some(text) = value
+        .as_str()
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+    {
+        return Some(text.to_string());
+    }
+    first_string(
+        value,
+        &[
+            "text",
+            "content",
+            "plain_text",
+            "msg",
+            "message",
+            "caption",
+            "description",
+        ],
+    )
+    .or_else(|| first_object_section(value, &["text", "content"]).and_then(first_text_string))
+}
+
+fn is_transcribed_voice_without_download(
+    kind: AttachmentKind,
+    section: &Value,
+    url: Option<&str>,
+    text_keys: &[&str],
+) -> bool {
+    kind == AttachmentKind::Audio && url.is_none() && first_string(section, text_keys).is_some()
+}
+
+fn inbound_attachment_has_identity(attachment: &InboundAttachment) -> bool {
+    attachment.media_id.is_some()
+        || attachment.url.is_some()
+        || attachment.name.is_some()
+        || attachment.mime_type.is_some()
+}
+
+fn dedupe_inbound_attachments(attachments: &mut Vec<InboundAttachment>) {
+    let mut seen = std::collections::HashSet::new();
+    attachments.retain(|attachment| {
+        let key = attachment
+            .media_id
+            .as_ref()
+            .map(|value| format!("media:{value}"))
+            .or_else(|| attachment.url.as_ref().map(|value| format!("url:{value}")));
+        match key {
+            Some(key) => seen.insert(key),
+            None => true,
+        }
+    });
+}
+
+fn attachment_from_wecom_item(
+    item: &Value,
+    kind: AttachmentKind,
+    section: &Value,
+    name_fallbacks: &[&str],
+) -> InboundAttachment {
+    let media = &section["media"];
+    let url = first_string(media, &url_keys()).or_else(|| first_string(section, &url_keys()));
+    let name = first_string(section, ATTACHMENT_NAME_KEYS)
+        .or_else(|| first_string(item, name_fallbacks))
+        .or_else(|| infer_name_from_url(url.as_deref()));
+    InboundAttachment {
+        kind,
+        name,
+        media_id: first_string(media, ATTACHMENT_MEDIA_ID_KEYS)
+            .or_else(|| first_string(section, ATTACHMENT_MEDIA_ID_KEYS)),
+        url,
+        local_path: None,
+        mime_type: first_string(media, ATTACHMENT_MIME_KEYS)
+            .or_else(|| first_string(section, ATTACHMENT_MIME_KEYS)),
+        size_bytes: first_u64(media, ATTACHMENT_SIZE_KEYS)
+            .or_else(|| first_u64(section, ATTACHMENT_SIZE_KEYS)),
+        raw: item.clone(),
+    }
+}
+
+pub(crate) async fn prepare_inbound_attachments(
+    attachments: &mut Vec<InboundAttachment>,
+    msg_id: &str,
+) -> Option<String> {
+    let mut dir_guard = AttachmentPrepareDirGuard::new(attachment_dir(msg_id));
+    let mut failures = Vec::new();
+    for (idx, attachment) in attachments.iter().enumerate() {
+        if attachment.local_path.is_none() && attachment.url.is_none() {
+            failures.push(format!(
+                "{} 缺少可下载链接",
+                attachment_label(attachment, idx)
+            ));
+        }
+    }
+    download_wecom_attachments(attachments, msg_id, &mut failures).await;
+    let before = attachments.len();
+    attachments.retain(|attachment| attachment.local_path.is_some());
+    if !attachments.is_empty() {
+        dir_guard.disarm();
+    }
+    attachment_prepare_response(
+        before - attachments.len(),
+        attachments.is_empty(),
+        &failures,
+    )
+}
+
+fn attachment_prepare_response(
+    dropped: usize,
+    all_dropped: bool,
+    failures: &[String],
+) -> Option<String> {
+    if dropped == 0 {
+        return None;
+    }
+    let detail = attachment_prepare_failure_detail(failures);
+    Some(if all_dropped {
+        format!("收到附件，但当前无法读取该附件内容。{detail}请重新发送可下载的图片或文件。")
+    } else {
+        format!(
+            "收到 {dropped} 个附件，但无法读取其中部分内容。{detail}请重新发送可下载的图片或文件。"
+        )
+    })
+}
+
+fn attachment_prepare_failure_detail(failures: &[String]) -> String {
+    let mut unique = Vec::new();
+    for failure in failures {
+        if !unique.contains(failure) {
+            unique.push(failure.clone());
+        }
+        if unique.len() >= 3 {
+            break;
+        }
+    }
+    if unique.is_empty() {
+        String::new()
+    } else {
+        format!("原因：{}。", unique.join("；"))
+    }
+}
+
+struct AttachmentPrepareDirGuard(Option<PathBuf>);
+
+impl AttachmentPrepareDirGuard {
+    fn new(dir: PathBuf) -> Self {
+        Self(Some(dir))
+    }
+
+    fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for AttachmentPrepareDirGuard {
+    fn drop(&mut self) {
+        let Some(dir) = self.0.as_ref() else {
+            return;
+        };
+        if let Err(e) = std::fs::remove_dir_all(dir)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::debug!(dir = %dir.display(), error = %e, "wecom attachment prepare dir cleanup failed");
+        }
+    }
+}
+
+async fn download_wecom_attachments(
+    attachments: &mut [InboundAttachment],
+    msg_id: &str,
+    failures: &mut Vec<String>,
+) {
+    if attachments
+        .iter()
+        .all(|attachment| attachment.local_path.is_some() || attachment.url.is_none())
+    {
+        return;
+    }
+
+    let dir = attachment_dir(msg_id);
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+    {
+        Ok(client) => client,
+        Err(e) => {
+            tracing::warn!(error = %e, "wecom attachment http client unavailable");
+            failures.push("下载客户端不可用".into());
+            return;
+        }
+    };
+
+    for (idx, attachment) in attachments.iter_mut().enumerate() {
+        if attachment.local_path.is_some() {
+            continue;
+        }
+        let Some(url) = attachment.url.as_deref() else {
+            continue;
+        };
+        if !is_safe_attachment_url(url) {
+            failures.push(format!(
+                "{} 链接地址不安全或协议不支持",
+                attachment_label(attachment, idx)
+            ));
+            continue;
+        }
+
+        let response = match client.get(url).send().await {
+            Ok(response) => response,
+            Err(e) => {
+                tracing::warn!(url, error = %e, "wecom attachment download failed");
+                failures.push(format!("{} 下载失败", attachment_label(attachment, idx)));
+                continue;
+            }
+        };
+        if !response.status().is_success() {
+            let status = response.status();
+            tracing::warn!(
+                url,
+                status = %status,
+                "wecom attachment download returned non-success status"
+            );
+            failures.push(format!(
+                "{} 下载返回 HTTP {}",
+                attachment_label(attachment, idx),
+                status.as_u16()
+            ));
+            continue;
+        }
+        if let Some(len) = response.content_length()
+            && len > MAX_INBOUND_ATTACHMENT_BYTES
+        {
+            tracing::warn!(
+                url,
+                content_length = len,
+                max_bytes = MAX_INBOUND_ATTACHMENT_BYTES,
+                "wecom attachment too large"
+            );
+            failures.push(attachment_too_large_failure(attachment, idx));
+            continue;
+        }
+        let response_mime = response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(normalize_content_type);
+
+        let raw_bytes = match response.bytes().await {
+            Ok(bytes) if bytes.len() as u64 <= MAX_INBOUND_ATTACHMENT_BYTES => bytes.to_vec(),
+            Ok(_) => {
+                failures.push(attachment_too_large_failure(attachment, idx));
+                continue;
+            }
+            Err(e) => {
+                tracing::warn!(url, error = %e, "wecom attachment body read failed");
+                failures.push(format!("{} 读取失败", attachment_label(attachment, idx)));
+                continue;
+            }
+        };
+
+        if attachment.mime_type.is_none() {
+            attachment.mime_type = response_mime;
+        }
+        let aes_key = find_string_deep(&attachment.raw, &["aeskey", "aes_key", "aesKey"]);
+        let bytes = if let Some(aes_key) = aes_key.as_deref() {
+            match decrypt_wecom_media(&raw_bytes, aes_key) {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    tracing::warn!(url, error = %e, "wecom attachment decrypt failed");
+                    failures.push(format!("{} 解密失败", attachment_label(attachment, idx)));
+                    continue;
+                }
+            }
+        } else {
+            raw_bytes
+        };
+        if let Some(mime_type) = detect_mime_from_bytes(&bytes, attachment.mime_type.as_deref()) {
+            attachment.mime_type = Some(mime_type.to_string());
+        }
+
+        if let Err(e) = ensure_private_dir(&dir).await {
+            tracing::warn!(dir = %dir.display(), error = %e, "wecom attachment dir create failed");
+            failures.push("附件目录创建失败".into());
+            return;
+        }
+        let filename = attachment_filename(attachment, idx, &bytes);
+        let path = dir.join(filename);
+        if let Err(e) = write_private_file(&path, &bytes).await {
+            tracing::warn!(path = %path.display(), error = %e, "wecom attachment write failed");
+            failures.push(format!("{} 写入失败", attachment_label(attachment, idx)));
+            continue;
+        }
+        attachment.size_bytes.get_or_insert(bytes.len() as u64);
+        attachment.local_path = Some(path.to_string_lossy().to_string());
+    }
+}
+
+fn attachment_too_large_failure(attachment: &InboundAttachment, idx: usize) -> String {
+    format!(
+        "{} 超过大小上限 {}MB",
+        attachment_label(attachment, idx),
+        MAX_INBOUND_ATTACHMENT_BYTES / 1024 / 1024
+    )
+}
+
+async fn ensure_private_dir(dir: &Path) -> std::io::Result<()> {
+    tokio::fs::create_dir_all(dir).await?;
+    #[cfg(unix)]
+    if let Err(e) = tokio::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).await {
+        tracing::debug!(dir = %dir.display(), error = %e, "wecom attachment dir chmod failed");
+    }
+    Ok(())
+}
+
+async fn write_private_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let mut file = tokio::fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(path)
+        .await?;
+    #[cfg(unix)]
+    if let Err(e) = file
+        .set_permissions(std::fs::Permissions::from_mode(0o600))
+        .await
+    {
+        tracing::debug!(path = %path.display(), error = %e, "wecom attachment chmod failed");
+    }
+    file.write_all(bytes).await
+}
+
+fn is_safe_attachment_url(url: &str) -> bool {
+    let Ok(parsed) = reqwest::Url::parse(url) else {
+        return false;
+    };
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return false;
+    }
+    if parsed.host_str().is_none() {
+        return false;
+    }
+    #[cfg(not(test))]
+    {
+        let Some(host) = parsed.host_str() else {
+            return false;
+        };
+        if host.eq_ignore_ascii_case("localhost") {
+            return false;
+        }
+        if let Ok(ip) = host.parse::<IpAddr>()
+            && is_private_attachment_ip(ip)
+        {
+            return false;
+        }
+    }
+    true
+}
+
+#[cfg(not(test))]
+fn is_private_attachment_ip(ip: IpAddr) -> bool {
+    ip.is_loopback()
+        || ip.is_unspecified()
+        || ip.is_multicast()
+        || match ip {
+            IpAddr::V4(ip) => ip.is_private() || ip.is_link_local(),
+            IpAddr::V6(ip) => ip.is_unique_local() || ip.is_unicast_link_local(),
+        }
+}
+
+fn decrypt_wecom_media(encrypted: &[u8], aes_key: &str) -> Result<Vec<u8>, String> {
+    if encrypted.is_empty() {
+        return Err("empty encrypted body".into());
+    }
+    if !encrypted.len().is_multiple_of(16) {
+        return Err(format!(
+            "encrypted body length {} is not AES block aligned",
+            encrypted.len()
+        ));
+    }
+
+    let key = decode_wecom_aes_key(aes_key)?;
+    if key.len() != 32 {
+        return Err(format!(
+            "aeskey decoded to {} bytes, expected 32",
+            key.len()
+        ));
+    }
+
+    let cipher = Aes256::new_from_slice(&key).map_err(|e| format!("invalid aes key: {e}"))?;
+    let mut prev = key[..16].to_vec();
+    let mut out = Vec::with_capacity(encrypted.len());
+    for chunk in encrypted.chunks_exact(16) {
+        let mut block = aes::cipher::generic_array::GenericArray::clone_from_slice(chunk);
+        cipher.decrypt_block(&mut block);
+        for i in 0..16 {
+            out.push(block[i] ^ prev[i]);
+        }
+        prev.copy_from_slice(chunk);
+    }
+
+    let pad_len = *out
+        .last()
+        .ok_or_else(|| "decrypted body is empty".to_string())? as usize;
+    if pad_len == 0 || pad_len > 32 || pad_len > out.len() {
+        return Err(format!("invalid PKCS#7 padding value: {pad_len}"));
+    }
+    if out[out.len() - pad_len..]
+        .iter()
+        .any(|byte| *byte as usize != pad_len)
+    {
+        return Err("invalid PKCS#7 padding bytes".into());
+    }
+    out.truncate(out.len() - pad_len);
+    Ok(out)
+}
+
+fn decode_wecom_aes_key(aes_key: &str) -> Result<Vec<u8>, String> {
+    for engine in [
+        &base64::engine::general_purpose::STANDARD,
+        &base64::engine::general_purpose::STANDARD_NO_PAD,
+        &base64::engine::general_purpose::URL_SAFE,
+        &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+    ] {
+        if let Ok(key) = engine.decode(aes_key.trim()) {
+            return Ok(key);
+        }
+    }
+
+    let mut padded = aes_key.trim().to_string();
+    let remainder = padded.len() % 4;
+    if remainder != 0 {
+        padded.extend(std::iter::repeat_n('=', 4 - remainder));
+    }
+    base64::engine::general_purpose::STANDARD
+        .decode(&padded)
+        .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(&padded))
+        .map_err(|e| format!("invalid base64 aeskey: {e}"))
+}
+
+fn attachment_dir(msg_id: &str) -> PathBuf {
+    run_dir()
+        .join(".attachments")
+        .join(sanitize_path_part(msg_id))
+}
+
+fn run_dir() -> PathBuf {
+    std::env::var_os("GATEWAY_RUN_DIR")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".astra-gateway")))
+        .unwrap_or_else(|| PathBuf::from(".astra-gateway"))
+}
+
+fn attachment_filename(attachment: &InboundAttachment, idx: usize, bytes: &[u8]) -> String {
+    let inferred_name = infer_name_from_url(attachment.url.as_deref());
+    let base = attachment
+        .name
+        .as_deref()
+        .or(inferred_name.as_deref())
+        .map(sanitize_path_part)
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| format!("attachment-{idx}"));
+    let filename = ensure_attachment_extension(
+        &base,
+        attachment.mime_type.as_deref(),
+        attachment.kind,
+        bytes,
+    );
+    format!("{}-{}", idx + 1, filename)
+}
+
+fn attachment_label(attachment: &InboundAttachment, idx: usize) -> String {
+    attachment
+        .name
+        .as_deref()
+        .filter(|name| !name.trim().is_empty())
+        .map(|name| format!("附件 `{}`", name.trim()))
+        .unwrap_or_else(|| format!("第 {} 个附件", idx + 1))
+}
+
+fn sanitize_path_part(input: &str) -> String {
+    input
+        .chars()
+        .map(|ch| match ch {
+            'a'..='z' | 'A'..='Z' | '0'..='9' | '.' | '-' | '_' => ch,
+            _ => '_',
+        })
+        .collect::<String>()
+        .trim_matches('_')
+        .to_string()
+}
+
+fn first_string(value: &Value, keys: &[&str]) -> Option<String> {
+    for key in keys {
+        if let Some(s) = value.get(*key).and_then(Value::as_str) {
+            let s = s.trim();
+            if !s.is_empty() {
+                return Some(s.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn find_string_deep(value: &Value, keys: &[&str]) -> Option<String> {
+    if let Some(text) = first_string(value, keys) {
+        return Some(text);
+    }
+    match value {
+        Value::Array(items) => items.iter().find_map(|item| find_string_deep(item, keys)),
+        Value::Object(object) => object
+            .values()
+            .find_map(|child| find_string_deep(child, keys)),
+        _ => None,
+    }
+}
+
+fn normalize_content_type(value: &str) -> Option<String> {
+    let mime = value
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    if mime.is_empty() || mime == "application/octet-stream" {
+        None
+    } else {
+        Some(mime)
+    }
+}
+
+fn detect_mime_from_bytes<'a>(bytes: &[u8], fallback: Option<&'a str>) -> Option<&'a str> {
+    if bytes.starts_with(b"%PDF-") {
+        return Some("application/pdf");
+    }
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return Some("image/png");
+    }
+    if bytes.starts_with(b"\xff\xd8\xff") {
+        return Some("image/jpeg");
+    }
+    if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        return Some("image/gif");
+    }
+    if bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP") {
+        return Some("image/webp");
+    }
+    let sample_len = bytes.len().min(512);
+    let sample = String::from_utf8_lossy(&bytes[..sample_len]).to_ascii_lowercase();
+    if sample.contains("<!doctype html") || sample.contains("<html") {
+        return Some("text/html");
+    }
+    fallback
+}
+
+fn first_u64(value: &Value, keys: &[&str]) -> Option<u64> {
+    for key in keys {
+        if let Some(n) = value.get(*key).and_then(Value::as_u64) {
+            return Some(n);
+        }
+        if let Some(s) = value.get(*key).and_then(Value::as_str)
+            && let Ok(n) = s.trim().parse()
+        {
+            return Some(n);
+        }
+    }
+    None
+}
+
+fn url_keys() -> [&'static str; 7] {
+    [
+        "url",
+        "download_url",
+        "file_url",
+        "full_url",
+        "pic_url",
+        "picurl",
+        "image_url",
+    ]
+}
+
+fn infer_name_from_url(url: Option<&str>) -> Option<String> {
+    let path = url?.split('?').next().unwrap_or_default();
+    let name = path.rsplit('/').next()?.trim();
+    if name.is_empty() {
+        None
+    } else {
+        Some(name.to_string())
     }
 }
 
@@ -959,9 +1825,362 @@ mod tests {
             assert_eq!(msg.chat_id, "chat-1");
             assert_eq!(msg.user_id, "user-1");
             assert_eq!(msg.text, "hello world");
+            assert!(msg.attachments.is_empty());
             assert_eq!(msg.chat_type, ChatType::DirectMessage);
             assert_eq!(msg.reply_token, Some("req-123".to_string()));
         });
+    }
+
+    #[test]
+    fn parse_image_attachment_message() {
+        let data: Value = serde_json::from_str(
+            r#"{
+            "cmd": "aibot_msg_callback",
+            "headers": {"req_id": "req-image"},
+            "body": {
+                "msgid": "image-1",
+                "from": {"userid": "u1"},
+                "chatid": "c1",
+                "chattype": "single",
+                "msgtype": "image",
+                "image": {"media_id": "media-image-1", "filename": "shot.png", "mime_type": "image/png"}
+            }
+        }"#,
+        )
+        .unwrap();
+
+        let (tx, mut rx) = mpsc::channel(10);
+        let mut dedup = MessageDeduplicator::new();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            handle_wecom_message(&data, &tx, &mut dedup).await;
+            let msg = rx.recv().await.unwrap();
+            assert!(msg.text.is_empty());
+            assert_eq!(msg.attachments.len(), 1);
+            let attachment = &msg.attachments[0];
+            assert_eq!(attachment.kind, AttachmentKind::Image);
+            assert_eq!(attachment.media_id.as_deref(), Some("media-image-1"));
+            assert_eq!(attachment.name.as_deref(), Some("shot.png"));
+            assert_eq!(attachment.mime_type.as_deref(), Some("image/png"));
+        });
+    }
+
+    #[test]
+    fn parse_file_attachment_with_text() {
+        let data: Value = serde_json::from_str(
+            r#"{
+            "cmd": "aibot_msg_callback",
+            "headers": {"req_id": "req-file"},
+            "body": {
+                "msgid": "file-1",
+                "from": {"userid": "u1"},
+                "chatid": "c1",
+                "chattype": "single",
+                "msgtype": "file",
+                "text": {"content": "please read this"},
+                "file": {"fileid": "file-media-1", "file_name": "report.pdf", "file_size": "1024"}
+            }
+        }"#,
+        )
+        .unwrap();
+
+        let (tx, mut rx) = mpsc::channel(10);
+        let mut dedup = MessageDeduplicator::new();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            handle_wecom_message(&data, &tx, &mut dedup).await;
+            let msg = rx.recv().await.unwrap();
+            assert_eq!(msg.text, "please read this");
+            assert_eq!(msg.attachments.len(), 1);
+            let attachment = &msg.attachments[0];
+            assert_eq!(attachment.kind, AttachmentKind::File);
+            assert_eq!(attachment.media_id.as_deref(), Some("file-media-1"));
+            assert_eq!(attachment.name.as_deref(), Some("report.pdf"));
+            assert_eq!(attachment.size_bytes, Some(1024));
+        });
+    }
+
+    #[test]
+    fn parse_mixed_text_and_image_items() {
+        let data: Value = serde_json::from_str(
+            r#"{
+            "cmd": "aibot_msg_callback",
+            "headers": {"req_id": "req-mixed"},
+            "body": {
+                "msgid": "mixed-1",
+                "from": {"userid": "u1"},
+                "chatid": "c1",
+                "chattype": "single",
+                "msgtype": "mixed",
+                "mixed": {
+                    "item_list": [
+                        {"type": 1, "text_item": {"text": "看一下这张图"}},
+                        {"type": 2, "image_item": {
+                            "media": {
+                                "full_url": "https://cdn.example.com/shot.png",
+                                "media_id": "media-image-2",
+                                "mime_type": "image/png",
+                                "size": 2048
+                            }
+                        }}
+                    ]
+                }
+            }
+        }"#,
+        )
+        .unwrap();
+
+        let (tx, mut rx) = mpsc::channel(10);
+        let mut dedup = MessageDeduplicator::new();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            handle_wecom_message(&data, &tx, &mut dedup).await;
+            let msg = rx.recv().await.unwrap();
+            assert_eq!(msg.text, "看一下这张图");
+            assert_eq!(msg.attachments.len(), 1);
+            let attachment = &msg.attachments[0];
+            assert_eq!(attachment.kind, AttachmentKind::Image);
+            assert_eq!(attachment.media_id.as_deref(), Some("media-image-2"));
+            assert_eq!(
+                attachment.url.as_deref(),
+                Some("https://cdn.example.com/shot.png")
+            );
+            assert_eq!(attachment.mime_type.as_deref(), Some("image/png"));
+            assert_eq!(attachment.size_bytes, Some(2048));
+        });
+    }
+
+    #[test]
+    fn mixed_empty_image_item_is_ignored() {
+        let data: Value = serde_json::from_str(
+            r#"{
+            "cmd": "aibot_msg_callback",
+            "headers": {"req_id": "req-empty-image"},
+            "body": {
+                "msgid": "mixed-empty-image",
+                "from": {"userid": "u1"},
+                "chatid": "c1",
+                "chattype": "single",
+                "msgtype": "mixed",
+                "mixed": {
+                    "items": [
+                        {"type": 1, "text_item": {"text": "只有文本有效"}},
+                        {"type": 2, "image_item": {"media": {}}}
+                    ]
+                }
+            }
+        }"#,
+        )
+        .unwrap();
+
+        let (tx, mut rx) = mpsc::channel(10);
+        let mut dedup = MessageDeduplicator::new();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            handle_wecom_message(&data, &tx, &mut dedup).await;
+            let msg = rx.recv().await.unwrap();
+            assert_eq!(msg.text, "只有文本有效");
+            assert!(msg.attachments.is_empty());
+        });
+    }
+
+    #[test]
+    fn parse_mixed_array_with_string_typed_items() {
+        let data: Value = serde_json::from_str(
+            r#"{
+            "cmd": "aibot_msg_callback",
+            "headers": {"req_id": "req-mixed-array"},
+            "body": {
+                "msgid": "mixed-array",
+                "from": {"userid": "u1"},
+                "chatid": "c1",
+                "chattype": "single",
+                "msgtype": "mixed",
+                "mixed": [
+                    {"type": "text", "text": {"content": "看一下这个文件"}},
+                    {"type": "file", "file": {
+                        "media": {
+                            "url": "https://cdn.example.com/report.html",
+                            "media_id": "media-file-2",
+                            "mime_type": "text/html",
+                            "size": "4096"
+                        },
+                        "file_name": "report.html"
+                    }}
+                ]
+            }
+        }"#,
+        )
+        .unwrap();
+
+        let (tx, mut rx) = mpsc::channel(10);
+        let mut dedup = MessageDeduplicator::new();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            handle_wecom_message(&data, &tx, &mut dedup).await;
+            let msg = rx.recv().await.unwrap();
+            assert_eq!(msg.text, "看一下这个文件");
+            assert_eq!(msg.attachments.len(), 1);
+            let attachment = &msg.attachments[0];
+            assert_eq!(attachment.kind, AttachmentKind::File);
+            assert_eq!(attachment.name.as_deref(), Some("report.html"));
+            assert_eq!(attachment.media_id.as_deref(), Some("media-file-2"));
+            assert_eq!(attachment.mime_type.as_deref(), Some("text/html"));
+            assert_eq!(attachment.size_bytes, Some(4096));
+        });
+    }
+
+    #[test]
+    fn parse_mixed_text_from_msgtype_and_direct_string_field() {
+        let data: Value = serde_json::from_str(
+            r#"{
+            "cmd": "aibot_msg_callback",
+            "headers": {"req_id": "req-mixed-msgtype"},
+            "body": {
+                "msgid": "mixed-msgtype",
+                "from": {"userid": "u1"},
+                "chatid": "c1",
+                "chattype": "single",
+                "msgtype": "mixed",
+                "mixed": {
+                    "items": [
+                        {"msgtype": "text", "text": "这张图里有什么？"},
+                        {"msgtype": "image", "image": {
+                            "media": {
+                                "url": "https://cdn.example.com/shot.png",
+                                "media_id": "media-image-3",
+                                "mime_type": "image/png"
+                            }
+                        }}
+                    ]
+                }
+            }
+        }"#,
+        )
+        .unwrap();
+
+        let (tx, mut rx) = mpsc::channel(10);
+        let mut dedup = MessageDeduplicator::new();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            handle_wecom_message(&data, &tx, &mut dedup).await;
+            let msg = rx.recv().await.unwrap();
+            assert_eq!(msg.text, "这张图里有什么？");
+            assert_eq!(msg.attachments.len(), 1);
+            assert_eq!(msg.attachments[0].kind, AttachmentKind::Image);
+        });
+    }
+
+    #[test]
+    fn attachment_filename_prefixes_index_to_avoid_collisions() {
+        let attachment = InboundAttachment {
+            kind: AttachmentKind::Image,
+            name: Some("shot.png".into()),
+            media_id: None,
+            url: None,
+            local_path: None,
+            mime_type: Some("image/png".into()),
+            size_bytes: None,
+            raw: Value::Null,
+        };
+
+        assert_eq!(
+            attachment_filename(&attachment, 0, b"\x89PNG\r\n\x1a\n"),
+            "1-shot.png"
+        );
+        assert_eq!(
+            attachment_filename(&attachment, 1, b"\x89PNG\r\n\x1a\n"),
+            "2-shot.png"
+        );
+    }
+
+    #[test]
+    fn attachment_filename_replaces_untrusted_image_extension() {
+        let attachment = InboundAttachment {
+            kind: AttachmentKind::Image,
+            name: Some("7655903806783167482.image".into()),
+            media_id: None,
+            url: None,
+            local_path: None,
+            mime_type: None,
+            size_bytes: None,
+            raw: Value::Null,
+        };
+
+        assert_eq!(
+            attachment_filename(&attachment, 0, b"\x89PNG\r\n\x1a\nrest"),
+            "1-7655903806783167482.png"
+        );
+    }
+
+    #[test]
+    fn nested_wecom_aes_key_is_found() {
+        let raw = json!({
+            "image": {
+                "media": {
+                    "aeskey": "abc123"
+                }
+            }
+        });
+
+        assert_eq!(
+            find_string_deep(&raw, &["aeskey", "aes_key", "aesKey"]).as_deref(),
+            Some("abc123")
+        );
+    }
+
+    #[test]
+    fn decrypt_wecom_media_uses_aes_256_cbc_and_pkcs7_padding() {
+        use aes::cipher::BlockEncrypt;
+
+        let key = [7u8; 32];
+        let aes_key = base64::engine::general_purpose::STANDARD.encode(key);
+        let plaintext = b"%PDF-test\n";
+        let mut padded = plaintext.to_vec();
+        let pad_len = 32 - (padded.len() % 32);
+        padded.extend(std::iter::repeat_n(pad_len as u8, pad_len));
+
+        let cipher = Aes256::new_from_slice(&key).unwrap();
+        let mut prev = key[..16].to_vec();
+        let mut encrypted = Vec::new();
+        for chunk in padded.chunks_exact(16) {
+            let mut block_bytes = [0u8; 16];
+            for i in 0..16 {
+                block_bytes[i] = chunk[i] ^ prev[i];
+            }
+            let mut block =
+                aes::cipher::generic_array::GenericArray::clone_from_slice(&block_bytes);
+            cipher.encrypt_block(&mut block);
+            encrypted.extend_from_slice(&block);
+            prev.copy_from_slice(&block);
+        }
+
+        assert_eq!(
+            decrypt_wecom_media(&encrypted, &aes_key).unwrap(),
+            plaintext
+        );
+        assert_eq!(
+            decrypt_wecom_media(&encrypted, aes_key.trim_end_matches('=')).unwrap(),
+            plaintext
+        );
     }
 
     #[test]
@@ -1324,7 +2543,7 @@ mod tests {
                 "from": {"userid": "u1"},
                 "chatid": "c1",
                 "chattype": "single",
-                "voice": {"content": "transcribed text from voice"}
+                "voice": {"content": "transcribed text from voice", "media_id": "voice-media-1"}
             }
         }"#,
         )
@@ -1340,6 +2559,41 @@ mod tests {
             handle_wecom_message(&data, &tx, &mut dedup).await;
             let msg = rx.recv().await.unwrap();
             assert_eq!(msg.text, "transcribed text from voice");
+            assert!(msg.attachments.is_empty());
+        });
+    }
+
+    #[test]
+    fn parse_deduplicates_repeated_attachment_identity() {
+        let data: Value = serde_json::from_str(
+            r#"{
+            "cmd": "aibot_msg_callback",
+            "headers": {"req_id": "r1"},
+            "body": {
+                "msgid": "image-1",
+                "from": {"userid": "u1"},
+                "chatid": "c1",
+                "chattype": "single",
+                "image": {"media_id": "media-1", "url": "https://example.com/image.png"},
+                "item_list": [
+                    {"type": 2, "image_item": {"media": {"media_id": "media-1", "url": "https://example.com/image.png"}}}
+                ]
+            }
+        }"#,
+        )
+        .unwrap();
+
+        let (tx, mut rx) = mpsc::channel(10);
+        let mut dedup = MessageDeduplicator::new();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            handle_wecom_message(&data, &tx, &mut dedup).await;
+            let msg = rx.recv().await.unwrap();
+            assert_eq!(msg.attachments.len(), 1);
+            assert_eq!(msg.attachments[0].media_id.as_deref(), Some("media-1"));
         });
     }
 
