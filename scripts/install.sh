@@ -1,10 +1,10 @@
 #!/usr/bin/env sh
-# Install astra-gateway binary from GitHub releases.
+# Install astra, astra-server, or astra-edge binary from GitHub releases.
 # Usage:
 #   curl -sSL https://raw.githubusercontent.com/matrixorigin/astra-suite/main/scripts/install.sh | sh
-#   curl -sSL ... | sh -s -- -v v0.1.0
-#   curl -sSL ... | sh -s -- -y              # auto-append PATH (no prompt)
-#   curl -sSL ... | sh -s -- -d ~/.local/bin  # custom directory
+#   curl -sSL ... | sh -s -- -b astra-server -y
+#   curl -sSL ... | sh -s -- -v v0.1.0 -d ~/.local/bin
+#   curl -sSL ... | sh -s -- -n              # dry-run (print URLs, don't install)
 #
 # Network: tries GitHub directly (10s timeout); on failure falls back to a
 # mirror. Override with ASTRA_GHPROXY=https://your-mirror (default ghfast.top).
@@ -23,9 +23,11 @@ error() { printf '%s\n' "${RED}x $*${NC}" >&2; }
 ok()    { printf '%s\n' "${GREEN}✓${NC} $*"; }
 
 REPO="matrixorigin/astra-suite"
+BINARY="${ASTRA_BINARY:-astra}"
 VERSION=""
 INSTALL_DIR=""
 FORCE=false
+DRY_RUN=false
 GHPROXY="${ASTRA_GHPROXY:-https://ghfast.top}"
 
 # Try direct GitHub URL first (10s timeout); on failure, fall back to a
@@ -60,12 +62,39 @@ resolve_latest() {
 
 while [ $# -gt 0 ]; do
   case "$1" in
+    -b|--binary)  BINARY="$2"; shift 2 ;;
     -v|--version) VERSION="$2"; shift 2 ;;
     -d|--dir)     INSTALL_DIR="$2"; shift 2 ;;
     -y|--yes)     FORCE=true; shift ;;
+    -n|--dry-run) DRY_RUN=true; shift ;;
+    -h|--help)
+      cat <<EOF
+Usage: install.sh [OPTIONS]
+
+Options:
+  -b, --binary NAME   Binary to install (default: astra)
+                       Choices: astra, astra-server, astra-edge
+  -v, --version TAG   Install a specific version (default: latest)
+  -d, --dir PATH      Install directory (default: /usr/local/bin or ~/.local/bin)
+  -y, --yes           Skip confirmation and PATH prompts
+  -n, --dry-run       Print download URLs and exit (no install)
+  -h, --help          Show this help
+
+Environment:
+  ASTRA_BINARY         Same as -b
+  ASTRA_GHPROXY        GitHub mirror base URL (default: https://ghfast.top)
+EOF
+      exit 0
+      ;;
     *) shift ;;
   esac
 done
+
+# Validate binary name
+case "$BINARY" in
+  astra|astra-server|astra-edge) ;;
+  *) error "Unknown binary: $BINARY (choose astra, astra-server, or astra-edge)"; exit 1 ;;
+esac
 
 # ── Platform detection ──────────────────────────────────────────────
 
@@ -117,19 +146,22 @@ fi
 # ── Download & install ──────────────────────────────────────────────
 
 TARGET=$(detect_target)
-ARCHIVE="astra-gateway-${TARGET}.tar.gz"
-URL="https://github.com/$REPO/releases/download/$VERSION/$ARCHIVE"
+ARCHIVE="${BINARY}-${TARGET}.tar.gz"
+CHECKSUM="${BINARY}-${TARGET}.tar.gz.sha256"
+BASE_URL="https://github.com/$REPO/releases/download/$VERSION"
+URL="${BASE_URL}/${ARCHIVE}"
+CHECKSUM_URL="${BASE_URL}/${CHECKSUM}"
 
-info "Installing astra-gateway $VERSION ($TARGET)"
+info "Installing $BINARY $VERSION ($TARGET)"
 info "From: $URL"
-info "To:   $INSTALL_DIR/astra-gateway"
+info "To:   $INSTALL_DIR/$BINARY"
+
+if [ "$DRY_RUN" = true ]; then
+  info "Dry-run mode: skipping download and install"
+  exit 0
+fi
 
 # Prompt the user, even when the script is piped via `curl | sh`.
-# Reads from stdin if it's a tty, otherwise from /dev/tty.
-# Returns 0 with the answer on stdout when input was obtained.
-# Returns 1 (and writes nothing) when no tty is available so the
-# caller can fall back to a non-interactive default.
-# Args: <prompt>   → result on stdout
 ask() {
   _prompt="$1"
   if [ -t 0 ]; then
@@ -138,10 +170,6 @@ ask() {
     printf '%s' "$_ans"
     return 0
   fi
-  # stdin isn't a tty (e.g. piped via `curl | sh`). Try /dev/tty in a
-  # subshell so a redirect failure can't kill the parent script.
-  # Tag the captured input so we can distinguish "user pressed Enter"
-  # (empty answer) from "no tty available" (subshell aborted early).
   printf '%s' "$_prompt" >&2
   _result=$(exec 2>/dev/null; IFS= read -r x </dev/tty && printf 'TTY:%s' "$x") || _result=""
   case "$_result" in
@@ -150,23 +178,69 @@ ask() {
   esac
 }
 
+# Check for already-installed version
+if [ -x "$INSTALL_DIR/$BINARY" ]; then
+  INSTALLED_VER=$("$INSTALL_DIR/$BINARY" --version 2>/dev/null | head -1 || true)
+  if [ -n "$INSTALLED_VER" ] && [ "$INSTALLED_VER" = "$BINARY $VERSION" ]; then
+    ok "$BINARY $VERSION is already installed"
+    exit 0
+  fi
+  if [ -n "$INSTALLED_VER" ]; then
+    warn "Upgrading $INSTALLED_VER → $VERSION"
+  fi
+fi
+
+if [ "$FORCE" != "true" ]; then
+  if ! _ans=$(ask "Install $BINARY $VERSION to $INSTALL_DIR? [y/N] "); then
+    info "Skipping (no tty). Use -y for non-interactive install."
+    exit 0
+  fi
+  case "$_ans" in y|Y|yes|YES) ;; *) info "Aborted."; exit 0 ;; esac
+fi
+
 TMPDIR=$(mktemp -d)
 trap 'rm -rf "$TMPDIR"' EXIT
 
-download "$URL" "$TMPDIR/$ARCHIVE" || { error "Download failed"; exit 1; }
+download "$URL" "$TMPDIR/$ARCHIVE"       || { error "Download failed"; exit 1; }
+download "$CHECKSUM_URL" "$TMPDIR/$CHECKSUM" 2>/dev/null || warn "Checksum not found, skipping verification"
+
+# Sha256 verification
+if [ -f "$TMPDIR/$CHECKSUM" ]; then
+  EXPECTED=$(awk '{print $1}' "$TMPDIR/$CHECKSUM")
+  ACTUAL=$(sha256sum "$TMPDIR/$ARCHIVE" 2>/dev/null | awk '{print $1}' || shasum -a 256 "$TMPDIR/$ARCHIVE" | awk '{print $1}')
+  if [ "$EXPECTED" = "$ACTUAL" ]; then
+    ok "Checksum verified"
+  else
+    error "Checksum mismatch!"
+    error "  Expected: $EXPECTED"
+    error "  Got:      $ACTUAL"
+    exit 1
+  fi
+fi
+
 info "Extracting..."
 tar xzf "$TMPDIR/$ARCHIVE" -C "$TMPDIR"
 
-if [ -w "$INSTALL_DIR" ]; then
-  mv "$TMPDIR/astra-gateway" "$INSTALL_DIR/astra-gateway"
-else
-  info "Need sudo to install to $INSTALL_DIR"
-  sudo mv "$TMPDIR/astra-gateway" "$INSTALL_DIR/astra-gateway"
+# The archive may contain the binary directly or in a subdirectory.
+# Find the binary by name.
+BIN_PATH=$(find "$TMPDIR" -maxdepth 2 -type f -name "$BINARY" | head -1)
+if [ -z "$BIN_PATH" ]; then
+  # Fallback: the binary might be named differently. Try 'astra'.
+  BIN_PATH=$(find "$TMPDIR" -maxdepth 2 -type f -name "$BINARY" -o -name "astra" -type f | head -1)
+fi
+if [ -z "$BIN_PATH" ]; then
+  error "Binary '$BINARY' not found in archive"
+  exit 1
 fi
 
-chmod +x "$INSTALL_DIR/astra-gateway"
+if [ -w "$INSTALL_DIR" ]; then
+  install -m 755 "$BIN_PATH" "$INSTALL_DIR/$BINARY"
+else
+  info "Need sudo to install to $INSTALL_DIR"
+  sudo install -m 755 "$BIN_PATH" "$INSTALL_DIR/$BINARY"
+fi
 
-ok "astra-gateway $VERSION installed to $INSTALL_DIR/astra-gateway"
+ok "$BINARY $VERSION installed to $INSTALL_DIR/$BINARY"
 
 # ── PATH setup ──────────────────────────────────────────────────────
 
@@ -208,7 +282,7 @@ touch "$RC"
 if grep -Fqs "$INSTALL_DIR" "$RC"; then
   ok "$INSTALL_DIR already referenced in $RC"
 else
-  printf '\n# Added by astra-gateway installer\n%s\n' "$LINE" >> "$RC"
+  printf '\n# Added by astra installer\n%s\n' "$LINE" >> "$RC"
   ok "Appended PATH entry to $RC"
 fi
 
