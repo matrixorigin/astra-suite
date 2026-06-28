@@ -1,8 +1,7 @@
 #!/usr/bin/env sh
-# Install astra, astra-server, or astra-edge binary from GitHub releases.
+# Install the astra CLI binary from GitHub releases.
 # Usage:
 #   curl -sSL https://raw.githubusercontent.com/matrixorigin/astra-suite/main/scripts/install.sh | sh
-#   curl -sSL ... | sh -s -- -b astra-server -y
 #   curl -sSL ... | sh -s -- -v v0.1.0 -d ~/.local/bin
 #   curl -sSL ... | sh -s -- -n              # dry-run (print URLs, don't install)
 #
@@ -23,7 +22,7 @@ error() { printf '%s\n' "${RED}x $*${NC}" >&2; }
 ok()    { printf '%s\n' "${GREEN}✓${NC} $*"; }
 
 REPO="matrixorigin/astra-suite"
-BINARY="${ASTRA_BINARY:-astra}"
+BINARY="astra"
 VERSION=""
 INSTALL_DIR=""
 FORCE=false
@@ -62,7 +61,13 @@ resolve_latest() {
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    -b|--binary)  BINARY="$2"; shift 2 ;;
+    -b|--binary)
+      if [ "${2:-}" != "astra" ]; then
+        error "Only the astra CLI is published by this installer; use the Docker image for astra-server"
+        exit 1
+      fi
+      shift 2
+      ;;
     -v|--version) VERSION="$2"; shift 2 ;;
     -d|--dir)     INSTALL_DIR="$2"; shift 2 ;;
     -y|--yes)     FORCE=true; shift ;;
@@ -72,8 +77,6 @@ while [ $# -gt 0 ]; do
 Usage: install.sh [OPTIONS]
 
 Options:
-  -b, --binary NAME   Binary to install (default: astra)
-                       Choices: astra, astra-server, astra-edge
   -v, --version TAG   Install a specific version (default: latest)
   -d, --dir PATH      Install directory (default: /usr/local/bin or ~/.local/bin)
   -y, --yes           Skip confirmation and PATH prompts
@@ -81,20 +84,13 @@ Options:
   -h, --help          Show this help
 
 Environment:
-  ASTRA_BINARY         Same as -b
   ASTRA_GHPROXY        GitHub mirror base URL (default: https://ghfast.top)
 EOF
       exit 0
       ;;
-    *) shift ;;
+    *) error "Unknown option: $1"; exit 1 ;;
   esac
 done
-
-# Validate binary name
-case "$BINARY" in
-  astra|astra-server|astra-edge) ;;
-  *) error "Unknown binary: $BINARY (choose astra, astra-server, or astra-edge)"; exit 1 ;;
-esac
 
 # ── Platform detection ──────────────────────────────────────────────
 
@@ -102,19 +98,12 @@ detect_target() {
   os=$(uname -s | tr '[:upper:]' '[:lower:]')
   arch=$(uname -m)
   case "$arch" in
-    x86_64|amd64) arch="x86_64" ;;
-    aarch64|arm64) arch="aarch64" ;;
+    x86_64|amd64) arch="amd64" ;;
+    aarch64|arm64) arch="arm64" ;;
     *) error "Unsupported architecture: $arch"; exit 1 ;;
   esac
   case "$os" in
-    linux)
-      [ "$arch" = "x86_64" ] && printf "x86_64-unknown-linux-musl" && return
-      [ "$arch" = "aarch64" ] && printf "aarch64-unknown-linux-musl" && return
-      ;;
-    darwin)
-      [ "$arch" = "x86_64" ] && printf "x86_64-apple-darwin" && return
-      [ "$arch" = "aarch64" ] && printf "aarch64-apple-darwin" && return
-      ;;
+    linux|darwin) printf '%s-%s' "$os" "$arch"; return ;;
   esac
   error "Unsupported platform: $os/$arch"
   exit 1
@@ -132,6 +121,9 @@ if [ -z "$VERSION" ]; then
   ok "Latest version: $VERSION"
 fi
 
+TAG="v${VERSION#v}"
+VERSION_STR="${TAG#v}"
+
 # ── Resolve install dir ─────────────────────────────────────────────
 
 if [ -z "$INSTALL_DIR" ]; then
@@ -146,13 +138,13 @@ fi
 # ── Download & install ──────────────────────────────────────────────
 
 TARGET=$(detect_target)
-ARCHIVE="${BINARY}-${TARGET}.tar.gz"
-CHECKSUM="${BINARY}-${TARGET}.tar.gz.sha256"
-BASE_URL="https://github.com/$REPO/releases/download/$VERSION"
+ARCHIVE="${BINARY}-v${VERSION_STR}-${TARGET}.tar.gz"
+CHECKSUM="${ARCHIVE}.sha256"
+BASE_URL="https://github.com/$REPO/releases/download/$TAG"
 URL="${BASE_URL}/${ARCHIVE}"
 CHECKSUM_URL="${BASE_URL}/${CHECKSUM}"
 
-info "Installing $BINARY $VERSION ($TARGET)"
+info "Installing $BINARY $TAG ($TARGET)"
 info "From: $URL"
 info "To:   $INSTALL_DIR/$BINARY"
 
@@ -181,8 +173,8 @@ ask() {
 # Check for already-installed version
 if [ -x "$INSTALL_DIR/$BINARY" ]; then
   INSTALLED_VER=$("$INSTALL_DIR/$BINARY" --version 2>/dev/null | head -1 || true)
-  if [ -n "$INSTALLED_VER" ] && [ "$INSTALLED_VER" = "$BINARY $VERSION" ]; then
-    ok "$BINARY $VERSION is already installed"
+  if [ -n "$INSTALLED_VER" ] && [ "$INSTALLED_VER" = "$BINARY $VERSION_STR" ]; then
+    ok "$BINARY $TAG is already installed"
     exit 0
   fi
   if [ -n "$INSTALLED_VER" ]; then
@@ -191,7 +183,7 @@ if [ -x "$INSTALL_DIR/$BINARY" ]; then
 fi
 
 if [ "$FORCE" != "true" ]; then
-  if ! _ans=$(ask "Install $BINARY $VERSION to $INSTALL_DIR? [y/N] "); then
+  if ! _ans=$(ask "Install $BINARY $TAG to $INSTALL_DIR? [y/N] "); then
     info "Skipping (no tty). Use -y for non-interactive install."
     exit 0
   fi
@@ -240,7 +232,7 @@ else
   sudo install -m 755 "$BIN_PATH" "$INSTALL_DIR/$BINARY"
 fi
 
-ok "$BINARY $VERSION installed to $INSTALL_DIR/$BINARY"
+ok "$BINARY $TAG installed to $INSTALL_DIR/$BINARY"
 
 # ── PATH setup ──────────────────────────────────────────────────────
 
