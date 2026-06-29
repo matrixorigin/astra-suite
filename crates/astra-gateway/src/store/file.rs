@@ -187,14 +187,13 @@ impl GatewayStore for FileGatewayStore {
     ) -> Result<(), StoreError> {
         let key = user_key(platform, user_id);
         let mut users = self.users.write().await;
-        let entry = users.entry(key).or_insert_with(|| UserEntry {
+        users.entry(key).or_insert_with(|| UserEntry {
             platform: platform.to_string(),
             user_id: user_id.to_string(),
-            display_name: String::new(),
+            display_name: display_name.to_string(),
             preferences: HashMap::new(),
             created_at: now_str(),
         });
-        entry.display_name = display_name.to_string();
         drop(users);
         self.flush_users().await
     }
