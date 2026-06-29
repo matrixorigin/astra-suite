@@ -114,7 +114,7 @@ pub async fn upsert_user(
     sqlx::query(
         "INSERT INTO gw_users (platform, platform_user_id, display_name)
          VALUES (?, ?, ?)
-         ON DUPLICATE KEY UPDATE display_name = VALUES(display_name), updated_at = NOW(6)",
+         ON DUPLICATE KEY UPDATE updated_at = NOW(6)",
     )
     .bind(platform)
     .bind(user_id)

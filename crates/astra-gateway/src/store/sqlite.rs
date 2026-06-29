@@ -218,7 +218,6 @@ impl GatewayStore for SqliteGatewayStore {
             "INSERT INTO gw_users (platform, platform_user_id, display_name)
              VALUES (?, ?, ?)
              ON CONFLICT(platform, platform_user_id) DO UPDATE SET
-                display_name = excluded.display_name,
                 updated_at = strftime('%Y-%m-%d %H:%M:%f', 'now')",
         )
         .bind(platform)
@@ -1105,13 +1104,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn upsert_user_updates_display_name() {
+    async fn upsert_user_preserves_display_name() {
         let store = make_store().await;
         store.upsert_user("wx", "u1", "Alice").await.unwrap();
         store.upsert_user("wx", "u1", "Bob").await.unwrap();
 
         // Still only one row.
         assert!(!store.is_first_message("wx", "u1").await.unwrap());
+        let row: (String,) = sqlx::query_as(
+            "SELECT display_name FROM gw_users WHERE platform = ? AND platform_user_id = ?",
+        )
+        .bind("wx")
+        .bind("u1")
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        assert_eq!(row.0, "Alice");
     }
 
     #[tokio::test]
