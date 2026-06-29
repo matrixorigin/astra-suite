@@ -67,8 +67,7 @@ only needed for the gateway's Astra backend.
 | `astra-gateway`           | Run in foreground (Ctrl+C to stop) — handy for debugging |
 
 `update` accepts `--version <version-or-tag>` and `--mirror <url>`.
-New gateway release tags use `astra-gateway-v<version>`; legacy `v<version>`
-tags still work when the gateway asset is present.
+Gateway release tags use the existing `v<version>` format.
 
 ## Backends
 

@@ -3,12 +3,12 @@ name: Release Gateway Binaries
 on:
   push:
     tags:
-      - 'astra-gateway-v*.*.*'
-      - 'astra-gateway-v*.*.*-*'
+      - 'v*.*.*'
+      - 'v*.*.*-*'
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Gateway release tag (e.g. astra-gateway-v0.1.0-rc1); must already exist'
+        description: 'Gateway release tag (e.g. v0.1.0-rc1); must already exist'
         required: true
         type: string
 
@@ -34,9 +34,9 @@ jobs:
             tag="${GITHUB_REF_NAME}"
           fi
 
-          if [[ ! "${tag}" =~ ^astra-gateway-v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+          if [[ ! "${tag}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
             echo "Invalid gateway release tag: ${tag}" >&2
-            echo "Expected format: astra-gateway-v0.4.1 or astra-gateway-v0.4.1-rc.1" >&2
+            echo "Expected format: v0.4.1 or v0.4.1-rc.1" >&2
             exit 1
           fi
 
@@ -155,4 +155,3 @@ jobs:
             artifacts/SHA256SUMS.txt
           generate_release_notes: true
           prerelease: ${{ needs.validate.outputs.prerelease }}
-          make_latest: false

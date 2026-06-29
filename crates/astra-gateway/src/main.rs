@@ -57,7 +57,7 @@ enum Command {
     /// Downloads the prebuilt binary for the current platform and atomically
     /// replaces the running executable.
     Update {
-        /// Install a specific gateway tag or version (e.g. 0.4.0, v0.4.0, astra-gateway-v0.4.0).
+        /// Install a specific gateway tag or version (e.g. 0.4.0, v0.4.0).
         /// Default: latest gateway release.
         #[arg(long)]
         version: Option<String>,
@@ -163,7 +163,6 @@ fn runtime_api_token_path() -> PathBuf {
 
 const REPO: &str = "matrixorigin/astra-suite";
 const BIN_NAME: &str = "astra-gateway";
-const GATEWAY_TAG_PREFIX: &str = "astra-gateway-v";
 
 fn current_target() -> Result<&'static str, String> {
     use std::env::consts::{ARCH, OS};
@@ -270,8 +269,7 @@ fn asset_exists(target_url: &str, proxy: &str) -> bool {
 }
 
 fn gateway_version_from_tag(tag: &str) -> Option<&str> {
-    tag.strip_prefix(GATEWAY_TAG_PREFIX)
-        .or_else(|| tag.strip_prefix('v'))
+    tag.strip_prefix('v')
 }
 
 fn stable_semver_key(version: &str) -> Option<(u64, u64, u64)> {
@@ -291,21 +289,8 @@ fn gateway_archive_url(tag: &str, target: &str) -> String {
 }
 
 fn gateway_tag_candidates(version: &str) -> Vec<String> {
-    if version.starts_with(GATEWAY_TAG_PREFIX) {
-        return vec![version.to_string()];
-    }
-
     let bare = version.strip_prefix('v').unwrap_or(version);
-    let prefixed = format!("{GATEWAY_TAG_PREFIX}{bare}");
-    let legacy = format!("v{bare}");
-    if version.starts_with('v') {
-        return vec![legacy, prefixed];
-    }
-    if prefixed == legacy {
-        vec![prefixed]
-    } else {
-        vec![prefixed, legacy]
-    }
+    vec![format!("v{bare}")]
 }
 
 #[derive(serde::Deserialize)]

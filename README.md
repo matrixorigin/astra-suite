@@ -165,8 +165,8 @@ make stack-clean    # stop containers and remove MatrixOne data
 
 `astra-gateway` assets are built by this repository. `astra` CLI assets are
 uploaded to this repository's releases by the private Astra build pipeline.
-Releases are component-scoped: gateway releases use `astra-gateway-v<version>`
-tags and CLI releases use `astra-cli-v<version>` tags.
+Gateway releases keep the existing `v<version>` tag format; CLI releases use
+`astra-cli-v<version>` tags.
 
 See [docs/releases.md](docs/releases.md).
 

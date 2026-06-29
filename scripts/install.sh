@@ -24,7 +24,6 @@ ok()    { printf '%s\n' "${GREEN}✓${NC} $*"; }
 
 REPO="matrixorigin/astra-suite"
 BINARY="astra-gateway"
-GATEWAY_TAG_PREFIX="astra-gateway-v"
 VERSION=""
 INSTALL_DIR=""
 FORCE=false
@@ -60,7 +59,6 @@ fetch_releases() {
 
 gateway_version_from_tag() {
   case "$1" in
-    ${GATEWAY_TAG_PREFIX}*) printf '%s' "${1#${GATEWAY_TAG_PREFIX}}" ;;
     v*) printf '%s' "${1#v}" ;;
     *) return 1 ;;
   esac
@@ -132,7 +130,6 @@ Environment:
 Examples:
   sh scripts/install.sh
   sh scripts/install.sh -v v0.4.0
-  sh scripts/install.sh -v astra-gateway-v0.4.1
 EOF
 }
 
@@ -176,28 +173,20 @@ detect_target() {
 # ── Resolve version ─────────────────────────────────────────────────
 
 TARGET=$(detect_target)
-FALLBACK_TAG=""
 
 if [ -z "$VERSION" ]; then
   info "Resolving latest gateway version..."
   TAG=$(resolve_latest "$TARGET" || true)
   if [ -z "$TAG" ]; then
     error "Failed to find an astra-gateway release for $TARGET"
-    error "Expected a release tagged astra-gateway-v<version> or legacy v<version>"
+    error "Expected a release tagged v<version>"
     exit 1
   fi
   ok "Latest gateway version: $TAG"
 else
   case "$VERSION" in
-    ${GATEWAY_TAG_PREFIX}*|v*) TAG="$VERSION" ;;
-    *)
-      TAG="${GATEWAY_TAG_PREFIX}${VERSION#v}"
-      FALLBACK_TAG="v${VERSION#v}"
-      if _asset=$(release_asset_url "$TAG" "$TARGET") && ! asset_exists "$_asset"; then
-        TAG="$FALLBACK_TAG"
-        FALLBACK_TAG=""
-      fi
-      ;;
+    v*) TAG="$VERSION" ;;
+    *) TAG="v${VERSION#v}" ;;
   esac
 fi
 
@@ -270,14 +259,8 @@ TMPDIR=$(mktemp -d)
 trap 'rm -rf "$TMPDIR"' EXIT
 
 if ! download "$URL" "$TMPDIR/$ARCHIVE"; then
-  if [ -n "$FALLBACK_TAG" ]; then
-    warn "Retrying legacy release tag: $FALLBACK_TAG"
-    set_release_urls "$FALLBACK_TAG" || { error "Invalid legacy release tag: $FALLBACK_TAG"; exit 1; }
-    download "$URL" "$TMPDIR/$ARCHIVE" || { error "Download failed"; exit 1; }
-  else
-    error "Download failed"
-    exit 1
-  fi
+  error "Download failed"
+  exit 1
 fi
 
 info "Extracting..."
