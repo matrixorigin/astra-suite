@@ -26,7 +26,7 @@ attachments, scheduled tasks, and full observability.
 ## Quick start
 
 ```bash
-# 1. Install (or build from source: cargo build --release -p astra-gateway)
+# 1. Install from releases
 curl -sSL https://raw.githubusercontent.com/matrixorigin/astra-suite/main/scripts/install.sh | sh
 
 # 2. Generate the starter config at ~/.astra-gateway/config.yaml (chmod 600)
@@ -42,6 +42,17 @@ astra-gateway status
 astra-gateway stop
 ```
 
+To build from source instead:
+
+```bash
+cargo build --release -p astra-gateway
+./target/release/astra-gateway init
+./target/release/astra-gateway start
+```
+
+The optional Astra CLI installer lives at `scripts/install-astra.sh`. It is
+only needed for the gateway's Astra backend.
+
 ## Subcommands
 
 | Command                   | Description |
@@ -52,10 +63,12 @@ astra-gateway stop
 | `astra-gateway start`     | Daemonize and run in background (idempotent) |
 | `astra-gateway status`    | Show whether the daemon is running, plus paths |
 | `astra-gateway stop`      | Graceful SIGTERM, escalates to SIGKILL after 15s |
-| `astra-gateway update`    | Self-replace with the latest release (atomic, with `ghfast.top` fallback) |
+| `astra-gateway update`    | Self-replace with the latest gateway release (atomic, with `ghfast.top` fallback) |
 | `astra-gateway`           | Run in foreground (Ctrl+C to stop) — handy for debugging |
 
-`update` accepts `--version <tag>` and `--mirror <url>`.
+`update` accepts `--version <version-or-tag>` and `--mirror <url>`.
+New gateway release tags use `astra-gateway-v<version>`; legacy `v<version>`
+tags still work when the gateway asset is present.
 
 ## Backends
 
@@ -66,7 +79,7 @@ astra-gateway stop
 | `claude`  | `claude` CLI on PATH (Claude Code)        |
 | `codex`   | `codex` CLI on PATH                       |
 | `copilot` | `copilot` CLI on PATH (GitHub Copilot CLI) |
-| `astra`   | An Astra agent server (closed-source today) |
+| `astra`   | `astra` CLI plus an Astra API server, for example the local stack at `127.0.0.1:17001` |
 | `custom`  | Any CLI with JSON / plain-text output     |
 
 Users switch at runtime with `/cli claude`, `/cli codex`, `/cli copilot`, etc.

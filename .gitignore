@@ -21,6 +21,8 @@ Thumbs.db
 # Local configs (users copy from .example)
 gateway.yaml
 !gateway.example.yaml
+.models.yaml
+.models.local.yaml
 
 # Logs / data
 *.log
@@ -37,5 +39,9 @@ vendor/rust-code-agent-sdks
 .claude/scheduled_tasks.lock
 
 # Local docs / plans
-docs/
+docs/*
+!docs/gateway.md
+!docs/install-astra-cli.md
+!docs/local-astra-stack.md
+!docs/releases.md
 test-plan-*.md

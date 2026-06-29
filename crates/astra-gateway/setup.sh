@@ -131,7 +131,7 @@ cat > "$CONFIG_FILE" <<YAML
 # 重新生成: bash gateway-setup.sh
 
 astra:
-  base_url: "http://localhost:8080"
+  base_url: "http://127.0.0.1:17001"
   api_key: ""
   default_model: "$MODEL"
 
@@ -141,6 +141,7 @@ database:
 cli:
   type: $CLI_TYPE
   bin: "$CLI_BIN"
+$([ "$CLI_TYPE" = "astra" ] && echo '  app_server_url: "http://127.0.0.1:17001"')
 $([ "$CLI_TYPE" = "astra" ] && echo "  permission_mode: auto")
 $([ "$CLI_TYPE" = "astra" ] && echo "  model: $MODEL")
 $([ "$CLI_TYPE" = "claude" ] && echo "  model: null")

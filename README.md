@@ -1,102 +1,174 @@
 # Astra Suite
 
-> Open-source tools for the [Astra](https://github.com/matrixorigin/astra) agent ecosystem.
+Public distribution and open-source tools for the Astra agent ecosystem.
 
-Astra is an AI agent runtime with planning, memory, tool orchestration, and multi-model routing. **Astra Suite** provides standalone open-source utilities that extend Astra's reach — each tool works independently and integrates with the broader ecosystem.
+The stable default install path in this repository is `astra-gateway`, the
+open-source chat-platform gateway. Optional Astra backend pieces are also
+published here: the `astra` CLI installer, a local Docker Compose stack, and
+documentation for connecting gateway to a local Astra API server.
 
----
+## User Journeys
 
-## Tools
-
-### [Astra Gateway](crates/astra-gateway)
-
-A production-ready **chat-platform gateway** that bridges messaging apps to AI agent CLIs.
-
-```
-WeChat / WeCom / WhatsApp
-        ↕
-   Astra Gateway
-        ↕
-Claude Code · Codex · Copilot · Astra · Custom CLI
-```
-
-**Highlights:**
-
-- **Zero-config start** — SQLite storage, 3 commands to deploy
-- **Multi-backend** — switch between Claude, Codex, Copilot, Astra at runtime (`/cli`, `/model`)
-- **Gateway tools** — MCP-backed reminders, cron jobs, and file sending from the agent
-- **Attachments** — receive images/files from chat platforms and send local files back
-- **Full observability** — per-request trace, audit chain, durable outbox with retry
-- **Multi-user** — per-user sessions, access control, group chat isolation
-
-**Install:**
+### Install Astra Gateway
 
 ```bash
 curl -sSL https://raw.githubusercontent.com/matrixorigin/astra-suite/main/scripts/install.sh | sh
+astra-gateway --version
+astra-gateway init
+astra-gateway start
 ```
 
-Or grab binaries directly from [GitHub Releases](https://github.com/matrixorigin/astra-suite/releases).
+`scripts/install.sh` installs `astra-gateway` and preserves the existing public
+installer contract.
 
-**Quick start:**
+See [docs/gateway.md](docs/gateway.md) and
+[crates/astra-gateway/README.md](crates/astra-gateway/README.md).
+
+### Optional: Install The Astra CLI
+
+Install the `astra` CLI when you want to talk to an Astra API server directly
+or use gateway's Astra backend:
 
 ```bash
-astra-gateway init     # writes ~/.astra-gateway/config.yaml (WeCom + Claude/Bedrock + SQLite)
-# edit the 3 FILL-ME fields: AWS_BEARER_TOKEN_BEDROCK, wecom.bot_id, wecom.secret
-astra-gateway start    # run as background daemon
-astra-gateway status   # check it's up
-astra-gateway stop     # graceful shutdown
+curl -sSL https://raw.githubusercontent.com/matrixorigin/astra-suite/main/scripts/install-astra.sh | sh
+astra --version
 ```
 
-Upgrade in place with `astra-gateway update`.
+The Astra CLI installer downloads `astra` from this repository's GitHub
+Releases. It does not install `astra-server` or `astra-gateway`.
 
-See [`crates/astra-gateway/README.md`](crates/astra-gateway/README.md) for full documentation.
+To also write a commented model registry template in the current directory:
 
----
+```bash
+curl -sSL https://raw.githubusercontent.com/matrixorigin/astra-suite/main/scripts/install-astra.sh | sh -s -- --init-models
+```
+
+See [docs/install-astra-cli.md](docs/install-astra-cli.md).
+
+### Optional: Run A Local Astra Stack
+
+Use Docker Compose to start MatrixOne, Memoria, and the Astra API server:
+
+```bash
+make stack-env
+# edit deployment/astra-stack/.env:
+#   MEMORIA_EMBEDDING_API_KEY=...
+#   MEMORIA_EMBEDDING_BASE_URL=...
+make stack-up
+make stack-smoke
+```
+
+Then install the CLI, create the first admin, and load model configuration:
+
+```bash
+make cli-install INIT_MODELS=1
+
+astra admin --api-url http://127.0.0.1:17001 register \
+  --username admin \
+  --email admin@example.com \
+  --password '<password>'
+
+# edit .models.yaml: uncomment one model entry and fill real credentials
+astra admin --api-url http://127.0.0.1:17001 model load .models.yaml --update-existing
+```
+
+On a fresh MatrixOne volume, `astra admin register` bootstraps the initial
+administrator. After an admin exists, creating another admin requires an
+existing admin login.
+
+Default local endpoints:
+
+| Service | Endpoint |
+| --- | --- |
+| Astra API | `http://127.0.0.1:17001` |
+| Memoria | `http://127.0.0.1:8100` |
+| MatrixOne | `127.0.0.1:26001` |
+| MatrixOne debug | `http://127.0.0.1:26060` |
+
+See [deployment/astra-stack/README.md](deployment/astra-stack/README.md) and
+[docs/local-astra-stack.md](docs/local-astra-stack.md).
+
+### Use Astra Gateway From Source
+
+`astra-gateway` bridges chat platforms to agent CLIs such as Claude Code,
+Codex, Copilot, Astra, and custom CLIs. It is open source and can run without
+an Astra server by using SQLite plus a non-Astra CLI backend.
+
+```bash
+cargo build --release -p astra-gateway
+./target/release/astra-gateway init
+./target/release/astra-gateway start
+```
+
+When you want gateway to use Astra, start the local stack and configure the
+gateway's Astra profile with `app_server_url: "http://127.0.0.1:17001"`.
+
+See [docs/gateway.md](docs/gateway.md) and
+[crates/astra-gateway/README.md](crates/astra-gateway/README.md).
 
 ## Repository Structure
 
-```
+```text
 astra-suite/
 ├── crates/
-│   ├── astra-gateway/     # Gateway binary + library
-│   └── astra/             # HTTP+SSE client for Astra server
-├── ARCHITECTURE.md        # System design + extension points
-├── CONTRIBUTING.md        # Developer workflow
-├── Makefile               # Build / test / run targets
-└── LICENSE                # MIT
+│   ├── astra/                 # HTTP + SSE client library for Astra server
+│   └── astra-gateway/         # Chat-platform gateway binary + library
+├── deployment/
+│   └── astra-stack/           # Public local stack: Astra API + Memoria + MatrixOne
+├── docs/                      # Public user journeys and release conventions
+├── scripts/
+│   ├── install.sh             # Public astra-gateway installer
+│   └── install-astra.sh       # Optional astra CLI installer
+├── ARCHITECTURE.md
+├── CONTRIBUTING.md
+├── Makefile
+└── LICENSE
 ```
 
 ## Development
 
 ```bash
 make help           # show all targets
-make build          # compile workspace (all targets)
-make release        # release build (astra-gateway only)
-make check          # format + clippy + test (full CI)
+make build          # compile workspace with all targets
+make release        # release build for astra-gateway
+make check          # format + clippy + test
 make test           # fast offline tests
-make test-live      # all tests including live integrations
+make test-live      # live integrations
 make format         # auto-format
-make lint           # fmt check + clippy (CI gate)
+make lint           # fmt check + clippy
 ```
+
+Gateway workflow:
 
 ```bash
+make gateway-install # install astra-gateway from releases
 make init           # generate gateway config + release build
-make run            # start gateway (auto-inits config if missing)
-make stop           # graceful shutdown
+make run            # start gateway
+make stop           # stop gateway
 make restart        # stop + start
-make log            # tail -f gateway log
-make setup          # run gateway setup script
-make clean          # remove all build artifacts
+make log            # tail gateway log
 ```
 
-## Roadmap
+Local Astra stack workflow:
 
-- [x] Astra Gateway (WeChat + WeCom)
-- [x] WhatsApp platform adapters
-- [x] Copilot CLI backend
-- [ ] Feishu (飞书) platform adapter
-- [ ] `astra-bench` — agent evaluation harness
-- [ ] `astra-sync` — cross-device session sync
+```bash
+make cli-install    # install optional astra CLI from releases
+make stack-env      # create deployment/astra-stack/.env and generate secrets
+make stack-up       # start MatrixOne + Memoria + Astra API
+make stack-status   # show compose status
+make stack-logs     # follow logs, optionally SERVICE=api
+make stack-down     # stop containers
+make stack-clean    # stop containers and remove MatrixOne data
+```
+
+## Releases
+
+`astra-gateway` assets are built by this repository. `astra` CLI assets are
+uploaded to this repository's releases by the private Astra build pipeline.
+Releases are component-scoped: gateway releases use `astra-gateway-v<version>`
+tags and CLI releases use `astra-cli-v<version>` tags.
+
+See [docs/releases.md](docs/releases.md).
 
 ## License
 

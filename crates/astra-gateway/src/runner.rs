@@ -5,7 +5,7 @@
 
 use crate::cli_bridge::{self, CliProfile, CliProgress, ReasoningDisplay, ReasoningKind};
 use crate::commands::{self, CommandContext};
-use crate::config::GatewayConfig;
+use crate::config::{DEFAULT_ASTRA_BASE_URL, GatewayConfig};
 use crate::gateway_context::GatewayContext;
 use crate::mcp::tools_cron;
 use crate::platforms::{FeedbackEvent, InboundMessage, OutboundAttachment, PlatformAdapter};
@@ -465,7 +465,7 @@ impl GatewayRunner {
         config: GatewayConfig,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let astra_url = if config.astra.base_url.is_empty() {
-            "http://127.0.0.1:8000"
+            DEFAULT_ASTRA_BASE_URL
         } else {
             &config.astra.base_url
         };
