@@ -2348,18 +2348,9 @@ async fn claude_model_entries(ctx: &CommandContext<'_>) -> Result<Vec<ModelEntry
 
     let candidates = [
         ("opus", "Claude alias: opus", vec!["opus"]),
-        (
-            "opus[1m]",
-            "Claude alias: opus[1m]",
-            vec!["opus1m", "opus 1m"],
-        ),
         ("sonnet", "Claude alias: sonnet", vec!["sonnet"]),
-        (
-            "sonnet[1m]",
-            "Claude alias: sonnet[1m]",
-            vec!["sonnet1m", "sonnet 1m"],
-        ),
         ("haiku", "Claude alias: haiku", vec!["haiku"]),
+        ("fable", "Claude alias: fable", vec!["fable"]),
     ];
 
     for (candidate, desc, aliases) in candidates {
@@ -2649,7 +2640,7 @@ pub(crate) enum ResolvedModel {
 
 /// Match against: numeric index · "默认"/"default" · label
 /// (case-insensitive, whitespace ignored) · alias · exact id.
-/// Anything else → `Unrecognized`.
+/// Any other non-empty single token is accepted as a user-provided model id.
 pub(crate) fn resolve_model_input(input: &str, entries: &[ModelEntry]) -> ResolvedModel {
     let trimmed = input.trim();
     if trimmed.is_empty() {
@@ -2712,7 +2703,7 @@ pub(crate) fn resolve_model_input(input: &str, entries: &[ModelEntry]) -> Resolv
 }
 
 fn is_explicit_model_id(input: &str) -> bool {
-    !input.chars().any(char::is_whitespace) && input.contains('.')
+    !input.chars().any(char::is_whitespace)
 }
 
 fn looks_like_configured_model_id(input: &str) -> bool {
@@ -3105,10 +3096,7 @@ mod tests {
             id(resolve_model_input("vendor.model-v1", &e)),
             "vendor.model-v1"
         );
-        assert!(matches!(
-            resolve_model_input("xyz-model", &e),
-            ResolvedModel::Unrecognized
-        ));
+        assert_eq!(id(resolve_model_input("xyz-model", &e)), "xyz-model");
         assert!(matches!(
             resolve_model_input("opus 12345", &e),
             ResolvedModel::Unrecognized
@@ -3121,10 +3109,10 @@ mod tests {
             resolve_model_input("random text", &e),
             ResolvedModel::Unrecognized
         ));
-        assert!(matches!(
-            resolve_model_input("claude-opus-9-9", &e),
-            ResolvedModel::Unrecognized
-        ));
+        assert_eq!(
+            id(resolve_model_input("claude-opus-9-9", &e)),
+            "claude-opus-9-9"
+        );
     }
 
     #[test]
@@ -3195,12 +3183,12 @@ mod tests {
     }
 
     #[test]
-    fn current_model_resolution_unknown_alias_is_unknown() {
+    fn current_model_resolution_preserves_custom_model_id() {
         let entries = vec![default_model_entry()];
 
         assert_eq!(
             resolved_model_id_from_entries(Some("haiku"), &entries),
-            None
+            Some("haiku".into())
         );
     }
 
