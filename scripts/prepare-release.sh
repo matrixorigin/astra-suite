@@ -1,21 +1,21 @@
 #!/usr/bin/env bash
-# Prepare a release commit and tag for astra-suite.
+# Prepare an astra-gateway release commit and component-scoped tag.
 #
 # Usage:
 #   scripts/prepare-release.sh 0.3.1
-#   scripts/prepare-release.sh v0.3.1 --push
+#   scripts/prepare-release.sh astra-gateway-v0.3.1 --push
 #
-# The GitHub release workflow builds binaries when a v* tag is pushed.
+# The GitHub release workflow builds binaries when an astra-gateway-v* tag is pushed.
 
 set -euo pipefail
 
 usage() {
   cat <<'USAGE'
-Usage: scripts/prepare-release.sh <version|vversion> [--push] [--no-check]
+Usage: scripts/prepare-release.sh <version|vversion|astra-gateway-vversion> [--push] [--no-check]
 
 Examples:
   scripts/prepare-release.sh 0.3.1
-  scripts/prepare-release.sh v0.3.1 --push
+  scripts/prepare-release.sh astra-gateway-v0.3.1 --push
 
 Options:
   --push      Push the release commit and tag after creating them.
@@ -28,8 +28,9 @@ if [[ $# -lt 1 || "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
   exit 0
 fi
 
-version="${1#v}"
-tag="v${version}"
+raw_version="${1#astra-gateway-v}"
+version="${raw_version#v}"
+tag="astra-gateway-v${version}"
 shift
 
 push=false
@@ -55,7 +56,7 @@ while [[ $# -gt 0 ]]; do
   shift
 done
 
-if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
   echo "invalid semver version: $version" >&2
   exit 2
 fi

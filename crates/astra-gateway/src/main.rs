@@ -57,7 +57,8 @@ enum Command {
     /// Downloads the prebuilt binary for the current platform and atomically
     /// replaces the running executable.
     Update {
-        /// Install a specific tag (e.g. v0.2.0). Default: latest release.
+        /// Install a specific gateway tag or version (e.g. 0.4.0, v0.4.0, astra-gateway-v0.4.0).
+        /// Default: latest gateway release.
         #[arg(long)]
         version: Option<String>,
         /// Mirror prefix for github.com (default: $ASTRA_GHPROXY or https://ghfast.top)
@@ -162,6 +163,7 @@ fn runtime_api_token_path() -> PathBuf {
 
 const REPO: &str = "matrixorigin/astra-suite";
 const BIN_NAME: &str = "astra-gateway";
+const GATEWAY_TAG_PREFIX: &str = "astra-gateway-v";
 
 fn current_target() -> Result<&'static str, String> {
     use std::env::consts::{ARCH, OS};
@@ -208,32 +210,142 @@ fn curl_with_fallback(args_direct: &[&str], target_url: &str, proxy: &str) -> Re
     Ok(())
 }
 
-fn resolve_latest_tag(proxy: &str) -> Result<String, String> {
-    let url = format!("https://github.com/{REPO}/releases/latest");
-    let try_one = |target: &str| -> Option<String> {
-        let out = std::process::Command::new("curl")
-            .args([
-                "-sIL",
-                "--max-time",
-                "10",
-                "-o",
-                "/dev/null",
-                "-w",
-                "%{url_effective}",
-            ])
-            .arg(target)
-            .output()
-            .ok()?;
-        let body = String::from_utf8(out.stdout).ok()?;
-        body.rfind("/tag/")
-            .map(|i| body[i + 5..].trim().to_string())
-    };
-    if let Some(v) = try_one(&url) {
-        return Ok(v);
+fn curl_capture_with_fallback(
+    args_direct: &[&str],
+    target_url: &str,
+    proxy: &str,
+) -> Result<String, String> {
+    let mut direct = std::process::Command::new("curl");
+    direct.args(args_direct).arg(target_url);
+    if let Ok(out) = direct.output()
+        && out.status.success()
+    {
+        return String::from_utf8(out.stdout).map_err(|e| format!("curl output utf8: {e}"));
     }
-    eprintln!("Direct version lookup failed, retrying via mirror: {proxy}");
-    try_one(&format!("{}/{}", proxy.trim_end_matches('/'), url))
-        .ok_or_else(|| "failed to resolve latest version".to_string())
+
+    eprintln!("Direct request failed, retrying via mirror: {proxy}");
+    let mirrored = format!("{}/{}", proxy.trim_end_matches('/'), target_url);
+    let mut filtered: Vec<&str> = Vec::with_capacity(args_direct.len());
+    let mut skip_next = false;
+    for a in args_direct {
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+        if *a == "--max-time" {
+            skip_next = true;
+            continue;
+        }
+        filtered.push(a);
+    }
+    let out = std::process::Command::new("curl")
+        .args(&filtered)
+        .arg(&mirrored)
+        .output()
+        .map_err(|e| format!("curl spawn failed: {e}"))?;
+    if !out.status.success() {
+        return Err("curl request failed (direct and mirror)".into());
+    }
+    String::from_utf8(out.stdout).map_err(|e| format!("curl output utf8: {e}"))
+}
+
+fn asset_exists(target_url: &str, proxy: &str) -> bool {
+    let direct = std::process::Command::new("curl")
+        .args(["-fsIL", "--max-time", "10", "-o", "/dev/null"])
+        .arg(target_url)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if direct {
+        return true;
+    }
+
+    let mirrored = format!("{}/{}", proxy.trim_end_matches('/'), target_url);
+    std::process::Command::new("curl")
+        .args(["-fsIL", "-o", "/dev/null"])
+        .arg(mirrored)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+fn gateway_version_from_tag(tag: &str) -> Option<&str> {
+    tag.strip_prefix(GATEWAY_TAG_PREFIX)
+        .or_else(|| tag.strip_prefix('v'))
+}
+
+fn stable_semver_key(version: &str) -> Option<(u64, u64, u64)> {
+    let mut parts = version.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    let patch = parts.next()?.parse().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((major, minor, patch))
+}
+
+fn gateway_archive_url(tag: &str, target: &str) -> String {
+    let archive = format!("{BIN_NAME}-{target}.tar.gz");
+    format!("https://github.com/{REPO}/releases/download/{tag}/{archive}")
+}
+
+fn gateway_tag_candidates(version: &str) -> Vec<String> {
+    if version.starts_with(GATEWAY_TAG_PREFIX) {
+        return vec![version.to_string()];
+    }
+
+    let bare = version.strip_prefix('v').unwrap_or(version);
+    let prefixed = format!("{GATEWAY_TAG_PREFIX}{bare}");
+    let legacy = format!("v{bare}");
+    if version.starts_with('v') {
+        return vec![legacy, prefixed];
+    }
+    if prefixed == legacy {
+        vec![prefixed]
+    } else {
+        vec![prefixed, legacy]
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct GithubRelease {
+    tag_name: String,
+    draft: bool,
+    prerelease: bool,
+}
+
+fn resolve_latest_tag(proxy: &str, target: &str) -> Result<String, String> {
+    let api_url = format!("https://api.github.com/repos/{REPO}/releases?per_page=50");
+    let body = curl_capture_with_fallback(&["-fsSL", "--max-time", "10"], &api_url, proxy)?;
+    let releases: Vec<GithubRelease> =
+        serde_json::from_str(&body).map_err(|e| format!("parse GitHub releases: {e}"))?;
+
+    let mut best: Option<((u64, u64, u64), String)> = None;
+    for release in releases {
+        if release.draft || release.prerelease {
+            continue;
+        }
+        let Some(version) = gateway_version_from_tag(&release.tag_name) else {
+            continue;
+        };
+        let Some(key) = stable_semver_key(version) else {
+            continue;
+        };
+        let archive_url = gateway_archive_url(&release.tag_name, target);
+        if asset_exists(&archive_url, proxy) {
+            let replace = best
+                .as_ref()
+                .map(|(current_key, _)| key > *current_key)
+                .unwrap_or(true);
+            if replace {
+                best = Some((key, release.tag_name));
+            }
+        }
+    }
+
+    best.map(|(_, tag)| tag)
+        .ok_or_else(|| format!("no astra-gateway release found for {target}"))
 }
 
 fn run_self_update(version: Option<String>, mirror: Option<String>) -> Result<(), String> {
@@ -242,22 +354,21 @@ fn run_self_update(version: Option<String>, mirror: Option<String>) -> Result<()
         .unwrap_or_else(|| "https://ghfast.top".into());
 
     let target = current_target()?;
-    let tag = match version {
-        Some(v) if v.starts_with('v') => v,
-        Some(v) => format!("v{v}"),
-        None => resolve_latest_tag(&proxy)?,
+    let tag_candidates = match version {
+        Some(v) => gateway_tag_candidates(&v),
+        None => vec![resolve_latest_tag(&proxy, target)?],
     };
 
     let current = env!("CARGO_PKG_VERSION");
-    if tag == format!("v{current}") {
-        println!("astra-gateway is already at {tag}.");
+    if tag_candidates
+        .iter()
+        .any(|tag| gateway_version_from_tag(tag).is_some_and(|version| version == current))
+    {
+        println!("astra-gateway is already at v{current}.");
         return Ok(());
     }
 
-    println!("Updating astra-gateway: v{current} → {tag} ({target})");
-
     let archive = format!("{BIN_NAME}-{target}.tar.gz");
-    let gh_url = format!("https://github.com/{REPO}/releases/download/{tag}/{archive}");
 
     // Random suffix avoids collisions between concurrent updates; Drop guard
     // ensures cleanup even if download / extract / self-replace fails.
@@ -282,11 +393,28 @@ fn run_self_update(version: Option<String>, mirror: Option<String>) -> Result<()
     let archive_path = tmp.join(&archive);
     let archive_path_str = archive_path.to_string_lossy().into_owned();
 
-    curl_with_fallback(
-        &["-fL#", "--max-time", "10", "-o", &archive_path_str],
-        &gh_url,
-        &proxy,
-    )?;
+    let mut selected_tag = None;
+    let mut last_error = None;
+    for tag in &tag_candidates {
+        println!("Updating astra-gateway: v{current} → {tag} ({target})");
+        let gh_url = format!("https://github.com/{REPO}/releases/download/{tag}/{archive}");
+        match curl_with_fallback(
+            &["-fL#", "--max-time", "10", "-o", &archive_path_str],
+            &gh_url,
+            &proxy,
+        ) {
+            Ok(()) => {
+                selected_tag = Some(tag.clone());
+                break;
+            }
+            Err(err) => {
+                last_error = Some(format!("{tag}: {err}"));
+            }
+        }
+    }
+    let tag = selected_tag.ok_or_else(|| {
+        last_error.unwrap_or_else(|| "failed to download gateway release".to_string())
+    })?;
 
     let status = std::process::Command::new("tar")
         .args(["xzf"])

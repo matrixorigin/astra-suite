@@ -1,0 +1,47 @@
+# Commented model registry template for `astra admin model load`.
+#
+# Copy this file, uncomment one or more model entries, fill real credentials,
+# then load it:
+#   cp deployment/astra-stack/.models.example.yaml .models.yaml
+#   astra admin --api-url http://127.0.0.1:17001 model load .models.yaml --update-existing
+#
+# Do not commit .models.yaml with real API keys.
+
+# --- OpenAI-compatible example ----------------------------------------------
+#
+# - name: qwen-plus
+#   provider: openai
+#   api_key: sk-your-model-api-key
+#   base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
+#   description: "Qwen Plus via OpenAI-compatible API"
+#   tags: [chat, code]
+#   context_window: 1000000
+#   max_completion_tokens: 32768
+#   supported_parameters: [tools]
+
+# --- Anthropic-compatible example -------------------------------------------
+#
+# - name: deepseek-v4-flash-anthropic
+#   provider: anthropic
+#   wire_model_name: deepseek-v4-flash
+#   api_key: sk-your-model-api-key
+#   base_url: https://api.deepseek.com/anthropic
+#   description: "DeepSeek v4 flash via Anthropic-compatible API"
+#   tags: [chat, code, reasoning]
+#   context_window: 1000000
+#   max_completion_tokens: 384000
+#   supported_parameters: [tools]
+#   prompt_cache_capability:
+#     protocol: marker_explicit
+#     volatile_placement: marker_isolated
+#     reuse_scope: conversation_turns
+
+# --- Common fields -----------------------------------------------------------
+#
+# name: Local model name used by `astra chat --model <name>`.
+# provider: openai | anthropic | bedrock | moonshot | glm, depending on server support.
+# wire_model_name: Optional upstream model name when it differs from `name`.
+# api_key: Upstream provider key.
+# base_url: Upstream API base URL.
+# tags: Free-form labels such as chat, code, reasoning, selector.
+# supported_parameters: Set to [tools] when the upstream model supports tool use.

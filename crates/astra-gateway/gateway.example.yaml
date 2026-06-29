@@ -69,7 +69,8 @@ cli:
 # ── Option B: Astra agent (requires astra server running) ──
 # cli:
 #   type: astra
-#   bin: /path/to/astra       # or just "astra" if on PATH
+#   bin: astra                # or full path to the astra CLI
+#   app_server_url: "http://127.0.0.1:17001"
 #   permission_mode: auto     # auto | always-ask | never-ask
 #   model: "MiniMax-M2.7"
 
@@ -162,7 +163,8 @@ providers:
 #     stream_json: true
 #   astra:
 #     type: astra
-#     bin: /path/to/astra
+#     bin: astra
+#     app_server_url: "http://127.0.0.1:17001"
 #     permission_mode: auto
 #     model: "MiniMax-M2.7"
 #   copilot:
@@ -193,7 +195,7 @@ providers:
 # ─── Astra Server (only needed if using astra CLI type) ─────────────────────
 
 # astra:
-#   base_url: "http://127.0.0.1:8000"
+#   base_url: "http://127.0.0.1:17001"
 #   api_key: ""
 #   default_model: "MiniMax-M2.7"
 

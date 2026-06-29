@@ -1,5 +1,7 @@
 use std::path::Path;
 
+pub const DEFAULT_ASTRA_BASE_URL: &str = "http://127.0.0.1:17001";
+
 #[derive(Debug, Clone)]
 pub struct GatewayConfig {
     pub astra: AstraServerConfig,
@@ -226,7 +228,7 @@ impl std::fmt::Debug for AstraServerConfig {
 }
 
 fn default_base_url() -> String {
-    "http://localhost:8080".into()
+    DEFAULT_ASTRA_BASE_URL.into()
 }
 
 /// Environment variables injected into the CLI process when a model belonging

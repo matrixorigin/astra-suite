@@ -1,7 +1,7 @@
 # Architecture
 
-High-level overview of the astra-suite workspace, its internal structure,
-and extension points.
+High-level overview of the astra-suite workspace, its public distribution
+surface, and extension points.
 
 ## Workspace Layout
 
@@ -18,6 +18,18 @@ An HTTP + SSE client library for the Astra agent server. Used by the
 gateway's `astra` CLI backend to communicate with a running Astra
 instance. Provides typed request/response models and streaming event
 parsing.
+
+### deployment/astra-stack
+
+Public Docker Compose stack for local Astra usage. It pulls published images
+for MatrixOne, Memoria, and the Astra API server. It does not include private
+Astra source code.
+
+### scripts/install.sh
+
+Public installer for the `astra` CLI binary uploaded to this repository's
+GitHub Releases by the private Astra build pipeline. It intentionally does not
+install `astra-gateway`.
 
 ## Gateway Architecture
 
