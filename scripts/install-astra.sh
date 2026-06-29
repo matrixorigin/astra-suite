@@ -258,7 +258,7 @@ if [ -z "$VERSION" ]; then
   ok "Latest version: $TAG"
 else
   case "$VERSION" in
-    ${CLI_TAG_PREFIX}*|v*) TAG="$VERSION" ;;
+    ${CLI_TAG_PREFIX}*) TAG="$VERSION" ;;
     *)
       TAG="${CLI_TAG_PREFIX}${VERSION#v}"
       FALLBACK_TAG="v${VERSION#v}"
@@ -371,7 +371,11 @@ download "$CHECKSUM_URL" "$TMPDIR/$CHECKSUM" 2>/dev/null || warn "Checksum not f
 # Sha256 verification
 if [ -f "$TMPDIR/$CHECKSUM" ]; then
   EXPECTED=$(awk '{print $1}' "$TMPDIR/$CHECKSUM")
-  ACTUAL=$(sha256sum "$TMPDIR/$ARCHIVE" 2>/dev/null | awk '{print $1}' || shasum -a 256 "$TMPDIR/$ARCHIVE" | awk '{print $1}')
+  if command -v sha256sum >/dev/null 2>&1; then
+    ACTUAL=$(sha256sum "$TMPDIR/$ARCHIVE" | awk '{print $1}')
+  else
+    ACTUAL=$(shasum -a 256 "$TMPDIR/$ARCHIVE" | awk '{print $1}')
+  fi
   if [ "$EXPECTED" = "$ACTUAL" ]; then
     ok "Checksum verified"
   else
