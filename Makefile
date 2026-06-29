@@ -1,4 +1,4 @@
-.PHONY: help build release test test-live check format lint prepare-release prepare-release-push clean run stop restart log init setup cli-install stack-env stack-check-env stack-config stack-up stack-down stack-clean stack-status stack-logs stack-smoke
+.PHONY: help build release test test-live check format lint prepare-release prepare-release-push clean run stop restart log init setup gateway-install cli-install stack-env stack-check-env stack-config stack-up stack-down stack-clean stack-status stack-logs stack-smoke
 
 GATEWAY_BIN = target/release/astra-gateway
 GATEWAY_PID = /tmp/astra-gateway.pid
@@ -56,12 +56,17 @@ prepare-release-push: ## Prepare gateway release commit/tag and push; usage: mak
 	@test -n "$(VERSION)" || (echo "usage: make prepare-release-push VERSION=0.3.1" >&2; exit 2)
 	scripts/prepare-release.sh $(VERSION) --push
 
+gateway-install: ## Install astra-gateway from GitHub Releases (VERSION=v0.4.0 optional)
+	@args=""; \
+	if [ -n "$(VERSION)" ]; then args="$$args -v $(VERSION)"; fi; \
+	sh scripts/install.sh $$args
+
 cli-install: ## Install astra CLI from GitHub Releases (VERSION=v0.1.0 optional)
 	@args=""; \
 	if [ -n "$(VERSION)" ]; then args="$$args -v $(VERSION)"; fi; \
 	if [ "$(INIT_MODELS)" = "1" ]; then args="$$args --init-models"; fi; \
 	if [ -n "$(MODELS_PATH)" ]; then args="$$args --models-path $(MODELS_PATH)"; fi; \
-	sh scripts/install.sh $$args
+	sh scripts/install-astra.sh $$args
 
 # ─── Run / Stop / Restart ────────────────────────────────────────────────────
 

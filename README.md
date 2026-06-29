@@ -2,32 +2,50 @@
 
 Public distribution and open-source tools for the Astra agent ecosystem.
 
-Astra itself is distributed as published binaries and Docker images. This
-repository provides the public user entry points: the `astra` CLI installer, a
-local Docker Compose stack, documentation, and the open-source `astra-gateway`
-workspace.
+The stable default install path in this repository is `astra-gateway`, the
+open-source chat-platform gateway. Optional Astra backend pieces are also
+published here: the `astra` CLI installer, a local Docker Compose stack, and
+documentation for connecting gateway to a local Astra API server.
 
 ## User Journeys
 
-### Install The Astra CLI
+### Install Astra Gateway
 
 ```bash
 curl -sSL https://raw.githubusercontent.com/matrixorigin/astra-suite/main/scripts/install.sh | sh
+astra-gateway --version
+astra-gateway init
+astra-gateway start
+```
+
+`scripts/install.sh` installs `astra-gateway` and preserves the existing public
+installer contract.
+
+See [docs/gateway.md](docs/gateway.md) and
+[crates/astra-gateway/README.md](crates/astra-gateway/README.md).
+
+### Optional: Install The Astra CLI
+
+Install the `astra` CLI when you want to talk to an Astra API server directly
+or use gateway's Astra backend:
+
+```bash
+curl -sSL https://raw.githubusercontent.com/matrixorigin/astra-suite/main/scripts/install-astra.sh | sh
 astra --version
 ```
 
-The installer downloads the public `astra` CLI from this repository's GitHub
+The Astra CLI installer downloads `astra` from this repository's GitHub
 Releases. It does not install `astra-server` or `astra-gateway`.
 
 To also write a commented model registry template in the current directory:
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/matrixorigin/astra-suite/main/scripts/install.sh | sh -s -- --init-models
+curl -sSL https://raw.githubusercontent.com/matrixorigin/astra-suite/main/scripts/install-astra.sh | sh -s -- --init-models
 ```
 
 See [docs/install-astra-cli.md](docs/install-astra-cli.md).
 
-### Run A Local Astra Stack
+### Optional: Run A Local Astra Stack
 
 Use Docker Compose to start MatrixOne, Memoria, and the Astra API server:
 
@@ -70,7 +88,7 @@ Default local endpoints:
 See [deployment/astra-stack/README.md](deployment/astra-stack/README.md) and
 [docs/local-astra-stack.md](docs/local-astra-stack.md).
 
-### Use Astra Gateway
+### Use Astra Gateway From Source
 
 `astra-gateway` bridges chat platforms to agent CLIs such as Claude Code,
 Codex, Copilot, Astra, and custom CLIs. It is open source and can run without
@@ -99,7 +117,8 @@ astra-suite/
 │   └── astra-stack/           # Public local stack: Astra API + Memoria + MatrixOne
 ├── docs/                      # Public user journeys and release conventions
 ├── scripts/
-│   └── install.sh             # Public astra CLI installer
+│   ├── install.sh             # Public astra-gateway installer
+│   └── install-astra.sh       # Optional astra CLI installer
 ├── ARCHITECTURE.md
 ├── CONTRIBUTING.md
 ├── Makefile
@@ -119,9 +138,10 @@ make format         # auto-format
 make lint           # fmt check + clippy
 ```
 
-Gateway source workflow:
+Gateway workflow:
 
 ```bash
+make gateway-install # install astra-gateway from releases
 make init           # generate gateway config + release build
 make run            # start gateway
 make stop           # stop gateway
@@ -132,7 +152,7 @@ make log            # tail gateway log
 Local Astra stack workflow:
 
 ```bash
-make cli-install    # install astra CLI from releases
+make cli-install    # install optional astra CLI from releases
 make stack-env      # create deployment/astra-stack/.env and generate secrets
 make stack-up       # start MatrixOne + Memoria + Astra API
 make stack-status   # show compose status
@@ -143,10 +163,10 @@ make stack-clean    # stop containers and remove MatrixOne data
 
 ## Releases
 
-`astra` CLI assets are uploaded to this repository's releases by the private
-Astra build pipeline. `astra-gateway` assets are built by this repository.
-Releases are component-scoped: CLI releases use `astra-cli-v<version>` tags and
-gateway releases use `astra-gateway-v<version>` tags.
+`astra-gateway` assets are built by this repository. `astra` CLI assets are
+uploaded to this repository's releases by the private Astra build pipeline.
+Releases are component-scoped: gateway releases use `astra-gateway-v<version>`
+tags and CLI releases use `astra-cli-v<version>` tags.
 
 See [docs/releases.md](docs/releases.md).
 

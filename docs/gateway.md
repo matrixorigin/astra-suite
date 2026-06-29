@@ -25,8 +25,14 @@ cli:
   model: "qwen-plus"
 ```
 
-The root `scripts/install.sh` installs the `astra` CLI only. It is useful for
-the gateway's Astra backend, but it is not a gateway installer.
+Install a released gateway binary:
+
+```bash
+curl -sSL https://raw.githubusercontent.com/matrixorigin/astra-suite/main/scripts/install.sh | sh
+```
+
+The optional Astra CLI installer lives at `scripts/install-astra.sh`; use it
+only when you want the gateway's Astra backend.
 
 For the full gateway reference, see
 [`crates/astra-gateway/README.md`](../crates/astra-gateway/README.md).

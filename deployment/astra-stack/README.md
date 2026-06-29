@@ -36,7 +36,7 @@ The stack does not build the CLI from source. Install the public `astra` binary
 from this repository's releases:
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/matrixorigin/astra-suite/main/scripts/install.sh | sh -s -- --init-models
+curl -sSL https://raw.githubusercontent.com/matrixorigin/astra-suite/main/scripts/install-astra.sh | sh -s -- --init-models
 astra --version
 ```
 

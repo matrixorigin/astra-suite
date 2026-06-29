@@ -1,10 +1,10 @@
 #!/usr/bin/env sh
-# Install astra-gateway binary from GitHub releases.
+# Install the astra CLI binary from GitHub releases.
 # Usage:
-#   curl -sSL https://raw.githubusercontent.com/matrixorigin/astra-suite/main/scripts/install.sh | sh
-#   curl -sSL ... | sh -s -- -v v0.4.0
-#   curl -sSL ... | sh -s -- -y
-#   curl -sSL ... | sh -s -- -d ~/.local/bin
+#   curl -sSL https://raw.githubusercontent.com/matrixorigin/astra-suite/main/scripts/install-astra.sh | sh
+#   curl -sSL ... | sh -s -- -v v0.1.0 -d ~/.local/bin
+#   curl -sSL ... | sh -s -- -n              # dry-run (print URLs, don't install)
+#   curl -sSL ... | sh -s -- --init-models  # also write ./.models.yaml template
 #
 # Network: tries GitHub directly (10s timeout); on failure falls back to a
 # mirror. Override with ASTRA_GHPROXY=https://your-mirror (default ghfast.top).
@@ -23,14 +23,19 @@ error() { printf '%s\n' "${RED}x $*${NC}" >&2; }
 ok()    { printf '%s\n' "${GREEN}✓${NC} $*"; }
 
 REPO="matrixorigin/astra-suite"
-BINARY="astra-gateway"
-GATEWAY_TAG_PREFIX="astra-gateway-v"
+BINARY="astra"
+CLI_TAG_PREFIX="astra-cli-v"
 VERSION=""
 INSTALL_DIR=""
 FORCE=false
 DRY_RUN=false
+INIT_MODELS=false
+MODELS_PATH="${ASTRA_MODELS_PATH:-.models.yaml}"
 GHPROXY="${ASTRA_GHPROXY:-https://ghfast.top}"
 
+# Try direct GitHub URL first (10s timeout); on failure, fall back to a
+# GitHub mirror (default https://ghfast.top, override via ASTRA_GHPROXY).
+# Args: <url> <output-path>
 download() {
   _url="$1"; _out="$2"
   info "Downloading $_url"
@@ -58,9 +63,9 @@ fetch_releases() {
   curl -fsSL "${GHPROXY}/${_url}"
 }
 
-gateway_version_from_tag() {
+cli_version_from_tag() {
   case "$1" in
-    ${GATEWAY_TAG_PREFIX}*) printf '%s' "${1#${GATEWAY_TAG_PREFIX}}" ;;
+    ${CLI_TAG_PREFIX}*) printf '%s' "${1#${CLI_TAG_PREFIX}}" ;;
     v*) printf '%s' "${1#v}" ;;
     *) return 1 ;;
   esac
@@ -69,9 +74,9 @@ gateway_version_from_tag() {
 release_asset_url() {
   _tag="$1"
   _target="$2"
-  gateway_version_from_tag "$_tag" >/dev/null || return 1
-  printf 'https://github.com/%s/releases/download/%s/%s-%s.tar.gz' \
-    "$REPO" "$_tag" "$BINARY" "$_target"
+  _version=$(cli_version_from_tag "$_tag") || return 1
+  printf 'https://github.com/%s/releases/download/%s/%s-v%s-%s.tar.gz' \
+    "$REPO" "$_tag" "$BINARY" "$_version" "$_target"
 }
 
 stable_semver_key() {
@@ -87,9 +92,9 @@ semver_key_gt() {
   [ "$(printf '%s\n%s\n' "$1" "$2" | sort | tail -n 1)" = "$1" ]
 }
 
-# Resolve the latest gateway release by asset presence rather than the
-# repository-wide /releases/latest pointer. astra-suite also hosts astra CLI
-# releases, so repo-level latest can point at the wrong component.
+# Resolve the latest astra CLI release by asset presence rather than the
+# repository-wide /releases/latest pointer. astra-suite also publishes
+# astra-gateway, so repo-level latest can point at the wrong component.
 resolve_latest() {
   _target="$1"
   _json=$(fetch_releases) || return 1
@@ -99,7 +104,7 @@ resolve_latest() {
     case "$_tag" in
       *-rc*|*-alpha*|*-beta*) continue ;;
     esac
-    _version=$(gateway_version_from_tag "$_tag" 2>/dev/null || true)
+    _version=$(cli_version_from_tag "$_tag" 2>/dev/null || true)
     [ -n "$_version" ] || continue
     _key=$(stable_semver_key "$_version")
     [ -n "$_key" ] || continue
@@ -115,36 +120,107 @@ resolve_latest() {
   printf '%s' "$_best_tag"
 }
 
-usage() {
-  cat <<EOF
-Usage: install.sh [OPTIONS]
+write_models_template() {
+  _path="$1"
+  if [ -e "$_path" ]; then
+    warn "$_path already exists; not overwriting"
+    return 0
+  fi
+  _dir=$(dirname "$_path")
+  if [ "$_dir" != "." ]; then
+    mkdir -p "$_dir"
+  fi
+  cat > "$_path" <<'EOF'
+# Commented model registry template for `astra admin model load`.
+#
+# Copy this file, uncomment one or more model entries, fill real credentials,
+# then load it:
+#   astra admin --api-url http://127.0.0.1:17001 model load .models.yaml --update-existing
+#
+# Do not commit .models.yaml with real API keys.
 
-Options:
-  -v, --version TAG   Install a specific gateway version or tag (default: latest)
-  -d, --dir PATH      Install directory (default: /usr/local/bin or ~/.local/bin)
-  -y, --yes           Skip confirmation and PATH prompts
-  -n, --dry-run       Print download URL and exit
-  -h, --help          Show this help
+# --- OpenAI-compatible example ----------------------------------------------
+#
+# - name: qwen-plus
+#   provider: openai
+#   api_key: sk-your-model-api-key
+#   base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
+#   description: "Qwen Plus via OpenAI-compatible API"
+#   tags: [chat, code]
+#   context_window: 1000000
+#   max_completion_tokens: 32768
+#   supported_parameters: [tools]
 
-Environment:
-  ASTRA_GHPROXY        GitHub mirror base URL (default: https://ghfast.top)
+# --- Anthropic-compatible example -------------------------------------------
+#
+# - name: deepseek-v4-flash-anthropic
+#   provider: anthropic
+#   wire_model_name: deepseek-v4-flash
+#   api_key: sk-your-model-api-key
+#   base_url: https://api.deepseek.com/anthropic
+#   description: "DeepSeek v4 flash via Anthropic-compatible API"
+#   tags: [chat, code, reasoning]
+#   context_window: 1000000
+#   max_completion_tokens: 384000
+#   supported_parameters: [tools]
+#   prompt_cache_capability:
+#     protocol: marker_explicit
+#     volatile_placement: marker_isolated
+#     reuse_scope: conversation_turns
 
-Examples:
-  sh scripts/install.sh
-  sh scripts/install.sh -v v0.4.0
-  sh scripts/install.sh -v astra-gateway-v0.4.1
+# --- Common fields -----------------------------------------------------------
+#
+# name: Local model name used by `astra chat --model <name>`.
+# provider: openai | anthropic | bedrock | moonshot | glm, depending on server support.
+# wire_model_name: Optional upstream model name when it differs from `name`.
+# api_key: Upstream provider key.
+# base_url: Upstream API base URL.
+# tags: Free-form labels such as chat, code, reasoning, selector.
+# supported_parameters: Set to [tools] when the upstream model supports tool use.
 EOF
+  ok "Wrote commented model template to $_path"
+}
+
+print_models_hint() {
+  info "Models template: rerun with --init-models to write ./.models.yaml"
 }
 
 # ── Parse args ──────────────────────────────────────────────────────
 
 while [ $# -gt 0 ]; do
   case "$1" in
+    -b|--binary)
+      if [ "${2:-}" != "astra" ]; then
+        error "Only the astra CLI is published by this installer; use the Docker image for astra-server"
+        exit 1
+      fi
+      shift 2
+      ;;
     -v|--version) VERSION="$2"; shift 2 ;;
     -d|--dir)     INSTALL_DIR="$2"; shift 2 ;;
     -y|--yes)     FORCE=true; shift ;;
     -n|--dry-run) DRY_RUN=true; shift ;;
-    -h|--help)    usage; exit 0 ;;
+    --init-models) INIT_MODELS=true; shift ;;
+    --models-path) MODELS_PATH="$2"; shift 2 ;;
+    -h|--help)
+      cat <<EOF
+Usage: install-astra.sh [OPTIONS]
+
+Options:
+  -v, --version TAG   Install a specific version (default: latest)
+  -d, --dir PATH      Install directory (default: /usr/local/bin or ~/.local/bin)
+  -y, --yes           Skip confirmation and PATH prompts
+  -n, --dry-run       Print download URLs and exit (no install)
+      --init-models   Also write a commented .models.yaml template
+      --models-path   Path for --init-models (default: ./.models.yaml)
+  -h, --help          Show this help
+
+Environment:
+  ASTRA_GHPROXY        GitHub mirror base URL (default: https://ghfast.top)
+  ASTRA_MODELS_PATH    Default path for --init-models
+EOF
+      exit 0
+      ;;
     *) error "Unknown option: $1"; exit 1 ;;
   esac
 done
@@ -155,19 +231,12 @@ detect_target() {
   os=$(uname -s | tr '[:upper:]' '[:lower:]')
   arch=$(uname -m)
   case "$arch" in
-    x86_64|amd64) arch="x86_64" ;;
-    aarch64|arm64) arch="aarch64" ;;
+    x86_64|amd64) arch="amd64" ;;
+    aarch64|arm64) arch="arm64" ;;
     *) error "Unsupported architecture: $arch"; exit 1 ;;
   esac
   case "$os" in
-    linux)
-      [ "$arch" = "x86_64" ] && printf "x86_64-unknown-linux-musl" && return
-      [ "$arch" = "aarch64" ] && printf "aarch64-unknown-linux-musl" && return
-      ;;
-    darwin)
-      [ "$arch" = "x86_64" ] && printf "x86_64-apple-darwin" && return
-      [ "$arch" = "aarch64" ] && printf "aarch64-apple-darwin" && return
-      ;;
+    linux|darwin) printf '%s-%s' "$os" "$arch"; return ;;
   esac
   error "Unsupported platform: $os/$arch"
   exit 1
@@ -179,30 +248,26 @@ TARGET=$(detect_target)
 FALLBACK_TAG=""
 
 if [ -z "$VERSION" ]; then
-  info "Resolving latest gateway version..."
+  info "Resolving latest version..."
   TAG=$(resolve_latest "$TARGET" || true)
   if [ -z "$TAG" ]; then
-    error "Failed to find an astra-gateway release for $TARGET"
-    error "Expected a release tagged astra-gateway-v<version> or legacy v<version>"
+    error "Failed to find an astra CLI release for $TARGET"
+    error "Expected a release tagged astra-cli-v<version> with astra-v<version>-$TARGET.tar.gz"
     exit 1
   fi
-  ok "Latest gateway version: $TAG"
+  ok "Latest version: $TAG"
 else
   case "$VERSION" in
-    ${GATEWAY_TAG_PREFIX}*|v*) TAG="$VERSION" ;;
+    ${CLI_TAG_PREFIX}*|v*) TAG="$VERSION" ;;
     *)
-      TAG="${GATEWAY_TAG_PREFIX}${VERSION#v}"
+      TAG="${CLI_TAG_PREFIX}${VERSION#v}"
       FALLBACK_TAG="v${VERSION#v}"
-      if _asset=$(release_asset_url "$TAG" "$TARGET") && ! asset_exists "$_asset"; then
-        TAG="$FALLBACK_TAG"
-        FALLBACK_TAG=""
-      fi
       ;;
   esac
 fi
 
-gateway_version_from_tag "$TAG" >/dev/null || {
-  error "Invalid gateway version tag: $TAG"
+VERSION_STR=$(cli_version_from_tag "$TAG") || {
+  error "Invalid astra CLI version tag: $TAG"
   exit 1
 }
 
@@ -219,14 +284,16 @@ fi
 
 set_release_urls() {
   TAG="$1"
-  gateway_version_from_tag "$TAG" >/dev/null || return 1
-  ARCHIVE="${BINARY}-${TARGET}.tar.gz"
+  VERSION_STR=$(cli_version_from_tag "$TAG") || return 1
+  ARCHIVE="${BINARY}-v${VERSION_STR}-${TARGET}.tar.gz"
+  CHECKSUM="${ARCHIVE}.sha256"
   BASE_URL="https://github.com/$REPO/releases/download/$TAG"
   URL="${BASE_URL}/${ARCHIVE}"
+  CHECKSUM_URL="${BASE_URL}/${CHECKSUM}"
 }
 
 set_release_urls "$TAG" || {
-  error "Invalid gateway version tag: $TAG"
+  error "Invalid astra CLI version tag: $TAG"
   exit 1
 }
 
@@ -238,6 +305,9 @@ info "To:   $INSTALL_DIR/$BINARY"
 
 if [ "$DRY_RUN" = true ]; then
   info "Dry-run mode: skipping download and install"
+  if [ "$INIT_MODELS" = true ]; then
+    info "Would write commented model template to $MODELS_PATH"
+  fi
   exit 0
 fi
 
@@ -257,6 +327,23 @@ ask() {
     *)     printf '\n' >&2; return 1 ;;
   esac
 }
+
+# Check for already-installed version
+if [ -x "$INSTALL_DIR/$BINARY" ]; then
+  INSTALLED_VER=$("$INSTALL_DIR/$BINARY" --version 2>/dev/null | head -1 || true)
+  if [ -n "$INSTALLED_VER" ] && [ "$INSTALLED_VER" = "$BINARY $VERSION_STR" ]; then
+    ok "$BINARY $TAG is already installed"
+    if [ "$INIT_MODELS" = true ]; then
+      write_models_template "$MODELS_PATH"
+    else
+      print_models_hint
+    fi
+    exit 0
+  fi
+  if [ -n "$INSTALLED_VER" ]; then
+    warn "Upgrading $INSTALLED_VER → $VERSION"
+  fi
+fi
 
 if [ "$FORCE" != "true" ]; then
   if ! _ans=$(ask "Install $BINARY $TAG to $INSTALL_DIR? [y/N] "); then
@@ -279,11 +366,32 @@ if ! download "$URL" "$TMPDIR/$ARCHIVE"; then
     exit 1
   fi
 fi
+download "$CHECKSUM_URL" "$TMPDIR/$CHECKSUM" 2>/dev/null || warn "Checksum not found, skipping verification"
+
+# Sha256 verification
+if [ -f "$TMPDIR/$CHECKSUM" ]; then
+  EXPECTED=$(awk '{print $1}' "$TMPDIR/$CHECKSUM")
+  ACTUAL=$(sha256sum "$TMPDIR/$ARCHIVE" 2>/dev/null | awk '{print $1}' || shasum -a 256 "$TMPDIR/$ARCHIVE" | awk '{print $1}')
+  if [ "$EXPECTED" = "$ACTUAL" ]; then
+    ok "Checksum verified"
+  else
+    error "Checksum mismatch!"
+    error "  Expected: $EXPECTED"
+    error "  Got:      $ACTUAL"
+    exit 1
+  fi
+fi
 
 info "Extracting..."
 tar xzf "$TMPDIR/$ARCHIVE" -C "$TMPDIR"
 
+# The archive may contain the binary directly or in a subdirectory.
+# Find the binary by name.
 BIN_PATH=$(find "$TMPDIR" -maxdepth 2 -type f -name "$BINARY" | head -1)
+if [ -z "$BIN_PATH" ]; then
+  # Fallback: the binary might be named differently. Try 'astra'.
+  BIN_PATH=$(find "$TMPDIR" -maxdepth 2 -type f -name "$BINARY" -o -name "astra" -type f | head -1)
+fi
 if [ -z "$BIN_PATH" ]; then
   error "Binary '$BINARY' not found in archive"
   exit 1
@@ -297,6 +405,12 @@ else
 fi
 
 ok "$BINARY $TAG installed to $INSTALL_DIR/$BINARY"
+
+if [ "$INIT_MODELS" = true ]; then
+  write_models_template "$MODELS_PATH"
+else
+  print_models_hint
+fi
 
 # ── PATH setup ──────────────────────────────────────────────────────
 
@@ -338,7 +452,7 @@ touch "$RC"
 if grep -Fqs "$INSTALL_DIR" "$RC"; then
   ok "$INSTALL_DIR already referenced in $RC"
 else
-  printf '\n# Added by astra-gateway installer\n%s\n' "$LINE" >> "$RC"
+  printf '\n# Added by astra installer\n%s\n' "$LINE" >> "$RC"
   ok "Appended PATH entry to $RC"
 fi
 

@@ -1,35 +1,35 @@
 # Install Astra CLI
 
-`scripts/install.sh` installs the public `astra` CLI from GitHub Releases.
+`scripts/install-astra.sh` installs the public `astra` CLI from GitHub Releases.
 It does not install `astra-gateway` and it does not install `astra-server`.
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/matrixorigin/astra-suite/main/scripts/install.sh | sh
+curl -sSL https://raw.githubusercontent.com/matrixorigin/astra-suite/main/scripts/install-astra.sh | sh
 astra --version
 ```
 
 Install a specific version:
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/matrixorigin/astra-suite/main/scripts/install.sh | sh -s -- -v v0.1.0
+curl -sSL https://raw.githubusercontent.com/matrixorigin/astra-suite/main/scripts/install-astra.sh | sh -s -- -v v0.1.0
 ```
 
 Install to a custom directory:
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/matrixorigin/astra-suite/main/scripts/install.sh | sh -s -- -d ~/.local/bin
+curl -sSL https://raw.githubusercontent.com/matrixorigin/astra-suite/main/scripts/install-astra.sh | sh -s -- -d ~/.local/bin
 ```
 
 Preview the download URL without installing:
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/matrixorigin/astra-suite/main/scripts/install.sh | sh -s -- -n
+curl -sSL https://raw.githubusercontent.com/matrixorigin/astra-suite/main/scripts/install-astra.sh | sh -s -- -n
 ```
 
 Write a commented model registry template while installing:
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/matrixorigin/astra-suite/main/scripts/install.sh | sh -s -- --init-models
+curl -sSL https://raw.githubusercontent.com/matrixorigin/astra-suite/main/scripts/install-astra.sh | sh -s -- --init-models
 ```
 
 By default this creates `./.models.yaml` and does not overwrite an existing
@@ -40,7 +40,7 @@ The installer tries GitHub directly first and falls back through
 `ASTRA_GHPROXY`:
 
 ```bash
-ASTRA_GHPROXY=https://ghfast.top sh scripts/install.sh
+ASTRA_GHPROXY=https://ghfast.top sh scripts/install-astra.sh
 ```
 
 Release assets use this naming convention:

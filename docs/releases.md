@@ -15,8 +15,8 @@ this repository's releases. New CLI releases use tags like:
 astra-cli-v<version>
 ```
 
-The public installer discovers the newest release that contains the current
-platform's CLI asset:
+The optional Astra CLI installer, `scripts/install-astra.sh`, discovers the
+newest release that contains the current platform's CLI asset:
 
 ```text
 astra-v<version>-linux-amd64.tar.gz
@@ -29,9 +29,10 @@ Each archive has a matching `.sha256` file.
 
 ## Astra Gateway
 
-This repository builds and releases `astra-gateway` from source. The gateway
-self-update command discovers the newest release that contains the current
-platform's gateway asset. New gateway releases use tags like:
+This repository builds and releases `astra-gateway` from source. The public
+gateway installer, `scripts/install.sh`, and the gateway self-update command
+discover the newest release that contains the current platform's gateway asset.
+New gateway releases use tags like:
 
 ```text
 astra-gateway-v<version>

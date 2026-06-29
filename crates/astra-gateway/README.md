@@ -26,24 +26,32 @@ attachments, scheduled tasks, and full observability.
 ## Quick start
 
 ```bash
-# 1. Build from source
-cargo build --release -p astra-gateway
+# 1. Install from releases
+curl -sSL https://raw.githubusercontent.com/matrixorigin/astra-suite/main/scripts/install.sh | sh
 
 # 2. Generate the starter config at ~/.astra-gateway/config.yaml (chmod 600)
-./target/release/astra-gateway init
+astra-gateway init
 # Edit the file: fill AWS_BEARER_TOKEN_BEDROCK + wecom.bot_id + wecom.secret.
 
 # 3. (WeChat personal account only) Scan QR to log in
-./target/release/astra-gateway weixin login
+astra-gateway weixin login
 
 # 4. Run as a background daemon
-./target/release/astra-gateway start
-./target/release/astra-gateway status
-./target/release/astra-gateway stop
+astra-gateway start
+astra-gateway status
+astra-gateway stop
 ```
 
-The repository root `scripts/install.sh` installs the `astra` CLI only. It is
-useful for the Astra backend, but it is not an `astra-gateway` installer.
+To build from source instead:
+
+```bash
+cargo build --release -p astra-gateway
+./target/release/astra-gateway init
+./target/release/astra-gateway start
+```
+
+The optional Astra CLI installer lives at `scripts/install-astra.sh`. It is
+only needed for the gateway's Astra backend.
 
 ## Subcommands
 

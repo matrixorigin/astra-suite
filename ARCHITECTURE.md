@@ -27,9 +27,15 @@ Astra source code.
 
 ### scripts/install.sh
 
-Public installer for the `astra` CLI binary uploaded to this repository's
-GitHub Releases by the private Astra build pipeline. It intentionally does not
-install `astra-gateway`.
+Public installer for the `astra-gateway` binary released by this repository.
+It preserves the stable `curl .../scripts/install.sh | sh` gateway install
+contract.
+
+### scripts/install-astra.sh
+
+Optional installer for the `astra` CLI binary uploaded to this repository's
+GitHub Releases by the private Astra build pipeline. Use it only when a user
+wants the Astra CLI directly or wants gateway to use the Astra backend.
 
 ## Gateway Architecture
 
