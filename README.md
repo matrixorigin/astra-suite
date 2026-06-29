@@ -47,46 +47,19 @@ See [docs/install-astra-cli.md](docs/install-astra-cli.md).
 
 ### Optional: Run A Local Astra Stack
 
-Use Docker Compose to start MatrixOne, Memoria, and the Astra API server:
+Use Docker Compose when you need a local Astra API server for the CLI or
+gateway's Astra backend:
 
 ```bash
 make stack-env
-# edit deployment/astra-stack/.env:
-#   MEMORIA_EMBEDDING_API_KEY=...
-#   MEMORIA_EMBEDDING_BASE_URL=...
 make stack-up
 make stack-smoke
 ```
 
-Then install the CLI, create the first admin, and load model configuration:
-
-```bash
-make cli-install INIT_MODELS=1
-
-astra admin --api-url http://127.0.0.1:17001 register \
-  --username admin \
-  --email admin@example.com \
-  --password '<password>'
-
-# edit .models.yaml: uncomment one model entry and fill real credentials
-astra admin --api-url http://127.0.0.1:17001 model load .models.yaml --update-existing
-```
-
-On a fresh MatrixOne volume, `astra admin register` bootstraps the initial
-administrator. After an admin exists, creating another admin requires an
-existing admin login.
-
-Default local endpoints:
-
-| Service | Endpoint |
-| --- | --- |
-| Astra API | `http://127.0.0.1:17001` |
-| Memoria | `http://127.0.0.1:8100` |
-| MatrixOne | `127.0.0.1:26001` |
-| MatrixOne debug | `http://127.0.0.1:26060` |
-
-See [deployment/astra-stack/README.md](deployment/astra-stack/README.md) and
-[docs/local-astra-stack.md](docs/local-astra-stack.md).
+After `make stack-env`, fill the required values in
+`deployment/astra-stack/.env`. See
+[deployment/astra-stack/README.md](deployment/astra-stack/README.md) for the
+full bootstrap and model-loading flow.
 
 ### Use Astra Gateway From Source
 
@@ -105,25 +78,6 @@ gateway's Astra profile with `app_server_url: "http://127.0.0.1:17001"`.
 
 See [docs/gateway.md](docs/gateway.md) and
 [crates/astra-gateway/README.md](crates/astra-gateway/README.md).
-
-## Repository Structure
-
-```text
-astra-suite/
-├── crates/
-│   ├── astra/                 # HTTP + SSE client library for Astra server
-│   └── astra-gateway/         # Chat-platform gateway binary + library
-├── deployment/
-│   └── astra-stack/           # Public local stack: Astra API + Memoria + MatrixOne
-├── docs/                      # Public user journeys and release conventions
-├── scripts/
-│   ├── install.sh             # Public astra-gateway installer
-│   └── install-astra.sh       # Optional astra CLI installer
-├── ARCHITECTURE.md
-├── CONTRIBUTING.md
-├── Makefile
-└── LICENSE
-```
 
 ## Development
 
@@ -165,8 +119,8 @@ make stack-clean    # stop containers and remove MatrixOne data
 
 `astra-gateway` assets are built by this repository. `astra` CLI assets are
 uploaded to this repository's releases by the private Astra build pipeline.
-Releases are component-scoped: gateway releases use `astra-gateway-v<version>`
-tags and CLI releases use `astra-cli-v<version>` tags.
+Gateway releases keep the existing `v<version>` tag format. Optional Astra CLI
+releases use `astra-cli-v<version>` tags.
 
 See [docs/releases.md](docs/releases.md).
 

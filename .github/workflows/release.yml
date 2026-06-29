@@ -1,53 +1,18 @@
-name: Release Gateway Binaries
+name: Release Binaries
 
 on:
   push:
     tags:
-      - 'astra-gateway-v*.*.*'
-      - 'astra-gateway-v*.*.*-*'
+      - 'v*.*.*'
+      - 'v*.*.*-*'
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Gateway release tag (e.g. astra-gateway-v0.1.0-rc1); must already exist'
+        description: 'Release tag (e.g. v0.1.0-rc1); must already exist'
         required: true
         type: string
 
 jobs:
-  validate:
-    name: Validate release tag
-    runs-on: ubuntu-latest
-    outputs:
-      tag: ${{ steps.release.outputs.tag }}
-      prerelease: ${{ steps.release.outputs.prerelease }}
-    steps:
-      - name: Resolve release tag
-        id: release
-        shell: bash
-        env:
-          INPUT_TAG: ${{ inputs.tag }}
-        run: |
-          set -euo pipefail
-
-          if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
-            tag="${INPUT_TAG}"
-          else
-            tag="${GITHUB_REF_NAME}"
-          fi
-
-          if [[ ! "${tag}" =~ ^astra-gateway-v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
-            echo "Invalid gateway release tag: ${tag}" >&2
-            echo "Expected format: astra-gateway-v0.4.1 or astra-gateway-v0.4.1-rc.1" >&2
-            exit 1
-          fi
-
-          prerelease=false
-          if [[ "${tag}" == *-* ]]; then
-            prerelease=true
-          fi
-
-          echo "tag=${tag}" >> "${GITHUB_OUTPUT}"
-          echo "prerelease=${prerelease}" >> "${GITHUB_OUTPUT}"
-
   test:
     name: Test gate
     if: github.event_name != 'workflow_dispatch'
@@ -55,8 +20,8 @@ jobs:
 
   build:
     name: Build ${{ matrix.target }}
-    needs: [validate, test]
-    if: always() && needs.validate.result == 'success' && (needs.test.result == 'success' || needs.test.result == 'skipped')
+    needs: [test]
+    if: always() && (needs.test.result == 'success' || needs.test.result == 'skipped')
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -79,7 +44,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ needs.validate.outputs.tag }}
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -129,7 +94,7 @@ jobs:
 
   release:
     name: Create Release
-    needs: [validate, build]
+    needs: build
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -149,10 +114,9 @@ jobs:
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ needs.validate.outputs.tag }}
+          tag_name: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
           files: |
             artifacts/*.tar.gz
             artifacts/SHA256SUMS.txt
           generate_release_notes: true
-          prerelease: ${{ needs.validate.outputs.prerelease }}
-          make_latest: false
+          prerelease: ${{ contains(github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name, '-rc') || contains(github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name, '-beta') || contains(github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name, '-alpha') }}

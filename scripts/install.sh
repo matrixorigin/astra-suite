@@ -2,9 +2,9 @@
 # Install astra-gateway binary from GitHub releases.
 # Usage:
 #   curl -sSL https://raw.githubusercontent.com/matrixorigin/astra-suite/main/scripts/install.sh | sh
-#   curl -sSL ... | sh -s -- -v v0.4.0
-#   curl -sSL ... | sh -s -- -y
-#   curl -sSL ... | sh -s -- -d ~/.local/bin
+#   curl -sSL ... | sh -s -- -v v0.1.0
+#   curl -sSL ... | sh -s -- -y              # auto-append PATH (no prompt)
+#   curl -sSL ... | sh -s -- -d ~/.local/bin  # custom directory
 #
 # Network: tries GitHub directly (10s timeout); on failure falls back to a
 # mirror. Override with ASTRA_GHPROXY=https://your-mirror (default ghfast.top).
@@ -23,14 +23,14 @@ error() { printf '%s\n' "${RED}x $*${NC}" >&2; }
 ok()    { printf '%s\n' "${GREEN}✓${NC} $*"; }
 
 REPO="matrixorigin/astra-suite"
-BINARY="astra-gateway"
-GATEWAY_TAG_PREFIX="astra-gateway-v"
 VERSION=""
 INSTALL_DIR=""
 FORCE=false
-DRY_RUN=false
 GHPROXY="${ASTRA_GHPROXY:-https://ghfast.top}"
 
+# Try direct GitHub URL first (10s timeout); on failure, fall back to a
+# GitHub mirror (default https://ghfast.top, override via ASTRA_GHPROXY).
+# Args: <url> <output-path>
 download() {
   _url="$1"; _out="$2"
   info "Downloading $_url"
@@ -39,14 +39,6 @@ download() {
   fi
   warn "Direct download failed, retrying via mirror: $GHPROXY"
   curl -fL# -o "$_out" "${GHPROXY}/${_url}"
-}
-
-asset_exists() {
-  _url="$1"
-  if curl -fsIL --max-time 10 -o /dev/null "$_url" 2>/dev/null; then
-    return 0
-  fi
-  curl -fsIL -o /dev/null "${GHPROXY}/${_url}" 2>/dev/null
 }
 
 fetch_releases() {
@@ -58,82 +50,21 @@ fetch_releases() {
   curl -fsSL "${GHPROXY}/${_url}"
 }
 
-gateway_version_from_tag() {
-  case "$1" in
-    ${GATEWAY_TAG_PREFIX}*) printf '%s' "${1#${GATEWAY_TAG_PREFIX}}" ;;
-    v*) printf '%s' "${1#v}" ;;
-    *) return 1 ;;
-  esac
-}
-
-release_asset_url() {
-  _tag="$1"
-  _target="$2"
-  gateway_version_from_tag "$_tag" >/dev/null || return 1
-  printf 'https://github.com/%s/releases/download/%s/%s-%s.tar.gz' \
-    "$REPO" "$_tag" "$BINARY" "$_target"
-}
-
-stable_semver_key() {
-  printf '%s\n' "$1" | awk -F. '
-    NF == 3 && $1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ && $3 ~ /^[0-9]+$/ {
-      printf "%010d.%010d.%010d", $1, $2, $3
-    }
-  '
-}
-
-semver_key_gt() {
-  [ "$1" != "$2" ] || return 1
-  [ "$(printf '%s\n%s\n' "$1" "$2" | sort | tail -n 1)" = "$1" ]
-}
-
-# Resolve the latest gateway release by asset presence rather than the
-# repository-wide /releases/latest pointer. astra-suite also hosts astra CLI
-# releases, so repo-level latest can point at the wrong component.
+# Resolve the latest gateway release tag without using the repository-wide
+# /releases/latest pointer, which can point at non-gateway releases.
 resolve_latest() {
-  _target="$1"
   _json=$(fetch_releases) || return 1
-  _best_tag=""
-  _best_key=""
   for _tag in $(printf '%s\n' "$_json" | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p'); do
     case "$_tag" in
-      *-rc*|*-alpha*|*-beta*) continue ;;
+      v[0-9]*.[0-9]*.[0-9]*)
+        printf '%s' "$_tag"
+        return 0
+        ;;
+      *) continue ;;
     esac
-    _version=$(gateway_version_from_tag "$_tag" 2>/dev/null || true)
-    [ -n "$_version" ] || continue
-    _key=$(stable_semver_key "$_version")
-    [ -n "$_key" ] || continue
-    if _asset=$(release_asset_url "$_tag" "$_target") && asset_exists "$_asset"; then
-      if [ -z "$_best_key" ] || semver_key_gt "$_key" "$_best_key"; then
-        _best_key="$_key"
-        _best_tag="$_tag"
-      fi
-    fi
   done
 
-  [ -n "$_best_tag" ] || return 1
-  printf '%s' "$_best_tag"
-}
-
-usage() {
-  cat <<EOF
-Usage: install.sh [OPTIONS]
-
-Options:
-  -v, --version TAG   Install a specific gateway version or tag (default: latest)
-  -d, --dir PATH      Install directory (default: /usr/local/bin or ~/.local/bin)
-  -y, --yes           Skip confirmation and PATH prompts
-  -n, --dry-run       Print download URL and exit
-  -h, --help          Show this help
-
-Environment:
-  ASTRA_GHPROXY        GitHub mirror base URL (default: https://ghfast.top)
-
-Examples:
-  sh scripts/install.sh
-  sh scripts/install.sh -v v0.4.0
-  sh scripts/install.sh -v astra-gateway-v0.4.1
-EOF
+  return 1
 }
 
 # ── Parse args ──────────────────────────────────────────────────────
@@ -143,9 +74,7 @@ while [ $# -gt 0 ]; do
     -v|--version) VERSION="$2"; shift 2 ;;
     -d|--dir)     INSTALL_DIR="$2"; shift 2 ;;
     -y|--yes)     FORCE=true; shift ;;
-    -n|--dry-run) DRY_RUN=true; shift ;;
-    -h|--help)    usage; exit 0 ;;
-    *) error "Unknown option: $1"; exit 1 ;;
+    *) shift ;;
   esac
 done
 
@@ -176,35 +105,16 @@ detect_target() {
 # ── Resolve version ─────────────────────────────────────────────────
 
 TARGET=$(detect_target)
-FALLBACK_TAG=""
 
 if [ -z "$VERSION" ]; then
-  info "Resolving latest gateway version..."
-  TAG=$(resolve_latest "$TARGET" || true)
-  if [ -z "$TAG" ]; then
-    error "Failed to find an astra-gateway release for $TARGET"
-    error "Expected a release tagged astra-gateway-v<version> or legacy v<version>"
+  info "Resolving latest version..."
+  VERSION=$(resolve_latest)
+  if [ -z "$VERSION" ]; then
+    error "Failed to fetch latest version"
     exit 1
   fi
-  ok "Latest gateway version: $TAG"
-else
-  case "$VERSION" in
-    ${GATEWAY_TAG_PREFIX}*|v*) TAG="$VERSION" ;;
-    *)
-      TAG="${GATEWAY_TAG_PREFIX}${VERSION#v}"
-      FALLBACK_TAG="v${VERSION#v}"
-      if _asset=$(release_asset_url "$TAG" "$TARGET") && ! asset_exists "$_asset"; then
-        TAG="$FALLBACK_TAG"
-        FALLBACK_TAG=""
-      fi
-      ;;
-  esac
+  ok "Latest version: $VERSION"
 fi
-
-gateway_version_from_tag "$TAG" >/dev/null || {
-  error "Invalid gateway version tag: $TAG"
-  exit 1
-}
 
 # ── Resolve install dir ─────────────────────────────────────────────
 
@@ -217,31 +127,22 @@ if [ -z "$INSTALL_DIR" ]; then
   fi
 fi
 
-set_release_urls() {
-  TAG="$1"
-  gateway_version_from_tag "$TAG" >/dev/null || return 1
-  ARCHIVE="${BINARY}-${TARGET}.tar.gz"
-  BASE_URL="https://github.com/$REPO/releases/download/$TAG"
-  URL="${BASE_URL}/${ARCHIVE}"
-}
-
-set_release_urls "$TAG" || {
-  error "Invalid gateway version tag: $TAG"
-  exit 1
-}
-
 # ── Download & install ──────────────────────────────────────────────
 
-info "Installing $BINARY $TAG ($TARGET)"
-info "From: $URL"
-info "To:   $INSTALL_DIR/$BINARY"
+TARGET=$(detect_target)
+ARCHIVE="astra-gateway-${TARGET}.tar.gz"
+URL="https://github.com/$REPO/releases/download/$VERSION/$ARCHIVE"
 
-if [ "$DRY_RUN" = true ]; then
-  info "Dry-run mode: skipping download and install"
-  exit 0
-fi
+info "Installing astra-gateway $VERSION ($TARGET)"
+info "From: $URL"
+info "To:   $INSTALL_DIR/astra-gateway"
 
 # Prompt the user, even when the script is piped via `curl | sh`.
+# Reads from stdin if it's a tty, otherwise from /dev/tty.
+# Returns 0 with the answer on stdout when input was obtained.
+# Returns 1 (and writes nothing) when no tty is available so the
+# caller can fall back to a non-interactive default.
+# Args: <prompt>   → result on stdout
 ask() {
   _prompt="$1"
   if [ -t 0 ]; then
@@ -250,6 +151,10 @@ ask() {
     printf '%s' "$_ans"
     return 0
   fi
+  # stdin isn't a tty (e.g. piped via `curl | sh`). Try /dev/tty in a
+  # subshell so a redirect failure can't kill the parent script.
+  # Tag the captured input so we can distinguish "user pressed Enter"
+  # (empty answer) from "no tty available" (subshell aborted early).
   printf '%s' "$_prompt" >&2
   _result=$(exec 2>/dev/null; IFS= read -r x </dev/tty && printf 'TTY:%s' "$x") || _result=""
   case "$_result" in
@@ -258,45 +163,23 @@ ask() {
   esac
 }
 
-if [ "$FORCE" != "true" ]; then
-  if ! _ans=$(ask "Install $BINARY $TAG to $INSTALL_DIR? [y/N] "); then
-    info "Skipping (no tty). Use -y for non-interactive install."
-    exit 0
-  fi
-  case "$_ans" in y|Y|yes|YES) ;; *) info "Aborted."; exit 0 ;; esac
-fi
-
 TMPDIR=$(mktemp -d)
 trap 'rm -rf "$TMPDIR"' EXIT
 
-if ! download "$URL" "$TMPDIR/$ARCHIVE"; then
-  if [ -n "$FALLBACK_TAG" ]; then
-    warn "Retrying legacy release tag: $FALLBACK_TAG"
-    set_release_urls "$FALLBACK_TAG" || { error "Invalid legacy release tag: $FALLBACK_TAG"; exit 1; }
-    download "$URL" "$TMPDIR/$ARCHIVE" || { error "Download failed"; exit 1; }
-  else
-    error "Download failed"
-    exit 1
-  fi
-fi
-
+download "$URL" "$TMPDIR/$ARCHIVE" || { error "Download failed"; exit 1; }
 info "Extracting..."
 tar xzf "$TMPDIR/$ARCHIVE" -C "$TMPDIR"
 
-BIN_PATH=$(find "$TMPDIR" -maxdepth 2 -type f -name "$BINARY" | head -1)
-if [ -z "$BIN_PATH" ]; then
-  error "Binary '$BINARY' not found in archive"
-  exit 1
-fi
-
 if [ -w "$INSTALL_DIR" ]; then
-  install -m 755 "$BIN_PATH" "$INSTALL_DIR/$BINARY"
+  mv "$TMPDIR/astra-gateway" "$INSTALL_DIR/astra-gateway"
 else
   info "Need sudo to install to $INSTALL_DIR"
-  sudo install -m 755 "$BIN_PATH" "$INSTALL_DIR/$BINARY"
+  sudo mv "$TMPDIR/astra-gateway" "$INSTALL_DIR/astra-gateway"
 fi
 
-ok "$BINARY $TAG installed to $INSTALL_DIR/$BINARY"
+chmod +x "$INSTALL_DIR/astra-gateway"
+
+ok "astra-gateway $VERSION installed to $INSTALL_DIR/astra-gateway"
 
 # ── PATH setup ──────────────────────────────────────────────────────
 
