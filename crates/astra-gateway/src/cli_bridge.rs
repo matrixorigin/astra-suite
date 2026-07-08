@@ -892,6 +892,7 @@ fn is_anthropic_env_key(key: &str) -> bool {
             | "ANTHROPIC_DEFAULT_OPUS_MODEL"
             | "ANTHROPIC_DEFAULT_SONNET_MODEL"
             | "ANTHROPIC_DEFAULT_HAIKU_MODEL"
+            | "ANTHROPIC_DEFAULT_FABLE_MODEL"
             | "CLAUDE_CODE_USE_BEDROCK"
             | "AWS_REGION"
             | "AWS_BEARER_TOKEN_BEDROCK"
