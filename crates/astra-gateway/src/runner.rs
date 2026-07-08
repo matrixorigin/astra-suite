@@ -1291,26 +1291,33 @@ impl GatewayRunner {
         let use_codex_app_pool = supports_codex_app_pool;
         let use_codex_mcp = matches!(&cli_profile, CliProfile::Codex { .. });
 
-        let mcp_config = if use_claude_pool || use_codex_mcp {
-            let storage_env = match &self.config.storage {
+        let storage_env = if use_claude_pool || use_codex_mcp {
+            match &self.config.storage {
                 crate::store::StorageConfig::Mysql { url }
                 | crate::store::StorageConfig::MatrixOne { url } => {
-                    crate::mcp::config::McpStorageEnv {
+                    Some(crate::mcp::config::McpStorageEnv {
                         database_url: Some(url.clone()),
                         sqlite_path: None,
-                    }
+                    })
                 }
-                crate::store::StorageConfig::Sqlite { path } => crate::mcp::config::McpStorageEnv {
-                    database_url: None,
-                    sqlite_path: Some(path.clone()),
-                },
-                _ => crate::mcp::config::McpStorageEnv {
+                crate::store::StorageConfig::Sqlite { path } => {
+                    Some(crate::mcp::config::McpStorageEnv {
+                        database_url: None,
+                        sqlite_path: Some(path.clone()),
+                    })
+                }
+                _ => Some(crate::mcp::config::McpStorageEnv {
                     database_url: None,
                     sqlite_path: None,
-                },
-            };
-            crate::mcp::config::generate_gateway_mcp_config(
-                &storage_env,
+                }),
+            }
+        } else {
+            None
+        };
+
+        let mcp_config = if let Some(ref env) = storage_env {
+            write_mcp_config_file(
+                env,
                 msg.platform,
                 &effective_chat_id,
                 &msg.user_id,
@@ -1337,11 +1344,16 @@ impl GatewayRunner {
             let mcp_config_path = mcp_config
                 .as_ref()
                 .map(|config| config.claude_config_path.clone());
+            let storage_env_clone = storage_env.clone();
             let pc = provider_config.clone();
             let sid = sid.clone();
             let pool_store = self.store.clone();
             let pool_platform = msg.platform.to_string();
             let pool_cli_name = cli_name.clone();
+            let pool_user_id = msg.user_id.clone();
+            let project_dirs = self.config.project_dirs.clone();
+            let runtime_api_url = self.runtime_api_url.clone();
+            let runtime_api_token = self.runtime_api_token.clone();
 
             tokio::spawn(async move {
                 let mut attempt_sid = sid;
@@ -1449,6 +1461,24 @@ impl GatewayRunner {
                             "pool: cleared stale session; retrying without resume"
                         );
                         pool.lock().await.kill(&pool_key);
+                        // Regenerate MCP config file since kill() deleted it
+                        if let Some(ref env) = storage_env_clone
+                            && let Err(e) = write_mcp_config_file(
+                                env,
+                                &pool_platform,
+                                &pool_key,
+                                &pool_user_id,
+                                &project_dirs,
+                                runtime_api_url.as_deref(),
+                                runtime_api_token.as_deref(),
+                            )
+                        {
+                            tracing::warn!(
+                                key = %pool_key,
+                                error = %e,
+                                "failed to regenerate MCP config for stale-session retry"
+                            );
+                        }
                         attempt_sid = None;
                         retried_stale_session = true;
                         continue;
@@ -3447,6 +3477,30 @@ impl GatewayRunner {
             }
         }
     }
+}
+
+/// Write the gateway MCP config file for a conversation and return the generated config.
+/// Used both for the initial pool spawn and for regeneration after a stale-session
+/// retry (kill() deletes the file, so it must be rewritten before the retry reuses it).
+fn write_mcp_config_file(
+    env: &crate::mcp::config::McpStorageEnv,
+    platform: &str,
+    chat_id: &str,
+    user_id: &str,
+    project_dirs: &[String],
+    runtime_api_url: Option<&str>,
+    runtime_api_token: Option<&str>,
+) -> Result<crate::mcp::config::GeneratedMcpConfig, String> {
+    crate::mcp::config::generate_gateway_mcp_config(
+        env,
+        platform,
+        chat_id,
+        user_id,
+        project_dirs,
+        runtime_api_url,
+        runtime_api_token,
+    )
+    .map_err(|e| e.to_string())
 }
 
 async fn recv_from_any(adapters: &[Box<dyn PlatformAdapter>]) -> Option<AdapterRecv> {
