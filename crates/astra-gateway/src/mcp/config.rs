@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 
 /// Storage info passed to the MCP server subprocess via environment variables.
 /// The generated Claude MCP config is 0600 because env values can include credentials.
+#[derive(Clone)]
 pub struct McpStorageEnv {
     pub database_url: Option<String>,
     pub sqlite_path: Option<String>,
