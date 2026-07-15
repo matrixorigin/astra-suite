@@ -438,6 +438,13 @@ pub fn next_cron_run_str_with_tz(expr: &str, tz_offset_hours: i32) -> String {
     let minute_field = parts[0];
     let hour_field = parts[1];
 
+    // A wildcard minute means every minute. Treat it like */1 rather than
+    // falling through to the fixed-time parser, where `*` would otherwise
+    // become minute 0 and hour 9.
+    if minute_field == "*" {
+        return next_step_minutes(now_local, 1, hour_field, parts[4], offset);
+    }
+
     // Handle */N minute patterns (sub-hourly)
     if let Some(step_str) = minute_field.strip_prefix("*/")
         && let Ok(step) = step_str.parse::<u32>()
@@ -882,6 +889,20 @@ mod tests {
             diff.num_minutes() <= 5,
             "*/5 should fire within 5 min, got {} min",
             diff.num_minutes()
+        );
+    }
+
+    #[test]
+    fn next_cron_wildcard_minute_runs_within_one_minute() {
+        let next = next_cron_run_str_with_tz("* * * * *", 0);
+        let next_dt = chrono::NaiveDateTime::parse_from_str(&next, "%Y-%m-%d %H:%M:%S").unwrap();
+        let now_dt = chrono::Utc::now().naive_utc();
+        let diff = next_dt - now_dt;
+        assert!(next_dt > now_dt, "next_run {next} should be in the future");
+        assert!(
+            diff.num_seconds() <= 60,
+            "wildcard minute should fire within 60 seconds, got {} seconds",
+            diff.num_seconds()
         );
     }
 

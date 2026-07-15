@@ -1,12 +1,9 @@
 //! Cron scheduler — polls gw_cron_jobs and executes due tasks.
 
-use crate::cli_bridge::{self, CliProfile};
-use crate::config::GatewayConfig;
-use crate::runner::{OutboundMessage, OutboxDelivery};
-use crate::store::{self, GatewayStore};
-use crate::trace_model::{
-    ConversationKey, GatewayRequest, RunStatus, TraceRepository, TraceWriter,
-};
+use crate::platforms::{ChatType, InboundMessage};
+use crate::runner::{OutboundMessage, OutboxDelivery, ScheduledAgentTurn};
+use crate::store::GatewayStore;
+use crate::trace_model::{ConversationKey, GatewayRequest, TraceRepository, TraceWriter};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -14,26 +11,50 @@ use tokio::sync::mpsc;
 const POLL_INTERVAL: Duration = Duration::from_secs(60);
 #[cfg(test)]
 const CLI_TIMEOUT: Duration = Duration::from_secs(300);
+const POLL_UNTIL_RESULT_MARKER: &str = "[[ASTRA_POLL_UNTIL_RESULT]]";
+const SILENT_MARKER: &str = "[[ASTRA_SILENT]]";
+
+fn parse_poll_result(response: &str) -> (String, bool) {
+    let silent = response.contains(SILENT_MARKER);
+    (
+        response
+            .replace(SILENT_MARKER, "")
+            .replace(POLL_UNTIL_RESULT_MARKER, "")
+            .trim()
+            .to_string(),
+        silent,
+    )
+}
+
+fn platform_name(name: &str) -> Option<&'static str> {
+    match name {
+        "wecom" => Some("wecom"),
+        "weixin" => Some("weixin"),
+        "whatsapp" => Some("whatsapp"),
+        "whatsapp_web" => Some("whatsapp_web"),
+        _ => None,
+    }
+}
 
 pub struct CronScheduler {
     store: Arc<dyn GatewayStore>,
-    config: GatewayConfig,
     trace_repo: Arc<dyn TraceRepository>,
     outbound_tx: mpsc::Sender<OutboundMessage>,
+    agent_turn_tx: mpsc::Sender<ScheduledAgentTurn>,
 }
 
 impl CronScheduler {
     pub fn new(
         store: Arc<dyn GatewayStore>,
-        config: GatewayConfig,
         trace_repo: Arc<dyn TraceRepository>,
         outbound_tx: mpsc::Sender<OutboundMessage>,
+        agent_turn_tx: mpsc::Sender<ScheduledAgentTurn>,
     ) -> Self {
         Self {
             store,
-            config,
             trace_repo,
             outbound_tx,
+            agent_turn_tx,
         }
     }
 
@@ -96,168 +117,78 @@ impl CronScheduler {
                 continue;
             }
             // once_exec and recurring cron both invoke the agent below
-
-            let (cli_profile, provider_config) = self.resolve_cli_profile(platform, &user_id).await;
-            let cli_name = cli_profile.name().to_string();
-            let workspace = self.resolve_workspace(platform, &user_id).await;
-            let session_id = self
-                .store
-                .get_current_session(platform, chat_id, &cli_name)
-                .await
-                .ok()
-                .flatten();
-            let trace = self
-                .begin_scheduler_trace(job_id, platform, chat_id, &cli_name, message)
-                .await;
-            let run_id = if let Some(writer) = trace.as_ref() {
-                writer.start_run(&cli_name, session_id.clone()).await.ok()
-            } else {
-                None
+            let Some(platform_name) = platform_name(platform) else {
+                tracing::warn!(job_id = %job_id, platform = %platform, "unsupported cron platform");
+                continue;
+            };
+            let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+            let turn = ScheduledAgentTurn {
+                message: InboundMessage {
+                    platform: platform_name,
+                    chat_id: chat_id.clone(),
+                    user_id: user_id.clone(),
+                    text: message.clone(),
+                    attachments: Vec::new(),
+                    msg_id: format!("cron-{job_id}-{}", uuid::Uuid::new_v4()),
+                    chat_type: ChatType::DirectMessage,
+                    reply_token: None,
+                    route_override: None,
+                    feedback: None,
+                },
+                response_tx,
             };
 
-            let cli_future = cli_bridge::run_cli_with_context_and_timeout(
-                &cli_profile,
-                message,
-                session_id.as_deref(),
-                workspace.as_deref(),
-                None,
-                None,
-                Some(Duration::from_secs(self.config.cli_timeout_secs.max(1))),
-                None, // scheduler does not use shared auth token
-                provider_config.as_ref(),
-            );
-
-            let response = match cli_future.await {
-                Ok(r) => {
-                    if let Some(ref sid) = r.session_id
-                        && let Err(e) = self
-                            .store
-                            .set_current_session(platform, chat_id, "", sid, &cli_name)
-                            .await
-                    {
-                        tracing::warn!(error = %e, "scheduler: failed to save session");
-                    }
-                    if let Some(writer) = trace.as_ref()
-                        && let Some(ref run_id) = run_id
-                    {
-                        let status = if r.exit_code == 0 {
-                            RunStatus::Succeeded
-                        } else {
-                            RunStatus::Failed
-                        };
-                        if let Err(e) = writer
-                            .finish_run(run_id, status, Some(r.exit_code), Some(&r.stderr))
-                            .await
-                        {
-                            tracing::warn!(error = %e, "scheduler: failed to finish run trace");
-                        }
-                    }
-                    r.text.unwrap_or(r.stdout)
+            if let Err(e) = self.agent_turn_tx.send(turn).await {
+                tracing::warn!(job_id = %job_id, error = %e, "failed to enqueue scheduled agent turn");
+                continue;
+            }
+            let response = match response_rx.await {
+                Ok(Some(response)) => response.text,
+                Ok(None) => {
+                    tracing::warn!(job_id = %job_id, "scheduled agent turn produced no response");
+                    continue;
                 }
                 Err(e) => {
-                    if let Some(writer) = trace.as_ref()
-                        && let Some(ref run_id) = run_id
-                        && let Err(te) = writer
-                            .finish_run(run_id, RunStatus::Failed, None, Some(&e))
-                            .await
-                    {
-                        tracing::warn!(error = %te, "scheduler: failed to finish run trace");
-                    }
-                    format!("⚠️ 执行失败: {e}")
+                    tracing::warn!(job_id = %job_id, error = %e, "scheduled agent turn response dropped");
+                    continue;
                 }
             };
 
-            let prefix = format!("⏰ **定时任务 `{}`**\n\n", &job_id[..8.min(job_id.len())]);
-            let body = format!("{prefix}{response}");
-            if let Some(writer) = trace.as_ref() {
-                match writer.enqueue_outbox(platform, chat_id, None, &body).await {
-                    Ok(outbox_id) => {
-                        if let Err(e) = self
-                            .outbound_tx
-                            .send(OutboundMessage::with_outbox(
-                                platform.clone(),
-                                chat_id.clone(),
-                                body,
-                                None,
-                                Some(writer.request_id().to_string()),
-                                OutboxDelivery {
-                                    outbox_id,
-                                    trace_id: writer.trace_id().clone(),
-                                    request_id: writer.request_id().clone(),
-                                },
-                            ))
-                            .await
-                        {
-                            tracing::warn!(error = %e, "scheduler: outbound send failed");
-                        }
-                    }
-                    Err(e) => tracing::warn!(error = %e, "scheduler outbox enqueue failed"),
+            let polling = message.contains(POLL_UNTIL_RESULT_MARKER);
+            let (response, silent) = parse_poll_result(&response);
+            let completed = is_one_shot || (polling && !silent);
+            let deliver = !silent;
+
+            if deliver {
+                let prefix = format!("⏰ **定时任务 `{}`**\n\n", &job_id[..8.min(job_id.len())]);
+                let body = format!("{prefix}{response}");
+                let outbound = self
+                    .enqueue_scheduler_outbox(
+                        job_id,
+                        platform,
+                        chat_id,
+                        &user_id,
+                        "scheduled",
+                        &body,
+                        None,
+                    )
+                    .await
+                    .unwrap_or_else(|_| {
+                        OutboundMessage::plain(platform.clone(), chat_id.clone(), body)
+                    });
+                if let Err(e) = self.outbound_tx.send(outbound).await {
+                    tracing::warn!(job_id = %job_id, error = %e, "scheduler: outbound send failed");
                 }
-            } else if let Err(e) = self
-                .outbound_tx
-                .send(OutboundMessage::plain(
-                    platform.clone(),
-                    chat_id.clone(),
-                    body,
-                ))
-                .await
-            {
-                tracing::warn!(error = %e, "scheduler: outbound send failed");
             }
 
-            if is_one_shot {
+            if completed {
                 if let Err(e) = self.store.delete_cron_job(job_id).await {
-                    tracing::error!(job_id = %job_id, error = %e, "failed to delete one-shot job — will re-fire");
+                    tracing::error!(job_id = %job_id, error = %e, "failed to delete completed scheduled job — will re-fire");
                 }
             } else if let Err(e) = self.store.mark_job_run(job_id, cron_expr).await {
                 tracing::warn!(job_id = %job_id, error = %e, "scheduler: failed to mark job run");
             }
         }
-    }
-
-    async fn resolve_cli_profile(
-        &self,
-        platform: &str,
-        user_id: &str,
-    ) -> (CliProfile, Option<crate::config::ProviderConfig>) {
-        let mut profile = if let Ok(Some(name)) = self
-            .store
-            .get_user_preference(platform, user_id, "cli_profile")
-            .await
-            && let Some(profile) = self.config.cli_profiles.get(&name)
-        {
-            profile.clone()
-        } else {
-            self.config.cli.clone()
-        };
-        let model_key = store::model_preference_key(profile.name(), None);
-        if let Ok(Some(model_name)) = self
-            .store
-            .get_user_preference(platform, user_id, &model_key)
-            .await
-            && !model_name.is_empty()
-        {
-            profile.set_model_override(model_name);
-        }
-        let provider = crate::cli_bridge::provider_for_cli_profile(&self.config, &profile);
-        (profile, provider)
-    }
-
-    async fn resolve_workspace(&self, platform: &str, user_id: &str) -> Option<std::path::PathBuf> {
-        let user_workspace = self
-            .store
-            .get_user_preference(platform, user_id, "workspace")
-            .await
-            .ok()
-            .flatten()
-            .and_then(|ws| crate::workspace::resolve_existing_dir(&ws));
-
-        user_workspace.or_else(|| {
-            self.config
-                .working_dir
-                .as_deref()
-                .and_then(crate::workspace::resolve_existing_dir)
-        })
     }
 
     /// Resolve the user_id who created the cron job.
@@ -329,5 +260,48 @@ mod tests {
     fn constants() {
         assert_eq!(POLL_INTERVAL.as_secs(), 60);
         assert_eq!(CLI_TIMEOUT.as_secs(), 300);
+    }
+
+    #[test]
+    fn poll_result_silent() {
+        let (text, silent) = parse_poll_result("still running\n[[ASTRA_SILENT]]");
+        assert_eq!(text, "still running");
+        assert!(silent);
+    }
+
+    #[test]
+    fn poll_result_visible() {
+        let (text, silent) = parse_poll_result("final report");
+        assert_eq!(text, "final report");
+        assert!(!silent);
+    }
+
+    #[test]
+    fn poll_result_does_not_deliver_input_marker_if_model_echoes_it() {
+        let (text, silent) = parse_poll_result("External task ready\n[[ASTRA_POLL_UNTIL_RESULT]]");
+        assert_eq!(text, "External task ready");
+        assert!(!silent);
+    }
+
+    #[test]
+    fn poll_result_only_marker_becomes_empty() {
+        let (text, silent) = parse_poll_result("[[ASTRA_SILENT]]");
+        assert_eq!(text, "");
+        assert!(silent);
+    }
+
+    #[test]
+    fn platform_names_are_restricted_to_configured_adapters() {
+        assert_eq!(platform_name("wecom"), Some("wecom"));
+        assert_eq!(platform_name("weixin"), Some("weixin"));
+        assert_eq!(platform_name("unknown"), None);
+    }
+
+    #[test]
+    fn polling_mode_is_opt_in() {
+        assert!(
+            format!("{POLL_UNTIL_RESULT_MARKER}\ncheck status").contains(POLL_UNTIL_RESULT_MARKER)
+        );
+        assert!(!"ordinary recurring task".contains(POLL_UNTIL_RESULT_MARKER));
     }
 }

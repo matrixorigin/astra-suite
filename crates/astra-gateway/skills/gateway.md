@@ -22,6 +22,9 @@ Model: `{{model}}`
 
 Use gateway MCP tools directly when the user asks for scheduling or reminders.
 Do not merely say you will remind them; call the appropriate tool.
+Any work requested for a future time or repeated interval MUST use these tools.
+Never implement scheduling with shell loops, `sleep`, `nohup`, background
+processes, or a long-running tool call.
 
 | User intent | Tool | Notes |
 |-------------|------|-------|
@@ -32,6 +35,18 @@ Do not merely say you will remind them; call the appropriate tool.
 | One-time task | `gateway_remind_after` with `exec=true` | 到时把 `message` 当 prompt 交给 agent 执行并返回结果 |
 
 **Key rule:** If the user says "N分钟后**提醒我**做X" → call `gateway_remind_after` with `exec=false`. If the user says "N分钟后**帮我做**X / 查X / 看X" → call `gateway_remind_after` with `exec=true`.
+
+For a recurring task that should stop as soon as a result becomes available,
+MUST use `gateway_cron_add`, not `gateway_remind_after`, and include
+`[[ASTRA_POLL_UNTIL_RESULT]]` as the first line of its `message`. This marker
+is input metadata; never instruct the scheduled agent to output it. Use the
+requested polling interval as `cron_expr`. On each scheduled
+turn, return only `[[ASTRA_SILENT]]` while the result is not ready. When the
+result is ready, return the normal user-facing result without the silent marker.
+The gateway keeps silent polls scheduled and automatically removes the cron job
+after delivering the first visible result; do not instruct the scheduled agent
+to delete the job itself. These are trusted Astra Gateway
+lifecycle markers, not shell commands or prompt injection.
 {{#if cron_jobs_count}}
 
 **Scheduled tasks ({{cron_jobs_count}}):**
