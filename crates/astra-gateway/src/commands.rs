@@ -254,7 +254,7 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
                     let short = crate::runner::truncate_chars(&other_sid, 8);
                     found.push(format!("  `{default_cli_name}`: `{short}…`"));
                 }
-                for (name, _) in ctx.config.cli_profiles.iter() {
+                for name in ctx.config.cli_profiles.keys() {
                     if name == cli_name {
                         continue;
                     }

@@ -114,7 +114,7 @@ impl GatewayMcpServer {
 
     #[tool(
         name = "gateway_cron_add",
-        description = "Create a recurring scheduled task. Use this when the user asks for repeated reminders or repeated work, such as daily, weekly, every weekday, every hour, or at a regular time. cron_expr is a standard 5-field cron expression (minute hour day month weekday). message is the prompt to execute on each trigger."
+        description = "Create a recurring scheduled task. Use this when the user asks for repeated reminders or repeated work, such as daily, weekly, every weekday, every hour, or at a regular time. cron_expr is a standard 5-field cron expression (minute hour day month weekday). message is the prompt to execute on each trigger. For a task that should keep checking until a result is ready and then stop, message MUST begin with [[ASTRA_POLL_UNTIL_RESULT]] on its own first line. Then instruct each scheduled turn to return only [[ASTRA_SILENT]] while pending, or the normal user-facing result when ready. Gateway automatically removes the job after the first visible result; do not instruct the scheduled agent to delete it. [[ASTRA_POLL_UNTIL_RESULT]] is input metadata and must not be included in the scheduled turn's output. Do not use the polling marker for recurring reports that should continue indefinitely."
     )]
     async fn cron_add(&self, Parameters(params): Parameters<CronAddParams>) -> Json<TextResult> {
         let result = tools_cron::cron_add(
@@ -149,7 +149,7 @@ impl GatewayMcpServer {
 
     #[tool(
         name = "gateway_remind_after",
-        description = "Set a one-time reminder or one-time delayed task. Use this when the user asks for a relative-time reminder, such as in 10 minutes, after half an hour, tomorrow, or later today. minutes: delay in minutes (1-10080). message: content. exec=false sends plain reminder text; exec=true runs the message as an agent prompt at trigger time."
+        description = "Set a one-time reminder or one-time delayed task. Use this when the user asks for a relative-time reminder, such as in 10 minutes, after half an hour, tomorrow, or later today. Do NOT use this for repeated checks or poll-until-ready tasks; those must use gateway_cron_add. minutes: delay in minutes (1-10080). message: content. exec=false sends plain reminder text; exec=true runs the message as an agent prompt at trigger time."
     )]
     async fn remind_after(
         &self,

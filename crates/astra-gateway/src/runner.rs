@@ -443,10 +443,20 @@ impl PlatformAdapter for NullAdapter {
 /// Response from a background CLI task, routed back to the adapter.
 type CliResponse = OutboundMessage;
 
+/// Agent turn submitted by the scheduler. It shares the normal conversation
+/// queue, pool, and session, but defers all delivery until the scheduler has
+/// inspected the final response.
+pub struct ScheduledAgentTurn {
+    pub message: InboundMessage,
+    pub response_tx: tokio::sync::oneshot::Sender<Option<OutboundMessage>>,
+}
+
 struct QueuedRequest {
     msg: InboundMessage,
     conversation: ConversationKey,
     trace: Option<OutboxDeliveryTrace>,
+    background: bool,
+    scheduled_response_tx: Option<tokio::sync::oneshot::Sender<Option<OutboundMessage>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -923,7 +933,7 @@ impl GatewayRunner {
         msg: &InboundMessage,
         adapter: &dyn PlatformAdapter,
     ) -> Option<String> {
-        self.handle_message_inner(msg, adapter, None)
+        self.handle_message_inner(msg, adapter, None, false)
             .await
             .map(|outbound| outbound.text)
     }
@@ -933,8 +943,14 @@ impl GatewayRunner {
         msg: &InboundMessage,
         adapter: &dyn PlatformAdapter,
         trace: Option<OutboxDeliveryTrace>,
+        background: bool,
     ) -> Option<OutboundMessage> {
         let mut msg = msg.clone();
+        let execution_outbound_tx = if background {
+            None
+        } else {
+            self.outbound_tx.clone()
+        };
         if let Some(feedback) = msg.feedback.as_ref() {
             self.record_feedback(&msg, feedback).await;
             return None;
@@ -1019,7 +1035,7 @@ impl GatewayRunner {
         // Send first-time welcome after upsert
         if is_first {
             let welcome = build_welcome_message(&cli_profile);
-            if let Some(ref tx) = self.outbound_tx {
+            if let Some(ref tx) = execution_outbound_tx {
                 let _ = tx
                     .send(OutboundMessage::plain(
                         msg.platform.to_string(),
@@ -1884,7 +1900,7 @@ impl GatewayRunner {
                                         && stream_id.is_some()
                                         && accumulated.len() + chunk.len() > STREAM_MAX_BYTES
                                     {
-                                        send_stream(&accumulated, &self.outbound_tx, msg.platform, &chat_id, reply_token.clone(), stream_id.clone(), true);
+                                        send_stream(&accumulated, &execution_outbound_tx, msg.platform, &chat_id, reply_token.clone(), stream_id.clone(), true);
                                         accumulated.clear();
                                         stream_id = reply_token.as_ref().map(|_| uuid::Uuid::new_v4().to_string());
                                     }
@@ -1898,7 +1914,7 @@ impl GatewayRunner {
                                         progressive_text_len = accumulated.len();
                                     }
                                     if !stream_cutoff_active {
-                                        send_stream(&accumulated, &self.outbound_tx, msg.platform, &chat_id, reply_token.clone(), stream_id.clone(), false);
+                                        send_stream(&accumulated, &execution_outbound_tx, msg.platform, &chat_id, reply_token.clone(), stream_id.clone(), false);
                                     }
                                 }
                             }
@@ -1937,7 +1953,7 @@ impl GatewayRunner {
                                 if stream_cutoff_active {
                                     post_stream_buffer.push_str(&chunk);
                                 } else {
-                                    send_stream(&accumulated, &self.outbound_tx, msg.platform, &chat_id, reply_token.clone(), stream_id.clone(), false);
+                                    send_stream(&accumulated, &execution_outbound_tx, msg.platform, &chat_id, reply_token.clone(), stream_id.clone(), false);
                                 }
                             }
                         }
@@ -1969,7 +1985,7 @@ impl GatewayRunner {
                                         &mut accumulated,
                                         reasoning_kind,
                                         &cli_name,
-                                        &self.outbound_tx,
+                                        &execution_outbound_tx,
                                         msg.platform,
                                         &chat_id,
                                         reply_token.clone(),
@@ -1985,7 +2001,7 @@ impl GatewayRunner {
                                         &mut accumulated,
                                         reasoning_kind,
                                         &cli_name,
-                                        &self.outbound_tx,
+                                        &execution_outbound_tx,
                                         msg.platform,
                                         &chat_id,
                                         reply_token.clone(),
@@ -2027,7 +2043,7 @@ impl GatewayRunner {
                             lines.push(String::new());
                             lines.push("回复 `/approve` 继续，或 `/deny` 拒绝。".to_string());
 
-                            if let Some(ref tx) = self.outbound_tx {
+                            if let Some(ref tx) = execution_outbound_tx {
                                 let _ = tx.try_send(OutboundMessage {
                                     platform: msg.platform.to_string(),
                                     chat_id: chat_id.clone(),
@@ -2049,7 +2065,7 @@ impl GatewayRunner {
                                     &mut accumulated,
                                     reasoning_kind,
                                     &cli_name,
-                                    &self.outbound_tx,
+                                    &execution_outbound_tx,
                                     msg.platform,
                                     &chat_id,
                                     reply_token.clone(),
@@ -2095,13 +2111,13 @@ impl GatewayRunner {
                             if stream_cutoff_active {
                                 send_plain_ai(
                                     post_stream_buffer.clone(),
-                                    &self.outbound_tx,
+                                    &execution_outbound_tx,
                                     msg.platform,
                                     &chat_id,
                                 );
                                 post_stream_final_sent = true;
                             } else {
-                                send_stream(&accumulated, &self.outbound_tx, msg.platform, &chat_id, reply_token.clone(), stream_id.clone(), true);
+                                send_stream(&accumulated, &execution_outbound_tx, msg.platform, &chat_id, reply_token.clone(), stream_id.clone(), true);
                             }
                             break;
                         }
@@ -2115,7 +2131,7 @@ impl GatewayRunner {
                     if !accumulated.is_empty() && stream_id.is_some() {
                         progressive_text_len = accumulated.len();
                     }
-                    send_stream(&accumulated, &self.outbound_tx, msg.platform, &chat_id, reply_token.clone(), stream_id.clone(), true);
+                    send_stream(&accumulated, &execution_outbound_tx, msg.platform, &chat_id, reply_token.clone(), stream_id.clone(), true);
                     stream_id = None;
                     stream_cutoff_active = true;
                     post_stream_heartbeat_timer.as_mut().reset(
@@ -2133,7 +2149,7 @@ impl GatewayRunner {
                         "[{request_tag}] 流式窗口已切段，仍在继续处理；当前已累积后续输出 {} 字节。",
                         post_stream_buffer.len() + token_buf.len()
                     );
-                    send_plain(heartbeat, &self.outbound_tx, msg.platform, &chat_id);
+                    send_plain(heartbeat, &execution_outbound_tx, msg.platform, &chat_id);
                     post_stream_heartbeat_timer.as_mut().reset(
                         tokio::time::Instant::now() + WECOM_POST_STREAM_HEARTBEAT,
                     );
@@ -2142,7 +2158,7 @@ impl GatewayRunner {
                     if !sent_initial_ack {
                         sent_initial_ack = true;
                         let ack = format!("[{request_tag}] 🤔 {cli_name} 思考中…");
-                        if let Some(ref tx) = self.outbound_tx {
+                        if let Some(ref tx) = execution_outbound_tx {
                             let _ = tx.try_send(OutboundMessage {
                                 platform: msg.platform.to_string(),
                                 chat_id: chat_id.clone(),
@@ -2447,7 +2463,7 @@ impl GatewayRunner {
 
         // Execute gateway actions embedded in agent response
         let mut action_results_text = String::new();
-        if text.contains("[[GATEWAY:") {
+        if !background && text.contains("[[GATEWAY:") {
             let mut action_results = Vec::new();
             text = execute_gateway_actions_with_policy(
                 &text,
@@ -2584,6 +2600,20 @@ impl GatewayRunner {
                 .await
         {
             tracing::warn!(error = %e, "failed to record usage");
+        }
+
+        // Scheduled turns share the normal conversation queue, pool, and
+        // session, but the scheduler owns delivery and lifecycle decisions.
+        // Return the raw final response without creating an outbox entry.
+        if background {
+            if let Some(writer) = trace_writer.as_ref() {
+                let _ = writer.complete_request().await;
+            }
+            return Some(OutboundMessage::plain(
+                msg.platform.to_string(),
+                msg.chat_id.clone(),
+                text,
+            ));
         }
 
         // When progressive streaming already delivered the main content, the
@@ -3013,6 +3043,8 @@ impl GatewayRunner {
             msg,
             conversation,
             trace,
+            background: false,
+            scheduled_response_tx: None,
         }
     }
 
@@ -3065,6 +3097,36 @@ impl GatewayRunner {
         }
     }
 
+    async fn enqueue_scheduled_agent_turn(
+        self: &Arc<Self>,
+        turn: ScheduledAgentTurn,
+        cli_resp_tx: tokio::sync::mpsc::Sender<CliResponse>,
+    ) {
+        let mut queued = self
+            .build_queued_request_with_profile_override(turn.message, None)
+            .await;
+        queued.background = true;
+        queued.scheduled_response_tx = Some(turn.response_tx);
+        let key = queued.conversation.clone();
+        let tx = {
+            let mut queues = self.queue_senders.lock().await;
+            if let Some(tx) = queues.get(&key) {
+                tx.clone()
+            } else {
+                let (tx, rx) = tokio::sync::mpsc::channel(128);
+                queues.insert(key.clone(), tx.clone());
+                let runner = self.clone();
+                tokio::spawn(async move {
+                    runner.run_conversation_worker(key, rx, cli_resp_tx).await;
+                });
+                tx
+            }
+        };
+        if let Err(e) = tx.send(queued).await {
+            tracing::warn!(error = %e, "failed to enqueue scheduled agent turn");
+        }
+    }
+
     async fn run_conversation_worker(
         self: Arc<Self>,
         key: ConversationKey,
@@ -3095,10 +3157,19 @@ impl GatewayRunner {
             let Ok(_permit) = self.global_run_limiter.clone().acquire_owned().await else {
                 break;
             };
-            match self
-                .handle_message_inner(&queued.msg, &NullAdapter, queued.trace.clone())
-                .await
-            {
+            let response = self
+                .handle_message_inner(
+                    &queued.msg,
+                    &NullAdapter,
+                    queued.trace.clone(),
+                    queued.background,
+                )
+                .await;
+            if let Some(response_tx) = queued.scheduled_response_tx {
+                let _ = response_tx.send(response);
+                continue;
+            }
+            match response {
                 Some(outbound) => {
                     let _ = cli_resp_tx.send(outbound).await;
                 }
@@ -3292,6 +3363,7 @@ impl GatewayRunner {
         self: std::sync::Arc<Self>,
         adapters: Vec<Box<dyn PlatformAdapter>>,
         mut cron_rx: tokio::sync::mpsc::Receiver<OutboundMessage>,
+        mut scheduled_turn_rx: tokio::sync::mpsc::Receiver<ScheduledAgentTurn>,
         mut inject_rx: tokio::sync::mpsc::Receiver<InboundMessage>,
         mut runtime_cmd_rx: tokio::sync::mpsc::Receiver<crate::runtime_api::RuntimeCommand>,
         mut shutdown: tokio::sync::broadcast::Receiver<()>,
@@ -3336,7 +3408,7 @@ impl GatewayRunner {
                     match inbound {
                         Some(AdapterRecv::Message(msg)) => {
                             if msg.feedback.is_some() {
-                                self.handle_message_inner(&msg, &NullAdapter, None).await;
+                                self.handle_message_inner(&msg, &NullAdapter, None, false).await;
                                 continue;
                             }
                             // Fast path: slash commands — instant, no CLI
@@ -3382,11 +3454,16 @@ impl GatewayRunner {
                         self.deliver_outbound(&adapters, &adapter_indices, outbound).await;
                     }
                 }
+                scheduled = scheduled_turn_rx.recv() => {
+                    if let Some(turn) = scheduled {
+                        self.enqueue_scheduled_agent_turn(turn, cli_resp_tx.clone()).await;
+                    }
+                }
                 injected = inject_rx.recv() => {
                     if let Some(msg) = injected {
                         tracing::info!(platform = "inject", chat_id = %msg.chat_id, user = %msg.user_id, text = %msg.text, "injected message");
                         if msg.feedback.is_some() {
-                            self.handle_message_inner(&msg, &NullAdapter, None).await;
+                            self.handle_message_inner(&msg, &NullAdapter, None, false).await;
                             continue;
                         }
                         match self.handle_fast(&msg).await {

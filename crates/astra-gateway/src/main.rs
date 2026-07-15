@@ -878,8 +878,6 @@ async fn main() {
             std::process::exit(1);
         }
     };
-    let scheduler_config = config.clone();
-
     let mut adapters: Vec<Box<dyn astra_gateway::platforms::PlatformAdapter>> = Vec::new();
 
     if let Some(wecom_cfg) = config.platforms.wecom
@@ -923,6 +921,7 @@ async fn main() {
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
     let (cron_tx, cron_rx) = tokio::sync::mpsc::channel(64);
+    let (scheduled_turn_tx, scheduled_turn_rx) = tokio::sync::mpsc::channel(64);
     let (inject_tx, inject_rx) = tokio::sync::mpsc::channel(64);
     let (runtime_cmd_tx, runtime_cmd_rx) = tokio::sync::mpsc::channel(64);
     runner.set_outbound_tx(cron_tx.clone());
@@ -954,9 +953,9 @@ async fn main() {
     if let (Some(store), Some(trace_repo)) = (runner.store(), runner.trace_repo()) {
         let scheduler = astra_gateway::scheduler::CronScheduler::new(
             store,
-            scheduler_config,
             trace_repo,
             cron_tx,
+            scheduled_turn_tx,
         );
         let _scheduler_handle = scheduler.spawn(shutdown_tx.subscribe());
     } else {
@@ -987,7 +986,14 @@ async fn main() {
 
     let runner = std::sync::Arc::new(runner);
     runner
-        .run(adapters, cron_rx, inject_rx, runtime_cmd_rx, shutdown_rx)
+        .run(
+            adapters,
+            cron_rx,
+            scheduled_turn_rx,
+            inject_rx,
+            runtime_cmd_rx,
+            shutdown_rx,
+        )
         .await;
 }
 

@@ -137,6 +137,14 @@ impl GatewayContext {
         lines.push(
             r#"- "提醒我X" → gateway_remind_after(exec=false); "帮我做X" → gateway_remind_after(exec=true)"#.into(),
         );
+        lines.push(
+            "- Poll-until-ready tasks MUST use gateway_cron_add (never gateway_remind_after), with the requested check interval as cron_expr. The message MUST begin with [[ASTRA_POLL_UNTIL_RESULT]] on its own first line. Then instruct scheduled turns to return only [[ASTRA_SILENT]] while pending and a normal user-facing result when ready. Gateway automatically removes the job after the first visible result, so do not tell the scheduled agent to delete it. Never instruct a scheduled turn to output [[ASTRA_POLL_UNTIL_RESULT]]; it is input metadata, not output. Use this for \"keep checking until done, then notify me\"; do not use it for recurring reports that should continue indefinitely."
+                .into(),
+        );
+        lines.push(
+            "- Any work requested for a future time or repeated interval MUST use gateway scheduling tools. Never implement scheduling with shell loops, sleep, nohup, background processes, or a long-running tool call."
+                .into(),
+        );
         lines.join("\n")
     }
 }
@@ -311,6 +319,20 @@ mod tests {
             !prompt.contains(LEGACY_GATEWAY_PREFIX),
             "must not expose legacy syntax"
         );
+    }
+
+    #[test]
+    fn slim_prompt_explains_poll_until_result_protocol() {
+        let ctx = GatewayContext::new("u1", "Test", "weixin", &CliProfile::default(), true);
+        let prompt = ctx.to_slim_system_prompt();
+        assert!(prompt.contains("[[ASTRA_POLL_UNTIL_RESULT]]"));
+        assert!(prompt.contains("[[ASTRA_SILENT]]"));
+        assert!(prompt.contains("MUST use gateway_cron_add (never gateway_remind_after)"));
+        assert!(prompt.contains("MUST begin with [[ASTRA_POLL_UNTIL_RESULT]]"));
+        assert!(prompt.contains("it is input metadata, not output"));
+        assert!(prompt.contains("do not tell the scheduled agent to delete it"));
+        assert!(prompt.contains("do not use it for recurring reports"));
+        assert!(prompt.contains("Never implement scheduling with shell loops"));
     }
 
     #[test]
