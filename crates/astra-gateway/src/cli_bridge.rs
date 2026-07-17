@@ -1095,6 +1095,35 @@ fn first_model_usage(v: &serde_json::Value) -> Option<&serde_json::Value> {
     v["modelUsage"].as_object()?.values().next()
 }
 
+fn cumulative_model_usage(v: &serde_json::Value) -> Option<ClaudeUsageSnapshot> {
+    let models = v["modelUsage"].as_object()?;
+    if models.is_empty() {
+        return None;
+    }
+
+    let sum = |field: &str| {
+        let values = models
+            .values()
+            .map(|usage| usage[field].as_u64())
+            .collect::<Vec<_>>();
+        sum_tokens(&values)
+    };
+
+    Some(ClaudeUsageSnapshot {
+        tokens_prompt: sum("inputTokens"),
+        tokens_completion: sum("outputTokens"),
+        cache_creation_input_tokens: sum("cacheCreationInputTokens"),
+        cache_read_input_tokens: sum("cacheReadInputTokens"),
+        cost_usd: v["total_cost_usd"].as_f64().or_else(|| {
+            let costs = models
+                .values()
+                .filter_map(|usage| usage["costUSD"].as_f64())
+                .collect::<Vec<_>>();
+            (!costs.is_empty()).then(|| costs.into_iter().sum())
+        }),
+    })
+}
+
 fn parse_api_error_payload(text: &str) -> Option<serde_json::Value> {
     let data = text
         .lines()
@@ -1248,54 +1277,58 @@ pub(crate) fn normalize_claude_pool_usage(
     result: &mut CliResult,
     previous: &mut Option<ClaudeUsageSnapshot>,
 ) {
-    let current = ClaudeUsageSnapshot {
-        tokens_prompt: result.tokens_prompt,
-        tokens_completion: result.tokens_completion,
-        cache_creation_input_tokens: result.cache_creation_input_tokens,
-        cache_read_input_tokens: result.cache_read_input_tokens,
-        cost_usd: result.cost_usd,
-    };
+    // Persistent Claude's top-level `usage` is already per turn, while
+    // `modelUsage` and `total_cost_usd` are cumulative for the process. Build
+    // the baseline from the cumulative fields so we do not difference a
+    // per-turn value twice.
+    let current = result
+        .raw_usage_json
+        .as_deref()
+        .and_then(|raw| serde_json::from_str(raw).ok())
+        .as_ref()
+        .and_then(cumulative_model_usage)
+        .unwrap_or(ClaudeUsageSnapshot {
+            tokens_prompt: result.tokens_prompt,
+            tokens_completion: result.tokens_completion,
+            cache_creation_input_tokens: result.cache_creation_input_tokens,
+            cache_read_input_tokens: result.cache_read_input_tokens,
+            cost_usd: result.cost_usd,
+        });
     let provider_failed_without_usage = result.provider_error.is_some()
         && sum_tokens(&[
-            current.tokens_prompt,
-            current.tokens_completion,
-            current.cache_creation_input_tokens,
-            current.cache_read_input_tokens,
+            result.tokens_prompt,
+            result.tokens_completion,
+            result.cache_creation_input_tokens,
+            result.cache_read_input_tokens,
         ])
         .unwrap_or(0)
             == 0;
 
-    if let Some(old) = previous.as_ref() {
-        if provider_failed_without_usage {
-            result.tokens_prompt = Some(0);
-            result.tokens_completion = Some(0);
-            result.cache_creation_input_tokens = Some(0);
-            result.cache_read_input_tokens = Some(0);
-            result.cached_input_tokens = Some(0);
-        } else {
-            result.tokens_prompt = usage_delta(current.tokens_prompt, old.tokens_prompt);
-            result.tokens_completion =
-                usage_delta(current.tokens_completion, old.tokens_completion);
-            result.cache_creation_input_tokens = usage_delta(
-                current.cache_creation_input_tokens,
-                old.cache_creation_input_tokens,
-            );
-            result.cache_read_input_tokens =
-                usage_delta(current.cache_read_input_tokens, old.cache_read_input_tokens);
-            result.cached_input_tokens = result.cache_read_input_tokens;
-        }
-        result.cost_usd = if provider_failed_without_usage {
-            current.cost_usd.map(|_| 0.0)
-        } else {
-            cost_delta(current.cost_usd, old.cost_usd)
-        };
-    } else if provider_failed_without_usage {
+    if provider_failed_without_usage {
         result.tokens_prompt = Some(0);
         result.tokens_completion = Some(0);
         result.cache_creation_input_tokens = Some(0);
         result.cache_read_input_tokens = Some(0);
         result.cached_input_tokens = Some(0);
         result.cost_usd = current.cost_usd.map(|_| 0.0);
+    } else if let Some(old) = previous.as_ref() {
+        result.tokens_prompt = usage_delta(current.tokens_prompt, old.tokens_prompt);
+        result.tokens_completion = usage_delta(current.tokens_completion, old.tokens_completion);
+        result.cache_creation_input_tokens = usage_delta(
+            current.cache_creation_input_tokens,
+            old.cache_creation_input_tokens,
+        );
+        result.cache_read_input_tokens =
+            usage_delta(current.cache_read_input_tokens, old.cache_read_input_tokens);
+        result.cached_input_tokens = result.cache_read_input_tokens;
+        result.cost_usd = cost_delta(current.cost_usd, old.cost_usd);
+    } else {
+        result.tokens_prompt = current.tokens_prompt;
+        result.tokens_completion = current.tokens_completion;
+        result.cache_creation_input_tokens = current.cache_creation_input_tokens;
+        result.cache_read_input_tokens = current.cache_read_input_tokens;
+        result.cached_input_tokens = current.cache_read_input_tokens;
+        result.cost_usd = current.cost_usd;
     }
 
     result.total_tokens = sum_tokens(&[
@@ -4110,6 +4143,13 @@ extra_args:
                 "cache_creation_input_tokens": 10,
                 "cache_read_input_tokens": 40
             },
+            "modelUsage": {"model": {
+                "inputTokens": 100,
+                "outputTokens": 20,
+                "cacheCreationInputTokens": 10,
+                "cacheReadInputTokens": 40,
+                "costUSD": 1.5
+            }},
             "total_cost_usd": 1.5
         });
         let mut baseline = None;
@@ -4121,11 +4161,18 @@ extra_args:
         let second = serde_json::json!({
             "result": "second",
             "usage": {
-                "input_tokens": 160,
-                "output_tokens": 32,
-                "cache_creation_input_tokens": 14,
-                "cache_read_input_tokens": 75
+                "input_tokens": 60,
+                "output_tokens": 12,
+                "cache_creation_input_tokens": 4,
+                "cache_read_input_tokens": 35
             },
+            "modelUsage": {"model": {
+                "inputTokens": 160,
+                "outputTokens": 32,
+                "cacheCreationInputTokens": 14,
+                "cacheReadInputTokens": 75,
+                "costUSD": 2.1
+            }},
             "total_cost_usd": 2.1
         });
         let mut second_result = parse_claude_result_value(&second, 0);
@@ -4140,6 +4187,13 @@ extra_args:
             "api_error_status": 400,
             "result": "API Error: 400 event:error\ndata:{\"code\":\"InvalidParameter\",\"message\":\"Range of input length should be [1, 983616]\"}",
             "usage": {"input_tokens": 0, "output_tokens": 0},
+            "modelUsage": {"model": {
+                "inputTokens": 160,
+                "outputTokens": 32,
+                "cacheCreationInputTokens": 14,
+                "cacheReadInputTokens": 75,
+                "costUSD": 2.1
+            }},
             "total_cost_usd": 2.1
         });
         let mut error_result = parse_claude_result_value(&repeated_error, 0);
@@ -4150,11 +4204,18 @@ extra_args:
         let after_error = serde_json::json!({
             "result": "after",
             "usage": {
-                "input_tokens": 190,
-                "output_tokens": 40,
-                "cache_creation_input_tokens": 15,
-                "cache_read_input_tokens": 90
+                "input_tokens": 30,
+                "output_tokens": 8,
+                "cache_creation_input_tokens": 1,
+                "cache_read_input_tokens": 15
             },
+            "modelUsage": {"model": {
+                "inputTokens": 190,
+                "outputTokens": 40,
+                "cacheCreationInputTokens": 15,
+                "cacheReadInputTokens": 90,
+                "costUSD": 2.5
+            }},
             "total_cost_usd": 2.5
         });
         let mut after_result = parse_claude_result_value(&after_error, 0);
