@@ -446,15 +446,17 @@ impl GatewayStore for MysqlGatewayStore {
         &self,
         platform: &str,
         chat_id: &str,
+        cli_profile: &str,
         target_session_id: &str,
     ) -> Result<bool, StoreError> {
         // Check target exists
         let exists: Option<(i64,)> = sqlx::query_as(
             "SELECT id FROM gw_sessions
-             WHERE platform = ? AND chat_id = ? AND astra_session_id = ?",
+             WHERE platform = ? AND chat_id = ? AND cli_profile = ? AND astra_session_id = ?",
         )
         .bind(platform)
         .bind(chat_id)
+        .bind(cli_profile)
         .bind(target_session_id)
         .fetch_optional(&self.pool)
         .await
@@ -467,10 +469,11 @@ impl GatewayStore for MysqlGatewayStore {
         // Clear current
         sqlx::query(
             "UPDATE gw_sessions SET is_current = FALSE
-             WHERE platform = ? AND chat_id = ?",
+             WHERE platform = ? AND chat_id = ? AND cli_profile = ?",
         )
         .bind(platform)
         .bind(chat_id)
+        .bind(cli_profile)
         .execute(&self.pool)
         .await
         .map_err(|e| StoreError::Database(e.to_string()))?;
@@ -478,16 +481,41 @@ impl GatewayStore for MysqlGatewayStore {
         // Set target as current
         sqlx::query(
             "UPDATE gw_sessions SET is_current = TRUE, last_active = NOW(6)
-             WHERE platform = ? AND chat_id = ? AND astra_session_id = ?",
+             WHERE platform = ? AND chat_id = ? AND cli_profile = ? AND astra_session_id = ?",
         )
         .bind(platform)
         .bind(chat_id)
+        .bind(cli_profile)
         .bind(target_session_id)
         .execute(&self.pool)
         .await
         .map_err(|e| StoreError::Database(e.to_string()))?;
 
         Ok(true)
+    }
+
+    async fn find_sessions_by_prefix(
+        &self,
+        platform: &str,
+        chat_id: &str,
+        cli_profile: &str,
+        prefix: &str,
+    ) -> Result<Vec<String>, StoreError> {
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT astra_session_id FROM gw_sessions
+             WHERE platform = ? AND chat_id = ? AND cli_profile = ?
+               AND LEFT(astra_session_id, CHAR_LENGTH(?)) = ?
+             ORDER BY last_active DESC LIMIT 2",
+        )
+        .bind(platform)
+        .bind(chat_id)
+        .bind(cli_profile)
+        .bind(prefix)
+        .bind(prefix)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| StoreError::Database(e.to_string()))?;
+        Ok(rows.into_iter().map(|(session_id,)| session_id).collect())
     }
 
     async fn reset_session(

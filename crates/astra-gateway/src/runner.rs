@@ -1485,7 +1485,7 @@ impl GatewayRunner {
                     // Extract stats from the result event stored by stdout reader
                     let pool_guard = pool.lock().await;
                     let session_id = pool_guard.session_id(&pool_key).await;
-                    let result_json = pool_guard.take_last_result(&pool_key).await;
+                    let pool_result = pool_guard.take_last_result(&pool_key).await;
                     let stderr_hint = pool_guard
                         .take_stderr_hint(&pool_key)
                         .await
@@ -1531,60 +1531,8 @@ impl GatewayRunner {
                         continue;
                     }
 
-                    let (
-                        text,
-                        tokens_prompt,
-                        tokens_completion,
-                        tool_calls_count,
-                        cache_creation_input_tokens,
-                        cache_read_input_tokens,
-                        context_window,
-                        max_output_tokens,
-                        cost_usd,
-                        raw_usage_json,
-                    ) = if let Some(ref v) = result_json {
-                        let usage = &v["usage"];
-                        let model_usage =
-                            v["modelUsage"].as_object().and_then(|m| m.values().next());
-                        (
-                            v["result"].as_str().map(String::from),
-                            usage["input_tokens"].as_u64(),
-                            usage["output_tokens"].as_u64(),
-                            v["num_turns"]
-                                .as_u64()
-                                .and_then(|t| if t > 1 { Some(t as u32) } else { None }),
-                            usage["cache_creation_input_tokens"].as_u64(),
-                            usage["cache_read_input_tokens"].as_u64(),
-                            model_usage.and_then(|m| m["contextWindow"].as_u64()),
-                            model_usage.and_then(|m| m["maxOutputTokens"].as_u64()),
-                            v["total_cost_usd"]
-                                .as_f64()
-                                .or_else(|| model_usage.and_then(|m| m["costUSD"].as_f64())),
-                            serde_json::to_string(usage).ok(),
-                        )
-                    } else {
-                        (None, None, None, None, None, None, None, None, None, None)
-                    };
-                    let total_tokens = {
-                        let mut total = 0u64;
-                        let mut any = false;
-                        for value in [
-                            tokens_prompt,
-                            tokens_completion,
-                            cache_creation_input_tokens,
-                            cache_read_input_tokens,
-                        ]
-                        .into_iter()
-                        .flatten()
-                        {
-                            total = total.saturating_add(value);
-                            any = true;
-                        }
-                        any.then_some(total)
-                    };
-
                     // Process exited without producing a result event
-                    if result_json.is_none() && text.is_none() && !stale_session_error {
+                    if pool_result.is_none() && !stale_session_error {
                         return Err(if stderr_hint.is_empty() {
                             "pool process exited without result".to_string()
                         } else {
@@ -1592,35 +1540,42 @@ impl GatewayRunner {
                         });
                     }
 
-                    return Ok(cli_bridge::CliResult {
+                    let mut result = pool_result.unwrap_or_else(|| cli_bridge::CliResult {
                         stdout: String::new(),
-                        stderr: stderr_hint,
-                        exit_code: if stale_session_error { 1 } else { 0 },
-                        success: !stale_session_error,
-                        error_kind: if stale_session_error {
-                            Some("stale_session".to_string())
-                        } else {
-                            None
-                        },
+                        stderr: String::new(),
+                        exit_code: 1,
+                        success: false,
+                        error_kind: Some("stale_session".to_string()),
+                        provider_error: None,
                         trace_id: None,
                         request_id: None,
                         run_id: None,
-                        session_id,
-                        text,
-                        tool_calls_count,
+                        session_id: session_id.clone(),
+                        text: None,
+                        tool_calls_count: None,
                         tools_used: Vec::new(),
-                        tokens_prompt,
-                        tokens_completion,
-                        cached_input_tokens: cache_read_input_tokens,
-                        cache_creation_input_tokens,
-                        cache_read_input_tokens,
+                        tokens_prompt: None,
+                        tokens_completion: None,
+                        cached_input_tokens: None,
+                        cache_creation_input_tokens: None,
+                        cache_read_input_tokens: None,
                         reasoning_output_tokens: None,
-                        total_tokens,
-                        context_window,
-                        max_output_tokens,
-                        cost_usd,
-                        raw_usage_json,
+                        total_tokens: None,
+                        context_window: None,
+                        max_output_tokens: None,
+                        cost_usd: None,
+                        raw_usage_json: None,
                     });
+                    result.stderr = stderr_hint;
+                    if result.session_id.is_none() {
+                        result.session_id = session_id;
+                    }
+                    if stale_session_error {
+                        result.exit_code = 1;
+                        result.success = false;
+                        result.error_kind = Some("stale_session".to_string());
+                    }
+                    return Ok(result);
                 }
             })
         } else if use_codex_app_pool {
@@ -2359,7 +2314,102 @@ impl GatewayRunner {
             run_id = retry_run_id;
         }
 
-        if result.exit_code != 0 {
+        if let Some(provider_error) = result.provider_error.as_ref() {
+            let trace_error = format!(
+                "{} status={:?} code={:?} request_id={:?}: {}",
+                provider_error.kind,
+                provider_error.status,
+                provider_error.code,
+                provider_error.request_id,
+                provider_error.message
+            );
+            tracing::warn!(
+                kind = provider_error.kind,
+                status = ?provider_error.status,
+                upstream_request_id = ?provider_error.request_id,
+                "Claude provider request failed"
+            );
+            if let Some(writer) = trace_writer.as_ref() {
+                if let Some(ref run_id) = run_id {
+                    let _ = writer
+                        .finish_run(
+                            run_id,
+                            RunStatus::Failed,
+                            Some(result.exit_code),
+                            Some(&trace_error),
+                        )
+                        .await;
+                }
+                let _ = writer.fail_request(&trace_error).await;
+            }
+
+            let elapsed = start.elapsed();
+            let prompt_tok = result.tokens_prompt.unwrap_or(0);
+            let completion_tok = result.tokens_completion.unwrap_or(0);
+            let cache_create_tok = result.cache_creation_input_tokens.unwrap_or(0);
+            let cache_read_tok = result.cache_read_input_tokens.unwrap_or(0);
+            let cached_tok = result.cached_input_tokens.unwrap_or(0);
+            let reasoning_tok = result.reasoning_output_tokens.unwrap_or(0);
+            let total_tok = result.total_tokens.unwrap_or_else(|| {
+                prompt_tok + completion_tok + cache_create_tok + cache_read_tok + reasoning_tok
+            });
+            let failure_cost_usd = if total_tok == 0 {
+                Some(0.0)
+            } else {
+                result.cost_usd
+            };
+            if let Some(ref store) = self.store
+                && let Err(e) = store
+                    .record_usage(&store::UsageRecord {
+                        platform: msg.platform.to_string(),
+                        user_id: msg.user_id.clone(),
+                        cli_profile: cli_name.clone(),
+                        model: cli_profile.model_name().map(String::from),
+                        trace_id: trace.as_ref().map(|t| t.trace_id.to_string()),
+                        request_id: trace.as_ref().map(|t| t.request_id.to_string()),
+                        run_id: run_id.as_ref().map(ToString::to_string),
+                        session_id: result.session_id.clone(),
+                        tokens_prompt: prompt_tok,
+                        tokens_completion: completion_tok,
+                        cached_input_tokens: cached_tok,
+                        cache_creation_input_tokens: cache_create_tok,
+                        cache_read_input_tokens: cache_read_tok,
+                        reasoning_output_tokens: reasoning_tok,
+                        total_tokens: total_tok,
+                        context_window: result.context_window,
+                        max_output_tokens: result.max_output_tokens,
+                        cost_usd: failure_cost_usd,
+                        raw_usage_json: result.raw_usage_json.clone(),
+                        tool_calls: result.tool_calls_count.unwrap_or(0),
+                        elapsed_ms: elapsed.as_millis() as u64,
+                    })
+                    .await
+            {
+                tracing::warn!(error = %e, "failed to record provider failure usage");
+            }
+
+            let mut stats_parts = vec![format_elapsed(elapsed)];
+            if failure_cost_usd.unwrap_or(0.0) > 0.001 {
+                stats_parts.push(format!("${:.3}", failure_cost_usd.unwrap_or(0.0)));
+            }
+            if !self.config.response_footer {
+                stats_parts.clear();
+            }
+            let body = cli_bridge::translate_provider_error(&cli_profile, provider_error);
+            let text = build_final_message(&body, "", &stats_parts, 0, &request_tag);
+            return Some(
+                self.outbound_response(
+                    trace.as_ref(),
+                    msg.platform,
+                    &msg.chat_id,
+                    msg.reply_token.clone(),
+                    text,
+                )
+                .await,
+            );
+        }
+
+        if !result.success {
             tracing::warn!(
                 exit_code = result.exit_code,
                 stderr = %result.stderr.chars().take(200).collect::<String>(),
@@ -2439,12 +2489,12 @@ impl GatewayRunner {
         if let Some(writer) = trace_writer.as_ref()
             && let Some(ref run_id) = run_id
         {
-            let status = if result.exit_code == 0 {
+            let status = if result.success {
                 RunStatus::Succeeded
             } else {
                 RunStatus::Failed
             };
-            let error = if result.exit_code == 0 {
+            let error = if result.success {
                 None
             } else {
                 Some(result.stderr.as_str())
@@ -2455,7 +2505,7 @@ impl GatewayRunner {
         }
 
         // Clear auth failure counter on success
-        if result.exit_code == 0 {
+        if result.success {
             self.clear_auth_failure(&cli_name);
         }
 
@@ -2488,6 +2538,10 @@ impl GatewayRunner {
             .as_deref()
             .unwrap_or(result.stdout.trim())
             .to_string();
+
+        if let Some(fallback) = compact_success_fallback(&message_text, result.success, &text) {
+            text = fallback.to_string();
+        }
 
         // Strip <think>...</think> blocks that some models emit as plain text
         text = strip_think_blocks(&text);
@@ -4307,6 +4361,17 @@ fn build_final_message(
     }
 }
 
+fn compact_success_fallback(
+    message: &str,
+    success: bool,
+    response_text: &str,
+) -> Option<&'static str> {
+    let message = message.trim();
+    let is_compact = message == "/compact" || message.starts_with("/compact ");
+    (is_compact && success && response_text.trim().is_empty())
+        .then_some("✅ 会话已压缩，可以继续对话。原始历史记录仍然保留。")
+}
+
 /// Strip `<think>...</think>` / `<thinking>...</thinking>` blocks from complete text.
 /// Unclosed think tags at EOF: the tag is removed but content after it is
 /// preserved — a malicious or buggy model cannot suppress all output.
@@ -4487,6 +4552,20 @@ fn answer_progressive_flush_enabled(reasoning_display: ReasoningDisplay) -> bool
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compact_empty_success_gets_visible_confirmation() {
+        assert_eq!(
+            compact_success_fallback("/compact", true, ""),
+            Some("✅ 会话已压缩，可以继续对话。原始历史记录仍然保留。")
+        );
+        assert_eq!(
+            compact_success_fallback("/compact focus on fixes", true, "  "),
+            Some("✅ 会话已压缩，可以继续对话。原始历史记录仍然保留。")
+        );
+        assert_eq!(compact_success_fallback("/compact", false, ""), None);
+        assert_eq!(compact_success_fallback("hello", true, ""), None);
+    }
 
     #[test]
     fn astra_app_server_startup_error_detection_is_narrow() {

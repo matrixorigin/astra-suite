@@ -356,15 +356,17 @@ pub async fn switch_session(
     pool: &MySqlPool,
     platform: &str,
     chat_id: &str,
+    cli_profile: &str,
     target_session_id: &str,
 ) -> Result<bool, sqlx::Error> {
     // Check target exists
     let exists: Option<(i64,)> = sqlx::query_as(
         "SELECT id FROM gw_sessions
-         WHERE platform = ? AND chat_id = ? AND astra_session_id = ?",
+         WHERE platform = ? AND chat_id = ? AND cli_profile = ? AND astra_session_id = ?",
     )
     .bind(platform)
     .bind(chat_id)
+    .bind(cli_profile)
     .bind(target_session_id)
     .fetch_optional(pool)
     .await?;
@@ -376,20 +378,22 @@ pub async fn switch_session(
     // Clear current
     sqlx::query(
         "UPDATE gw_sessions SET is_current = FALSE
-         WHERE platform = ? AND chat_id = ?",
+         WHERE platform = ? AND chat_id = ? AND cli_profile = ?",
     )
     .bind(platform)
     .bind(chat_id)
+    .bind(cli_profile)
     .execute(pool)
     .await?;
 
     // Set target as current
     sqlx::query(
         "UPDATE gw_sessions SET is_current = TRUE, last_active = NOW(6)
-         WHERE platform = ? AND chat_id = ? AND astra_session_id = ?",
+         WHERE platform = ? AND chat_id = ? AND cli_profile = ? AND astra_session_id = ?",
     )
     .bind(platform)
     .bind(chat_id)
+    .bind(cli_profile)
     .bind(target_session_id)
     .execute(pool)
     .await?;

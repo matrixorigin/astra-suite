@@ -38,6 +38,8 @@ providers:
     env:
       ANTHROPIC_API_KEY: ""           # ← FILL ME (DashScope API key)
       ANTHROPIC_BASE_URL: "https://dashscope.aliyuncs.com/apps/anthropic"
+      # Claude-compatible providers may count tokens differently from Claude Code.
+      # CLAUDE_AUTOCOMPACT_PCT_OVERRIDE: "50"
 
 platforms:
   wecom:

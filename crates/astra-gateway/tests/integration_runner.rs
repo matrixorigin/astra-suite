@@ -182,6 +182,22 @@ fn create_fake_cli_script_with_ids(
     dir
 }
 
+fn create_fake_claude_stream_script(result: &serde_json::Value) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let script_path = dir.path().join("fake_cli.sh");
+    let content = format!(
+        "#!/bin/sh\ncase \"$*\" in *--version*) echo '2.1.0'; exit 0;; esac\nwhile IFS= read -r line; do\n  printf '%s\\n' '{}'\ndone\n",
+        result.to_string().replace('\'', "'\\''")
+    );
+    std::fs::write(&script_path, content).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    dir
+}
+
 /// Helper to get the script path from a tempdir created by create_fake_cli_script.
 fn script_path(dir: &tempfile::TempDir) -> String {
     dir.path().join("fake_cli.sh").to_string_lossy().to_string()
@@ -572,12 +588,14 @@ async fn session_switch_restores_previous() {
     let cli_name = gw.runner.cli_profile().name();
 
     // Manually create two sessions
+    let first = "ac73779a-60b1-4973-a582-9b73350e3e8b";
+    let second = "2e8c8b02-5c96-45e8-85b3-b74f0bc2f101";
     store
-        .set_current_session("mock", "chat-sw", "user-1", "session-aaa", cli_name)
+        .set_current_session("mock", "chat-sw", "user-1", first, cli_name)
         .await
         .unwrap();
     store
-        .set_current_session("mock", "chat-sw", "user-1", "session-bbb", cli_name)
+        .set_current_session("mock", "chat-sw", "user-1", second, cli_name)
         .await
         .unwrap();
 
@@ -586,10 +604,14 @@ async fn session_switch_restores_previous() {
         .get_current_session("mock", "chat-sw", cli_name)
         .await
         .unwrap();
-    assert_eq!(current.as_deref(), Some("session-bbb"));
+    assert_eq!(current.as_deref(), Some(second));
 
-    // Switch to aaa via /session switch
-    let switch_msg = msg("chat-sw", "user-1", "/session switch session-aaa");
+    // Switch via a copied short prefix wrapped in Markdown and U+2060.
+    let switch_msg = msg(
+        "chat-sw",
+        "user-1",
+        "/session switch \u{2060}`ac73779a`\u{2060}",
+    );
     let result = gw.runner.handle_fast(&switch_msg).await;
     assert!(result.is_ok());
     let text = result.unwrap().unwrap();
@@ -600,7 +622,37 @@ async fn session_switch_restores_previous() {
         .get_current_session("mock", "chat-sw", cli_name)
         .await
         .unwrap();
-    assert_eq!(current.as_deref(), Some("session-aaa"));
+    assert_eq!(current.as_deref(), Some(first));
+}
+
+#[tokio::test]
+async fn session_switch_rejects_short_and_ambiguous_prefixes() {
+    let gw = TestGateway::new().await;
+    let store = gw.runner.store().unwrap();
+    let cli_name = gw.runner.cli_profile().name();
+
+    for session_id in ["abcdefgh-one", "abcdefgh-two"] {
+        store
+            .set_current_session("mock", "chat-prefix", "user-1", session_id, cli_name)
+            .await
+            .unwrap();
+    }
+
+    let short = msg("chat-prefix", "user-1", "/session switch abcdefg");
+    let short_text = gw.runner.handle_fast(&short).await.unwrap().unwrap();
+    assert!(short_text.contains("至少需要 8"));
+
+    let ambiguous = msg("chat-prefix", "user-1", "/session switch abcdefgh");
+    let ambiguous_text = gw.runner.handle_fast(&ambiguous).await.unwrap().unwrap();
+    assert!(ambiguous_text.contains("多个会话"));
+    assert_eq!(
+        store
+            .get_current_session("mock", "chat-prefix", cli_name)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("abcdefgh-two")
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -636,6 +688,60 @@ async fn cli_failure_returns_error_response() {
         text.contains("segfault") || text.contains("错误") || text.contains("⚠"),
         "should report CLI failure: {text}"
     );
+}
+
+#[tokio::test]
+async fn claude_context_overflow_returns_actionable_zero_cost_failure() {
+    let session_id = "2e8c8b02-5c96-45e8-85b3-b74f0bc2f101";
+    let upstream_request_id = "upstream-overflow-123";
+    let result = serde_json::json!({
+        "type": "result",
+        "subtype": "success",
+        "is_error": false,
+        "api_error_status": 400,
+        "session_id": session_id,
+        "result": format!(
+            "API Error: 400 event:error\ndata:{{\"code\":\"InvalidParameter\",\"message\":\"Range of input length should be [1, 983616]\",\"request_id\":\"{upstream_request_id}\"}}"
+        ),
+        "usage": {"input_tokens": 0, "output_tokens": 0},
+        "total_cost_usd": 77.5227695
+    });
+    let fake_cli = create_fake_claude_stream_script(&result);
+    let mut config = TestGateway::build_config(&script_path(&fake_cli));
+    config.cli = CliProfile::Claude {
+        bin: script_path(&fake_cli),
+        model: Some("test-claude".into()),
+        stream_json: true,
+        extra_args: vec![],
+        env: Default::default(),
+        env_file: None,
+    };
+    config.cli_timeout_secs = 5;
+    let gw = TestGateway::with_config(config).await;
+    let outputs = Arc::new(Mutex::new(Vec::new()));
+    let adapter = MockPlatformAdapter::new(mpsc::channel(1).1, outputs);
+    let inbound = msg("chat-overflow", "user-1", "continue");
+
+    let response = gw
+        .runner
+        .handle_message(&inbound, &adapter)
+        .await
+        .expect("actionable error response");
+    assert!(response.contains("/compact"), "response: {response}");
+    assert!(response.contains(upstream_request_id));
+    assert!(!response.contains("InvalidParameter"));
+    assert!(!response.contains("Range of input length"));
+
+    let usage = gw
+        .runner
+        .store()
+        .unwrap()
+        .get_usage_session("mock", "user-1", session_id)
+        .await
+        .unwrap();
+    assert_eq!(usage.messages, 1);
+    assert_eq!(usage.total_tokens, 0);
+    assert_eq!(usage.cost_usd, 0.0);
 }
 
 #[tokio::test]
@@ -1175,6 +1281,33 @@ async fn slash_command_unknown_falls_to_slow_path() {
         result.is_err(),
         "non-slash message should fall to slow path"
     );
+}
+
+#[tokio::test]
+async fn compact_routes_only_claude_to_slow_path() {
+    let non_claude = TestGateway::new().await;
+    let command = msg("chat-compact", "user-1", "/compact focus on fixes");
+    let rejection = non_claude
+        .runner
+        .handle_fast(&command)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(rejection.contains("仅适用于 Claude"));
+
+    let fake_cli = create_fake_cli_script("unused");
+    let mut config = TestGateway::build_config(&script_path(&fake_cli));
+    config.cli = CliProfile::Claude {
+        bin: script_path(&fake_cli),
+        model: Some("test-claude".into()),
+        stream_json: true,
+        extra_args: vec![],
+        env: Default::default(),
+        env_file: None,
+    };
+    let claude = TestGateway::with_config(config).await;
+    let routed = claude.runner.handle_fast(&command).await;
+    assert!(routed.is_err(), "Claude /compact must reach the slow path");
 }
 
 #[tokio::test]

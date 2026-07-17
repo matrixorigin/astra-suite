@@ -436,15 +436,17 @@ impl GatewayStore for SqliteGatewayStore {
         &self,
         platform: &str,
         chat_id: &str,
+        cli_profile: &str,
         target_session_id: &str,
     ) -> Result<bool, StoreError> {
         // Check target exists.
         let exists: Option<(i64,)> = sqlx::query_as(
             "SELECT id FROM gw_sessions
-             WHERE platform = ? AND chat_id = ? AND astra_session_id = ?",
+             WHERE platform = ? AND chat_id = ? AND cli_profile = ? AND astra_session_id = ?",
         )
         .bind(platform)
         .bind(chat_id)
+        .bind(cli_profile)
         .bind(target_session_id)
         .fetch_optional(&self.pool)
         .await?;
@@ -456,25 +458,50 @@ impl GatewayStore for SqliteGatewayStore {
         // Clear current.
         sqlx::query(
             "UPDATE gw_sessions SET is_current = 0
-             WHERE platform = ? AND chat_id = ?",
+             WHERE platform = ? AND chat_id = ? AND cli_profile = ?",
         )
         .bind(platform)
         .bind(chat_id)
+        .bind(cli_profile)
         .execute(&self.pool)
         .await?;
 
         // Set target as current.
         sqlx::query(
             "UPDATE gw_sessions SET is_current = 1, last_active = strftime('%Y-%m-%d %H:%M:%f', 'now')
-             WHERE platform = ? AND chat_id = ? AND astra_session_id = ?",
+             WHERE platform = ? AND chat_id = ? AND cli_profile = ? AND astra_session_id = ?",
         )
         .bind(platform)
         .bind(chat_id)
+        .bind(cli_profile)
         .bind(target_session_id)
         .execute(&self.pool)
         .await?;
 
         Ok(true)
+    }
+
+    async fn find_sessions_by_prefix(
+        &self,
+        platform: &str,
+        chat_id: &str,
+        cli_profile: &str,
+        prefix: &str,
+    ) -> Result<Vec<String>, StoreError> {
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT astra_session_id FROM gw_sessions
+             WHERE platform = ? AND chat_id = ? AND cli_profile = ?
+               AND substr(astra_session_id, 1, length(?)) = ?
+             ORDER BY last_active DESC LIMIT 2",
+        )
+        .bind(platform)
+        .bind(chat_id)
+        .bind(cli_profile)
+        .bind(prefix)
+        .bind(prefix)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(|(session_id,)| session_id).collect())
     }
 
     async fn reset_session(
@@ -1293,18 +1320,55 @@ mod tests {
             .unwrap();
         assert_eq!(cur.as_deref(), Some("sess-2"));
 
+        // A switch is isolated to the active CLI profile and conversation.
+        store
+            .set_current_session("wx", "c1", "u1", "claude-1", "claude")
+            .await
+            .unwrap();
+        assert!(
+            !store
+                .switch_session("wx", "c1", "astra", "claude-1")
+                .await
+                .unwrap()
+        );
+        store
+            .set_current_session("wx", "c2", "u1", "other-chat", "astra")
+            .await
+            .unwrap();
+
         // Switch back.
-        assert!(store.switch_session("wx", "c1", "sess-1").await.unwrap());
+        assert!(
+            store
+                .switch_session("wx", "c1", "astra", "sess-1")
+                .await
+                .unwrap()
+        );
         let cur = store
             .get_current_session("wx", "c1", "astra")
             .await
             .unwrap();
         assert_eq!(cur.as_deref(), Some("sess-1"));
+        assert_eq!(
+            store
+                .get_current_session("wx", "c1", "claude")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("claude-1")
+        );
+        assert_eq!(
+            store
+                .get_current_session("wx", "c2", "astra")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("other-chat")
+        );
 
         // Switch to nonexistent.
         assert!(
             !store
-                .switch_session("wx", "c1", "nonexistent")
+                .switch_session("wx", "c1", "astra", "nonexistent")
                 .await
                 .unwrap()
         );
@@ -1535,7 +1599,7 @@ mod tests {
 
         // Switch to a non-existent session → returns false (not found).
         let result = store
-            .switch_session("wx", "c1", "does-not-exist")
+            .switch_session("wx", "c1", "astra", "does-not-exist")
             .await
             .unwrap();
         assert!(!result, "switch to nonexistent session should return false");

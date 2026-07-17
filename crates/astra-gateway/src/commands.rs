@@ -78,6 +78,20 @@ macro_rules! require_trace_repo {
     };
 }
 
+fn normalize_session_selector(selector: &str) -> String {
+    selector
+        .chars()
+        .filter(|ch| {
+            !matches!(
+                ch,
+                '`' | '\u{200B}' | '\u{200C}' | '\u{200D}' | '\u{2060}' | '\u{FEFF}'
+            )
+        })
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
 pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<String> {
     let text = text.trim();
     if !text.starts_with('/') {
@@ -88,6 +102,19 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
     let arg = arg.trim();
 
     match cmd {
+        "/compact" => {
+            if ctx.resolved_cli.name() == "claude" {
+                // Claude Code handles compaction itself; keep this on the slow path so
+                // its real token and cost delta are recorded like any other request.
+                None
+            } else {
+                Some(format!(
+                    "⚠️ 当前 CLI `{}` 不支持 `/compact`。此命令仅适用于 Claude profile。",
+                    ctx.resolved_cli.name()
+                ))
+            }
+        }
+
         "/new" | "/reset" => {
             if let Some(denial) = slash_denial(ctx, ActionCapability::SessionMutation) {
                 return Some(denial);
@@ -99,7 +126,7 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
                 .await
             {
                 Ok(()) => Some(format!(
-                    "🔄 `{cli_name}` 会话已重置。发送新消息开始新对话。"
+                    "🔄 `{cli_name}` 会话已重置（当前会话已停用）。发送新消息会创建新会话；原历史仍保留，可用 `/session list` 查看并恢复。"
                 )),
                 Err(e) => Some(format!("⚠️ 会话重置失败: {e}")),
             }
@@ -307,9 +334,9 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
                 for s in &sessions {
                     let marker = if s.is_current { "→ " } else { "  " };
                     let short = &s.session_id[..8.min(s.session_id.len())];
-                    lines.push(format!("{marker}`{short}…` ({})", s.created_at));
+                    lines.push(format!("{marker}`{short}` ({})", s.created_at));
                 }
-                lines.push("\n使用 `/session switch <id>` 切换".into());
+                lines.push("\n可直接使用显示的短前缀切换：`/session switch <前8位>`".into());
                 return Some(lines.join("\n"));
             }
 
@@ -317,17 +344,55 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
                 .strip_prefix("switch ")
                 .or_else(|| arg.strip_prefix("sw "))
             {
-                let target = target.trim();
-                match require_store!(ctx)
-                    .switch_session(ctx.platform, ctx.chat_id, target)
+                if let Some(denial) = slash_denial(ctx, ActionCapability::SessionMutation) {
+                    return Some(denial);
+                }
+                let target = normalize_session_selector(target);
+                if target.chars().count() < 8 {
+                    return Some("⚠️ 会话 ID 前缀至少需要 8 个字符。".into());
+                }
+                let store = require_store!(ctx);
+
+                // Preserve full-ID behavior even when an older session is outside the
+                // display list, then resolve short selectors within this conversation
+                // and CLI profile only.
+                match store
+                    .switch_session(ctx.platform, ctx.chat_id, cli_name, &target)
                     .await
                 {
-                    Ok(true) => Some(format!(
-                        "✅ 已切换到会话 `{}`",
-                        &target[..8.min(target.len())]
+                    Ok(true) => {
+                        return Some(format!(
+                            "✅ 已切换到会话 `{}`",
+                            &target[..8.min(target.len())]
+                        ));
+                    }
+                    Err(e) => return Some(format!("⚠️ 切换失败: {e}")),
+                    Ok(false) => {}
+                }
+
+                let matches = match store
+                    .find_sessions_by_prefix(ctx.platform, ctx.chat_id, cli_name, &target)
+                    .await
+                {
+                    Ok(matches) => matches,
+                    Err(e) => return Some(format!("⚠️ 切换失败: {e}")),
+                };
+                match matches.as_slice() {
+                    [] => Some(format!("❌ 找不到会话 `{target}`")),
+                    [session_id] => match store
+                        .switch_session(ctx.platform, ctx.chat_id, cli_name, session_id)
+                        .await
+                    {
+                        Ok(true) => Some(format!(
+                            "✅ 已切换到会话 `{}`",
+                            &session_id[..8.min(session_id.len())]
+                        )),
+                        Ok(false) => Some(format!("❌ 找不到会话 `{target}`")),
+                        Err(e) => Some(format!("⚠️ 切换失败: {e}")),
+                    },
+                    _ => Some(format!(
+                        "⚠️ 会话前缀 `{target}` 匹配到多个会话，请补充更多字符。"
                     )),
-                    Ok(false) => Some(format!("❌ 找不到会话 `{target}`")),
-                    Err(e) => Some(format!("⚠️ 切换失败: {e}")),
                 }
             } else {
                 Some("用法: `/session [list|switch <id>|current]`".into())
@@ -832,7 +897,8 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
         "/help" => Some(
             "💡 **命令列表**\n\n\
              **对话**\n\
-             `/new` (`/reset`) — 新建会话\n\
+             `/new` (`/reset`) — 停用当前会话并新建（历史仍可恢复）\n\
+             `/compact [说明]` — 压缩上下文，原始历史仍保留（仅 Claude profile）\n\
              `/session list` — 历史会话\n\
              `/session switch <id>` — 切换会话\n\n\
              **模型**\n\
@@ -1492,6 +1558,12 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
             lines.push("| Command | Description |".to_string());
             lines.push("|---------|-------------|".to_string());
             lines.push("| `/new` | Reset conversation |".to_string());
+            if cli_name == "claude" {
+                lines.push(
+                    "| `/compact [instructions]` | Compact context; transcript is preserved |"
+                        .to_string(),
+                );
+            }
             lines.push("| `/status` | Status + harness |".to_string());
             lines.push("| `/model <name>` | Switch model |".to_string());
             lines.push("| `/cli <name>` | Switch CLI backend |".to_string());
@@ -4343,6 +4415,18 @@ mod tests {
         assert!(
             result.contains("2"),
             "/cancel all should report 2 cleared: {result}"
+        );
+    }
+
+    #[test]
+    fn session_selector_removes_markdown_and_invisible_characters() {
+        assert_eq!(
+            normalize_session_selector(" \u{2060}`ac73779a-60b1`\u{200B} "),
+            "ac73779a-60b1"
+        );
+        assert_eq!(
+            normalize_session_selector("\u{FEFF}ac73779a\u{200C}\u{200D}"),
+            "ac73779a"
         );
     }
 }

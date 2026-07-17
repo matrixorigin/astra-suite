@@ -239,10 +239,21 @@ pub trait GatewayStore: Send + Sync + 'static {
         cli_profile: &str,
     ) -> Result<Vec<SessionRecord>, StoreError>;
 
+    /// Return at most two matches so callers can distinguish missing, unique,
+    /// and ambiguous selectors without scanning only the recent display page.
+    async fn find_sessions_by_prefix(
+        &self,
+        platform: &str,
+        chat_id: &str,
+        cli_profile: &str,
+        prefix: &str,
+    ) -> Result<Vec<String>, StoreError>;
+
     async fn switch_session(
         &self,
         platform: &str,
         chat_id: &str,
+        cli_profile: &str,
         target_session_id: &str,
     ) -> Result<bool, StoreError>;
 
@@ -1617,7 +1628,12 @@ url: "mysql://root:111@127.0.0.1:6001/astra_gateway""#;
                 .as_deref(),
             Some("s11")
         );
-        assert!(store.switch_session("test", "c1", "s10").await.unwrap());
+        assert!(
+            store
+                .switch_session("test", "c1", "astra", "s10")
+                .await
+                .unwrap()
+        );
         assert_eq!(
             store
                 .get_current_session("test", "c1", "astra")
@@ -1628,7 +1644,7 @@ url: "mysql://root:111@127.0.0.1:6001/astra_gateway""#;
         );
         assert!(
             !store
-                .switch_session("test", "c1", "nonexistent")
+                .switch_session("test", "c1", "astra", "nonexistent")
                 .await
                 .unwrap()
         );

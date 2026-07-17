@@ -351,25 +351,20 @@ impl GatewayStore for FileGatewayStore {
         &self,
         platform: &str,
         chat_id: &str,
+        cli_profile: &str,
         target_session_id: &str,
     ) -> Result<bool, StoreError> {
         let mut sessions = self.sessions.write().await;
+        let key = session_key(platform, chat_id, cli_profile);
         let mut found = false;
-        for entries in sessions.values_mut() {
-            if entries
-                .iter()
-                .any(|e| e.platform == platform && e.chat_id == chat_id)
-            {
-                for e in entries.iter_mut() {
-                    if e.platform == platform && e.chat_id == chat_id {
-                        if e.session_id == target_session_id {
-                            e.is_current = true;
-                            e.last_active = now_str();
-                            found = true;
-                        } else {
-                            e.is_current = false;
-                        }
-                    }
+        if let Some(entries) = sessions.get_mut(&key) {
+            for e in entries.iter_mut() {
+                if e.session_id == target_session_id {
+                    e.is_current = true;
+                    e.last_active = now_str();
+                    found = true;
+                } else {
+                    e.is_current = false;
                 }
             }
         }
@@ -378,6 +373,25 @@ impl GatewayStore for FileGatewayStore {
             self.flush_sessions().await?;
         }
         Ok(found)
+    }
+
+    async fn find_sessions_by_prefix(
+        &self,
+        platform: &str,
+        chat_id: &str,
+        cli_profile: &str,
+        prefix: &str,
+    ) -> Result<Vec<String>, StoreError> {
+        let key = session_key(platform, chat_id, cli_profile);
+        let sessions = self.sessions.read().await;
+        Ok(sessions
+            .get(&key)
+            .into_iter()
+            .flatten()
+            .filter(|entry| entry.session_id.starts_with(prefix))
+            .take(2)
+            .map(|entry| entry.session_id.clone())
+            .collect())
     }
 
     async fn reset_session(
