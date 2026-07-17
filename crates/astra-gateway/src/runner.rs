@@ -931,12 +931,16 @@ impl GatewayRunner {
         };
         if let Some(response) = commands::handle_command(&cmd_ctx, &msg.text).await {
             // Commands that invalidate the long-lived process (model/session/workspace change)
-            let invalidates_pool = msg.text.starts_with("/new")
-                || msg.text.starts_with("/reset")
-                || msg.text.starts_with("/model ")
-                || msg.text.starts_with("/cli ")
-                || msg.text.starts_with("/workspace ")
-                || msg.text.starts_with("/ws ");
+            let command = msg.text.trim();
+            let switched_session =
+                command.starts_with("/session switch ") && response.starts_with("✅ 已切换到会话");
+            let invalidates_pool = command.starts_with("/new")
+                || command.starts_with("/reset")
+                || command.starts_with("/model ")
+                || command.starts_with("/cli ")
+                || command.starts_with("/workspace ")
+                || command.starts_with("/ws ")
+                || switched_session;
             if invalidates_pool {
                 // For /model, only reset the pool when the argument actually
                 // resolved to a valid model. Otherwise the user just gets an
@@ -1165,6 +1169,17 @@ impl GatewayRunner {
                 }
                 let _ = writer.fail_request("CLI unavailable").await;
             }
+            self.record_zero_usage_failure(
+                &msg,
+                &cli_name,
+                &cli_profile,
+                trace.as_ref(),
+                run_id.as_ref().map(ToString::to_string),
+                session_id.clone(),
+                Duration::ZERO,
+                "cli_unavailable",
+            )
+            .await;
             let text = cli_bridge::onboarding_message(&cli_profile, &availability);
             return Some(
                 self.outbound_response(
@@ -1193,6 +1208,17 @@ impl GatewayRunner {
                 }
                 let _ = writer.fail_request("auth circuit breaker open").await;
             }
+            self.record_zero_usage_failure(
+                &msg,
+                &cli_name,
+                &cli_profile,
+                trace.as_ref(),
+                run_id.as_ref().map(ToString::to_string),
+                session_id.clone(),
+                Duration::ZERO,
+                "auth_circuit_open",
+            )
+            .await;
             return Some(
                 self.outbound_response(
                     trace.as_ref(),
@@ -2179,6 +2205,17 @@ impl GatewayRunner {
             if let Err(e) = cli_handle.await {
                 tracing::debug!(error = %e, "cli task join error after cancel");
             }
+            self.record_zero_usage_failure(
+                &msg,
+                &cli_name,
+                &cli_profile,
+                trace.as_ref(),
+                run_id.as_ref().map(ToString::to_string),
+                session_id.clone(),
+                start.elapsed(),
+                "cancelled",
+            )
+            .await;
             tracing::info!(tag = %request_tag, "task interrupted, skipping result processing");
             return Some(
                 self.outbound_response(
@@ -2210,6 +2247,17 @@ impl GatewayRunner {
                     }
                     let _ = writer.fail_request(&e).await;
                 }
+                self.record_zero_usage_failure(
+                    &msg,
+                    &cli_name,
+                    &cli_profile,
+                    trace.as_ref(),
+                    run_id.as_ref().map(ToString::to_string),
+                    session_id.clone(),
+                    start.elapsed(),
+                    "cli_execution_error",
+                )
+                .await;
                 let text = cli_bridge::translate_cli_error(&cli_profile, -1, &e);
                 let text = format!("[{request_tag}] {text}");
                 return Some(
@@ -2232,6 +2280,17 @@ impl GatewayRunner {
                     }
                     let _ = writer.fail_request(&e.to_string()).await;
                 }
+                self.record_zero_usage_failure(
+                    &msg,
+                    &cli_name,
+                    &cli_profile,
+                    trace.as_ref(),
+                    run_id.as_ref().map(ToString::to_string),
+                    session_id.clone(),
+                    start.elapsed(),
+                    "cli_task_join_error",
+                )
+                .await;
                 return Some(
                     self.outbound_response(
                         trace.as_ref(),
@@ -2860,6 +2919,51 @@ impl GatewayRunner {
                     outbox: None,
                 }
             }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn record_zero_usage_failure(
+        &self,
+        msg: &InboundMessage,
+        cli_name: &str,
+        cli_profile: &CliProfile,
+        trace: Option<&OutboxDeliveryTrace>,
+        run_id: Option<String>,
+        session_id: Option<String>,
+        elapsed: Duration,
+        failure_kind: &str,
+    ) {
+        let Some(store) = self.store.as_ref() else {
+            return;
+        };
+        if let Err(e) = store
+            .record_usage(&store::UsageRecord {
+                platform: msg.platform.to_string(),
+                user_id: msg.user_id.clone(),
+                cli_profile: cli_name.to_string(),
+                model: cli_profile.model_name().map(String::from),
+                trace_id: trace.map(|trace| trace.trace_id.to_string()),
+                request_id: trace.map(|trace| trace.request_id.to_string()),
+                run_id,
+                session_id,
+                tokens_prompt: 0,
+                tokens_completion: 0,
+                cached_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 0,
+                reasoning_output_tokens: 0,
+                total_tokens: 0,
+                context_window: None,
+                max_output_tokens: None,
+                cost_usd: Some(0.0),
+                raw_usage_json: None,
+                tool_calls: 0,
+                elapsed_ms: elapsed.as_millis() as u64,
+            })
+            .await
+        {
+            tracing::warn!(error = %e, failure_kind, "failed to record zero-usage failure");
         }
     }
 

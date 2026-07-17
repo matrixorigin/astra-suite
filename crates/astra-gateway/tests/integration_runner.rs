@@ -198,6 +198,53 @@ fn create_fake_claude_stream_script(result: &serde_json::Value) -> tempfile::Tem
     dir
 }
 
+fn create_tracking_claude_stream_script() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let script_path = dir.path().join("fake_cli.sh");
+    let starts_path = dir.path().join("starts.log");
+    let result = serde_json::json!({
+        "type": "result",
+        "subtype": "success",
+        "is_error": false,
+        "session_id": "__SESSION_ID__",
+        "result": "ok",
+        "usage": {"input_tokens": 1, "output_tokens": 1},
+        "modelUsage": {"test": {
+            "inputTokens": 1,
+            "outputTokens": 1,
+            "cacheCreationInputTokens": 0,
+            "cacheReadInputTokens": 0,
+            "costUSD": 0.01,
+            "contextWindow": 200000,
+            "maxOutputTokens": 32000
+        }},
+        "total_cost_usd": 0.01
+    });
+    let content = format!(
+        "#!/bin/sh\n\
+         case \"$*\" in *--version*) echo '2.1.0'; exit 0;; esac\n\
+         printf '%s\\n' \"$*\" >> '{}'\n\
+         sid='new-session'\n\
+         previous=''\n\
+         for arg in \"$@\"; do\n\
+           if [ \"$previous\" = '--resume' ]; then sid=\"$arg\"; break; fi\n\
+           previous=\"$arg\"\n\
+         done\n\
+         while IFS= read -r line; do\n\
+           printf '%s\\n' '{}' | sed \"s/__SESSION_ID__/$sid/g\"\n\
+         done\n",
+        starts_path.display(),
+        result.to_string().replace('\'', "'\\''")
+    );
+    std::fs::write(&script_path, content).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    dir
+}
+
 /// Helper to get the script path from a tempdir created by create_fake_cli_script.
 fn script_path(dir: &tempfile::TempDir) -> String {
     dir.path().join("fake_cli.sh").to_string_lossy().to_string()
@@ -221,7 +268,28 @@ fn create_failing_cli_script(exit_code: i32, stderr_msg: &str) -> tempfile::Temp
 fn create_hanging_cli_script() -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("fake_cli.sh");
-    std::fs::write(&path, "#!/bin/sh\nsleep 5").unwrap();
+    std::fs::write(
+        &path,
+        "#!/bin/sh\ncase \"$*\" in *--version*) echo 'test 1.0'; exit 0;; esac\nsleep 5",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    dir
+}
+
+/// Create a persistent Claude script that exits without a result frame.
+fn create_no_result_claude_stream_script() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("fake_cli.sh");
+    std::fs::write(
+        &path,
+        "#!/bin/sh\ncase \"$*\" in *--version*) echo '2.1.0'; exit 0;; esac\nIFS= read -r line\nexit 0",
+    )
+    .unwrap();
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -626,6 +694,73 @@ async fn session_switch_restores_previous() {
 }
 
 #[tokio::test]
+async fn session_switch_restarts_persistent_claude_with_target_session() {
+    let fake_cli = create_tracking_claude_stream_script();
+    let mut config = TestGateway::build_config(&script_path(&fake_cli));
+    config.cli = CliProfile::Claude {
+        bin: script_path(&fake_cli),
+        model: Some("test-claude".into()),
+        stream_json: true,
+        extra_args: vec![],
+        env: Default::default(),
+        env_file: None,
+    };
+    config.cli_timeout_secs = 5;
+    let gw = TestGateway::with_config(config).await;
+    let store = gw.runner.store().unwrap();
+    let cli_name = gw.runner.cli_profile().name();
+    let first = "ac73779a-60b1-4973-a582-9b73350e3e8b";
+    let target = "2e8c8b02-5c96-45e8-85b3-b74f0bc2f101";
+    store
+        .set_current_session("mock", "chat-pool-switch", "user-1", target, cli_name)
+        .await
+        .unwrap();
+    store
+        .set_current_session("mock", "chat-pool-switch", "user-1", first, cli_name)
+        .await
+        .unwrap();
+
+    let outputs = Arc::new(Mutex::new(Vec::new()));
+    let adapter = MockPlatformAdapter::new(mpsc::channel(1).1, outputs);
+    let first_response = gw
+        .runner
+        .handle_message(&msg("chat-pool-switch", "user-1", "first turn"), &adapter)
+        .await;
+    assert!(first_response.is_some());
+
+    let switched = gw
+        .runner
+        .handle_fast(&msg(
+            "chat-pool-switch",
+            "user-1",
+            "/session switch 2e8c8b02",
+        ))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(switched.starts_with("✅ 已切换到会话"));
+
+    let second_response = gw
+        .runner
+        .handle_message(&msg("chat-pool-switch", "user-1", "second turn"), &adapter)
+        .await;
+    assert!(second_response.is_some());
+
+    let starts = std::fs::read_to_string(fake_cli.path().join("starts.log")).unwrap();
+    let starts = starts
+        .lines()
+        .filter(|line| line.starts_with("--resume "))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        starts.len(),
+        2,
+        "expected a new persistent process: {starts:?}"
+    );
+    assert!(starts[0].contains(&format!("--resume {first}")));
+    assert!(starts[1].contains(&format!("--resume {target}")));
+}
+
+#[tokio::test]
 async fn session_switch_rejects_short_and_ambiguous_prefixes() {
     let gw = TestGateway::new().await;
     let store = gw.runner.store().unwrap();
@@ -688,6 +823,111 @@ async fn cli_failure_returns_error_response() {
         text.contains("segfault") || text.contains("错误") || text.contains("⚠"),
         "should report CLI failure: {text}"
     );
+    let usage = gw
+        .runner
+        .store()
+        .unwrap()
+        .get_usage_total("mock", "user-1")
+        .await
+        .unwrap();
+    assert_eq!(usage.messages, 1);
+    assert_eq!(usage.total_tokens, 0);
+    assert_eq!(usage.cost_usd, 0.0);
+}
+
+#[tokio::test]
+async fn cli_spawn_failure_records_zero_usage() {
+    let fake_cli = create_fake_cli_script("probe succeeds");
+    let profile = CliProfile::Custom {
+        bin: script_path(&fake_cli),
+        args_template: vec![],
+        json_output: true,
+        text_field: Some("text".into()),
+        session_id_field: Some("session_id".into()),
+    };
+    assert!(
+        astra_gateway::cli_bridge::probe_cli(&profile)
+            .await
+            .is_available()
+    );
+
+    let config = TestGateway::build_config(&script_path(&fake_cli));
+    let gw = TestGateway::with_config(config).await;
+    std::fs::remove_file(fake_cli.path().join("fake_cli.sh")).unwrap();
+
+    let outputs = Arc::new(Mutex::new(Vec::new()));
+    let adapter = MockPlatformAdapter::new(mpsc::channel(1).1, outputs);
+    let response = gw
+        .runner
+        .handle_message(&msg("chat-spawn-fail", "user-1", "hello"), &adapter)
+        .await
+        .expect("spawn failure response");
+    assert!(response.contains("错误") || response.contains("⚠"));
+
+    let usage = gw
+        .runner
+        .store()
+        .unwrap()
+        .get_usage_total("mock", "user-1")
+        .await
+        .unwrap();
+    assert_eq!(usage.messages, 1);
+    assert_eq!(usage.total_tokens, 0);
+    assert_eq!(usage.cost_usd, 0.0);
+}
+
+#[tokio::test]
+async fn cli_timeout_records_zero_usage() {
+    let hanging_cli = create_hanging_cli_script();
+    let mut config = TestGateway::build_config(&script_path(&hanging_cli));
+    config.cli_timeout_secs = 1;
+    let gw = TestGateway::with_config(config).await;
+    let outputs = Arc::new(Mutex::new(Vec::new()));
+    let adapter = MockPlatformAdapter::new(mpsc::channel(1).1, outputs);
+
+    let response = gw
+        .runner
+        .handle_message(&msg("chat-timeout", "user-1", "hello"), &adapter)
+        .await
+        .expect("timeout response");
+    assert!(response.contains("超时") || response.contains("timeout"));
+
+    let usage = gw
+        .runner
+        .store()
+        .unwrap()
+        .get_usage_total("mock", "user-1")
+        .await
+        .unwrap();
+    assert_eq!(usage.messages, 1);
+    assert_eq!(usage.total_tokens, 0);
+    assert_eq!(usage.cost_usd, 0.0);
+}
+
+#[tokio::test]
+async fn persistent_claude_no_result_records_zero_usage() {
+    let fake_cli = create_no_result_claude_stream_script();
+    let mut config = TestGateway::build_config(&script_path(&fake_cli));
+    config.cli = CliProfile::Claude {
+        bin: script_path(&fake_cli),
+        model: Some("test-claude".into()),
+        stream_json: true,
+        extra_args: vec![],
+        env: Default::default(),
+        env_file: None,
+    };
+    config.cli_timeout_secs = 5;
+    let gw = TestGateway::with_config(config).await;
+    let outputs = Arc::new(Mutex::new(Vec::new()));
+    let adapter = MockPlatformAdapter::new(mpsc::channel(1).1, outputs);
+
+    let response = gw
+        .runner
+        .handle_message(&msg("chat-no-result", "user-1", "hello"), &adapter)
+        .await
+        .expect("missing result response");
+    assert!(response.contains("错误") || response.contains("⚠"));
+
     let usage = gw
         .runner
         .store()

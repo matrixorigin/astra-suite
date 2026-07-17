@@ -1222,16 +1222,62 @@ fn claude_audit_usage_json(
         "session_id",
         "request_id",
         "total_cost_usd",
-        "usage",
-        "modelUsage",
         "terminal_reason",
         "fast_mode_state",
         "uuid",
     ] {
         if let Some(value) = v.get(field)
-            && !value.is_null()
+            && (value.is_boolean() || value.is_number() || value.is_string())
         {
             audit.insert(field.to_string(), value.clone());
+        }
+    }
+    if let Some(usage) = v["usage"].as_object() {
+        let mut safe_usage = serde_json::Map::new();
+        for field in [
+            "input_tokens",
+            "output_tokens",
+            "cache_creation_input_tokens",
+            "cache_read_input_tokens",
+        ] {
+            if let Some(value) = usage.get(field).filter(|value| value.is_number()) {
+                safe_usage.insert(field.to_string(), value.clone());
+            }
+        }
+        if !safe_usage.is_empty() {
+            audit.insert("usage".to_string(), serde_json::Value::Object(safe_usage));
+        }
+    }
+    if let Some(models) = v["modelUsage"].as_object() {
+        let mut safe_models = serde_json::Map::new();
+        for (model, usage) in models {
+            let Some(usage) = usage.as_object() else {
+                continue;
+            };
+            let mut safe_usage = serde_json::Map::new();
+            for field in [
+                "inputTokens",
+                "outputTokens",
+                "cacheCreationInputTokens",
+                "cacheReadInputTokens",
+                "webSearchRequests",
+                "costUSD",
+                "contextWindow",
+                "maxOutputTokens",
+            ] {
+                if let Some(value) = usage.get(field).filter(|value| value.is_number()) {
+                    safe_usage.insert(field.to_string(), value.clone());
+                }
+            }
+            if !safe_usage.is_empty() {
+                safe_models.insert(model.clone(), serde_json::Value::Object(safe_usage));
+            }
+        }
+        if !safe_models.is_empty() {
+            audit.insert(
+                "modelUsage".to_string(),
+                serde_json::Value::Object(safe_models),
+            );
         }
     }
     if let Some(error) = provider_error {
@@ -1318,6 +1364,27 @@ fn cost_delta(current: Option<f64>, previous: Option<f64>) -> Option<f64> {
     })
 }
 
+fn usage_snapshot_rolled_back(
+    current: &ClaudeUsageSnapshot,
+    previous: &ClaudeUsageSnapshot,
+) -> bool {
+    [
+        (current.tokens_prompt, previous.tokens_prompt),
+        (current.tokens_completion, previous.tokens_completion),
+        (
+            current.cache_creation_input_tokens,
+            previous.cache_creation_input_tokens,
+        ),
+        (
+            current.cache_read_input_tokens,
+            previous.cache_read_input_tokens,
+        ),
+    ]
+    .into_iter()
+    .any(|(current, previous)| matches!((current, previous), (Some(value), Some(old)) if value < old))
+        || matches!((current.cost_usd, previous.cost_usd), (Some(value), Some(old)) if value < old)
+}
+
 pub(crate) fn normalize_claude_pool_usage(
     result: &mut CliResult,
     previous: &mut Option<ClaudeUsageSnapshot>,
@@ -1357,16 +1424,30 @@ pub(crate) fn normalize_claude_pool_usage(
         result.cached_input_tokens = Some(0);
         result.cost_usd = current.cost_usd.map(|_| 0.0);
     } else if let Some(old) = previous.as_ref() {
-        result.tokens_prompt = usage_delta(current.tokens_prompt, old.tokens_prompt);
-        result.tokens_completion = usage_delta(current.tokens_completion, old.tokens_completion);
-        result.cache_creation_input_tokens = usage_delta(
-            current.cache_creation_input_tokens,
-            old.cache_creation_input_tokens,
-        );
-        result.cache_read_input_tokens =
-            usage_delta(current.cache_read_input_tokens, old.cache_read_input_tokens);
-        result.cached_input_tokens = result.cache_read_input_tokens;
-        result.cost_usd = cost_delta(current.cost_usd, old.cost_usd);
+        if usage_snapshot_rolled_back(&current, old) {
+            // Persistent process replacement or provider counter reset. A
+            // rollback in any cumulative field invalidates the whole old
+            // snapshot; mixing deltas and absolute values would mischarge the
+            // current turn.
+            result.tokens_prompt = current.tokens_prompt;
+            result.tokens_completion = current.tokens_completion;
+            result.cache_creation_input_tokens = current.cache_creation_input_tokens;
+            result.cache_read_input_tokens = current.cache_read_input_tokens;
+            result.cached_input_tokens = current.cache_read_input_tokens;
+            result.cost_usd = current.cost_usd;
+        } else {
+            result.tokens_prompt = usage_delta(current.tokens_prompt, old.tokens_prompt);
+            result.tokens_completion =
+                usage_delta(current.tokens_completion, old.tokens_completion);
+            result.cache_creation_input_tokens = usage_delta(
+                current.cache_creation_input_tokens,
+                old.cache_creation_input_tokens,
+            );
+            result.cache_read_input_tokens =
+                usage_delta(current.cache_read_input_tokens, old.cache_read_input_tokens);
+            result.cached_input_tokens = result.cache_read_input_tokens;
+            result.cost_usd = cost_delta(current.cost_usd, old.cost_usd);
+        }
     } else {
         result.tokens_prompt = current.tokens_prompt;
         result.tokens_completion = current.tokens_completion;
@@ -4192,8 +4273,17 @@ extra_args:
             "result": "sensitive model response",
             "permission_denials": [{"tool": "Read", "path": "/secret/path"}],
             "session_id": "session-1",
-            "usage": {"input_tokens": 3, "output_tokens": 4},
-            "modelUsage": {"model": {"inputTokens": 3, "outputTokens": 4}},
+            "usage": {
+                "input_tokens": 3,
+                "output_tokens": 4,
+                "iterations": [{"prompt": "secret iteration prompt"}],
+                "provider_extension": {"secret": "opaque usage data"}
+            },
+            "modelUsage": {"model": {
+                "inputTokens": 3,
+                "outputTokens": 4,
+                "debug": {"prompt": "secret model debug data"}
+            }},
             "total_cost_usd": 0.25
         });
 
@@ -4203,6 +4293,10 @@ extra_args:
             serde_json::from_str(result.raw_usage_json.as_deref().unwrap()).unwrap();
         assert!(raw.get("result").is_none());
         assert!(raw.get("permission_denials").is_none());
+        assert!(raw["usage"].get("iterations").is_none());
+        assert!(raw["usage"].get("provider_extension").is_none());
+        assert!(raw["modelUsage"]["model"].get("debug").is_none());
+        assert!(!raw.to_string().contains("secret"));
         assert_eq!(raw["usage"]["input_tokens"], 3);
         assert_eq!(raw["modelUsage"]["model"]["outputTokens"], 4);
     }
@@ -4310,19 +4404,27 @@ extra_args:
         });
         let restarted = serde_json::json!({
             "result": "fresh process",
+            "modelUsage": {"claude": {
+                "inputTokens": 600,
+                "outputTokens": 5,
+                "cacheCreationInputTokens": 60,
+                "cacheReadInputTokens": 7,
+                "costUSD": 5.2
+            }},
             "usage": {
-                "input_tokens": 20,
+                "input_tokens": 10,
                 "output_tokens": 5,
                 "cache_creation_input_tokens": 2,
                 "cache_read_input_tokens": 7
             },
-            "total_cost_usd": 0.2
+            "total_cost_usd": 5.2
         });
         let mut result = parse_claude_result_value(&restarted, 0);
         normalize_claude_pool_usage(&mut result, &mut baseline);
-        assert_eq!(result.tokens_prompt, Some(20));
+        assert_eq!(result.tokens_prompt, Some(600));
         assert_eq!(result.tokens_completion, Some(5));
-        assert_eq!(result.cost_usd, Some(0.2));
-        assert_eq!(baseline.unwrap().tokens_prompt, Some(20));
+        assert_eq!(result.cache_creation_input_tokens, Some(60));
+        assert_eq!(result.cost_usd, Some(5.2));
+        assert_eq!(baseline.unwrap().tokens_prompt, Some(600));
     }
 }
