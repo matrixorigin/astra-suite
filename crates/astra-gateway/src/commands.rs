@@ -187,7 +187,7 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
 
             if let (Some(store), Some(sid)) = (ctx.store, session.as_deref()) {
                 match store
-                    .get_usage_session(ctx.platform, ctx.user_id, sid)
+                    .get_usage_session(ctx.platform, ctx.user_id, cli_name, sid)
                     .await
                 {
                     Ok(usage) if usage.messages > 0 => {

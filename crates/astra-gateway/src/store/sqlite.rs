@@ -921,6 +921,7 @@ impl GatewayStore for SqliteGatewayStore {
         &self,
         platform: &str,
         user_id: &str,
+        cli_profile: &str,
         session_id: &str,
     ) -> Result<UsageSummary, StoreError> {
         let row: Option<(
@@ -954,10 +955,11 @@ impl GatewayStore for SqliteGatewayStore {
                     COALESCE(SUM(cost_usd), 0.0),
                     COALESCE(SUM(tool_calls), 0)
              FROM gw_usage
-             WHERE platform = ? AND user_id = ? AND session_id = ?",
+             WHERE platform = ? AND user_id = ? AND cli_profile = ? AND session_id = ?",
         )
         .bind(platform)
         .bind(user_id)
+        .bind(cli_profile)
         .bind(session_id)
         .fetch_optional(&self.pool)
         .await?;
@@ -1477,6 +1479,52 @@ mod tests {
 
         let total = store.get_usage_total("wx", "u1").await.unwrap();
         assert_eq!(total.messages, 1);
+    }
+
+    #[tokio::test]
+    async fn session_usage_isolated_by_cli_profile() {
+        let store = make_store().await;
+        for (profile, prompt_tokens) in [("astra", 10), ("claude", 20)] {
+            store
+                .record_usage(&UsageRecord {
+                    platform: "wx".into(),
+                    user_id: "u1".into(),
+                    cli_profile: profile.into(),
+                    model: None,
+                    trace_id: None,
+                    request_id: None,
+                    run_id: None,
+                    session_id: Some("shared-session-id".into()),
+                    tokens_prompt: prompt_tokens,
+                    tokens_completion: 0,
+                    cached_input_tokens: 0,
+                    cache_creation_input_tokens: 0,
+                    cache_read_input_tokens: 0,
+                    reasoning_output_tokens: 0,
+                    total_tokens: prompt_tokens,
+                    context_window: None,
+                    max_output_tokens: None,
+                    cost_usd: None,
+                    raw_usage_json: None,
+                    tool_calls: 0,
+                    elapsed_ms: 1,
+                })
+                .await
+                .unwrap();
+        }
+
+        let astra = store
+            .get_usage_session("wx", "u1", "astra", "shared-session-id")
+            .await
+            .unwrap();
+        let claude = store
+            .get_usage_session("wx", "u1", "claude", "shared-session-id")
+            .await
+            .unwrap();
+        assert_eq!(astra.messages, 1);
+        assert_eq!(astra.tokens_prompt, 10);
+        assert_eq!(claude.messages, 1);
+        assert_eq!(claude.tokens_prompt, 20);
     }
 
     #[tokio::test]

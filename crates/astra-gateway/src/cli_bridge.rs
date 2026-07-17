@@ -1205,6 +1205,49 @@ fn detect_claude_provider_error(
     })
 }
 
+fn claude_audit_usage_json(
+    v: &serde_json::Value,
+    provider_error: Option<&ProviderError>,
+) -> Option<String> {
+    let mut audit = serde_json::Map::new();
+    for field in [
+        "type",
+        "subtype",
+        "is_error",
+        "api_error_status",
+        "duration_ms",
+        "duration_api_ms",
+        "num_turns",
+        "stop_reason",
+        "session_id",
+        "request_id",
+        "total_cost_usd",
+        "usage",
+        "modelUsage",
+        "terminal_reason",
+        "fast_mode_state",
+        "uuid",
+    ] {
+        if let Some(value) = v.get(field)
+            && !value.is_null()
+        {
+            audit.insert(field.to_string(), value.clone());
+        }
+    }
+    if let Some(error) = provider_error {
+        audit.insert(
+            "provider_error".to_string(),
+            serde_json::json!({
+                "kind": error.kind,
+                "status": error.status,
+                "code": error.code,
+                "request_id": error.request_id,
+            }),
+        );
+    }
+    raw_json(&serde_json::Value::Object(audit))
+}
+
 pub(crate) fn parse_claude_result_value(v: &serde_json::Value, exit_code: i32) -> CliResult {
     let usage = &v["usage"];
     let model_usage = first_model_usage(v);
@@ -1219,6 +1262,7 @@ pub(crate) fn parse_claude_result_value(v: &serde_json::Value, exit_code: i32) -
         .as_ref()
         .map(|error| error.kind.clone())
         .or_else(|| default_error_kind(exit_code));
+    let raw_usage_json = claude_audit_usage_json(v, provider_error.as_ref());
 
     CliResult {
         stdout: String::new(),
@@ -1251,9 +1295,10 @@ pub(crate) fn parse_claude_result_value(v: &serde_json::Value, exit_code: i32) -
         cost_usd: v["total_cost_usd"]
             .as_f64()
             .or_else(|| model_usage.and_then(|m| m["costUSD"].as_f64())),
-        // Persistent Claude frames are cumulative; retain the full upstream
-        // envelope for audits while the normalized columns store per-turn deltas.
-        raw_usage_json: raw_json(v),
+        // Retain only accounting and request metadata. The upstream envelope
+        // also contains the model response and permission details, which do
+        // not belong in the usage table.
+        raw_usage_json,
     }
 }
 
@@ -4101,6 +4146,12 @@ extra_args:
         let result = parse_claude_result_value(&value, 0);
         assert!(!result.success);
         assert_eq!(result.error_kind.as_deref(), Some("context_overflow"));
+        let raw: serde_json::Value =
+            serde_json::from_str(result.raw_usage_json.as_deref().expect("audit usage JSON"))
+                .unwrap();
+        assert!(raw.get("result").is_none());
+        assert_eq!(raw["provider_error"]["status"], 400);
+        assert_eq!(raw["provider_error"]["request_id"], "upstream-123");
         let error = result.provider_error.expect("structured provider error");
         assert_eq!(error.status, Some(400));
         assert_eq!(error.code.as_deref(), Some("InvalidParameter"));
@@ -4131,6 +4182,29 @@ extra_args:
         assert_eq!(error.kind, "provider_api_error");
         assert_eq!(error.code.as_deref(), Some("ServiceUnavailable"));
         assert_eq!(error.request_id.as_deref(), Some("req-generic"));
+    }
+
+    #[test]
+    fn claude_audit_usage_excludes_response_and_permission_details() {
+        let value = serde_json::json!({
+            "type": "result",
+            "subtype": "success",
+            "result": "sensitive model response",
+            "permission_denials": [{"tool": "Read", "path": "/secret/path"}],
+            "session_id": "session-1",
+            "usage": {"input_tokens": 3, "output_tokens": 4},
+            "modelUsage": {"model": {"inputTokens": 3, "outputTokens": 4}},
+            "total_cost_usd": 0.25
+        });
+
+        let result = parse_claude_result_value(&value, 0);
+        assert_eq!(result.text.as_deref(), Some("sensitive model response"));
+        let raw: serde_json::Value =
+            serde_json::from_str(result.raw_usage_json.as_deref().unwrap()).unwrap();
+        assert!(raw.get("result").is_none());
+        assert!(raw.get("permission_denials").is_none());
+        assert_eq!(raw["usage"]["input_tokens"], 3);
+        assert_eq!(raw["modelUsage"]["model"]["outputTokens"], 4);
     }
 
     #[test]

@@ -688,6 +688,16 @@ async fn cli_failure_returns_error_response() {
         text.contains("segfault") || text.contains("错误") || text.contains("⚠"),
         "should report CLI failure: {text}"
     );
+    let usage = gw
+        .runner
+        .store()
+        .unwrap()
+        .get_usage_total("mock", "user-1")
+        .await
+        .unwrap();
+    assert_eq!(usage.messages, 1);
+    assert_eq!(usage.total_tokens, 0);
+    assert_eq!(usage.cost_usd, 0.0);
 }
 
 #[tokio::test]
@@ -736,7 +746,7 @@ async fn claude_context_overflow_returns_actionable_zero_cost_failure() {
         .runner
         .store()
         .unwrap()
-        .get_usage_session("mock", "user-1", session_id)
+        .get_usage_session("mock", "user-1", "claude", session_id)
         .await
         .unwrap();
     assert_eq!(usage.messages, 1);

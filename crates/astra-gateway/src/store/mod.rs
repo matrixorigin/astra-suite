@@ -334,6 +334,7 @@ pub trait GatewayStore: Send + Sync + 'static {
         &self,
         platform: &str,
         user_id: &str,
+        cli_profile: &str,
         session_id: &str,
     ) -> Result<UsageSummary, StoreError>;
 

@@ -2467,6 +2467,59 @@ impl GatewayRunner {
                     }
                     let _ = writer.fail_request(error_text.trim()).await;
                 }
+                let elapsed = start.elapsed();
+                let prompt_tok = result.tokens_prompt.unwrap_or(0);
+                let completion_tok = result.tokens_completion.unwrap_or(0);
+                let cache_create_tok = result.cache_creation_input_tokens.unwrap_or(0);
+                let cache_read_tok = result.cache_read_input_tokens.unwrap_or(0);
+                let cached_tok = result.cached_input_tokens.unwrap_or(0);
+                let reasoning_tok = result.reasoning_output_tokens.unwrap_or(0);
+                let total_tok = result.total_tokens.unwrap_or_else(|| {
+                    prompt_tok + completion_tok + cache_create_tok + cache_read_tok + reasoning_tok
+                });
+                let failure_cost_usd = if total_tok == 0 {
+                    Some(0.0)
+                } else {
+                    result.cost_usd
+                };
+                if let Some(ref store) = self.store
+                    && let Err(e) = store
+                        .record_usage(&store::UsageRecord {
+                            platform: msg.platform.to_string(),
+                            user_id: msg.user_id.clone(),
+                            cli_profile: cli_name.clone(),
+                            model: cli_profile.model_name().map(String::from),
+                            trace_id: result
+                                .trace_id
+                                .clone()
+                                .or_else(|| trace.as_ref().map(|t| t.trace_id.to_string())),
+                            request_id: result
+                                .request_id
+                                .clone()
+                                .or_else(|| trace.as_ref().map(|t| t.request_id.to_string())),
+                            run_id: result
+                                .run_id
+                                .clone()
+                                .or_else(|| run_id.as_ref().map(ToString::to_string)),
+                            session_id: result.session_id.clone(),
+                            tokens_prompt: prompt_tok,
+                            tokens_completion: completion_tok,
+                            cached_input_tokens: cached_tok,
+                            cache_creation_input_tokens: cache_create_tok,
+                            cache_read_input_tokens: cache_read_tok,
+                            reasoning_output_tokens: reasoning_tok,
+                            total_tokens: total_tok,
+                            context_window: result.context_window,
+                            max_output_tokens: result.max_output_tokens,
+                            cost_usd: failure_cost_usd,
+                            raw_usage_json: result.raw_usage_json.clone(),
+                            tool_calls: result.tool_calls_count.unwrap_or(0),
+                            elapsed_ms: elapsed.as_millis() as u64,
+                        })
+                        .await
+                {
+                    tracing::warn!(error = %e, "failed to record CLI failure usage");
+                }
                 let text = cli_bridge::translate_cli_error(
                     &cli_profile,
                     result.exit_code,

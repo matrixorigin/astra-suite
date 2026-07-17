@@ -946,6 +946,7 @@ impl GatewayStore for MysqlGatewayStore {
         &self,
         platform: &str,
         user_id: &str,
+        cli_profile: &str,
         session_id: &str,
     ) -> Result<UsageSummary, StoreError> {
         let row: Option<(
@@ -978,10 +979,12 @@ impl GatewayStore for MysqlGatewayStore {
                     MAX(max_output_tokens),
                     COALESCE(SUM(cost_usd),0.0),
                     COALESCE(SUM(tool_calls),0)
-             FROM gw_usage WHERE platform = ? AND user_id = ? AND session_id = ?",
+             FROM gw_usage
+             WHERE platform = ? AND user_id = ? AND cli_profile = ? AND session_id = ?",
         )
         .bind(platform)
         .bind(user_id)
+        .bind(cli_profile)
         .bind(session_id)
         .fetch_optional(&self.pool)
         .await

@@ -671,6 +671,7 @@ impl GatewayStore for FileGatewayStore {
         &self,
         platform: &str,
         user_id: &str,
+        cli_profile: &str,
         session_id: &str,
     ) -> Result<UsageSummary, StoreError> {
         let dir = self.base_dir.join("usage");
@@ -682,8 +683,14 @@ impl GatewayStore for FileGatewayStore {
         while let Ok(Some(entry)) = entries.next_entry().await {
             let path = entry.path();
             if path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
-                let day =
-                    load_usage_summary_for_session(&path, platform, user_id, session_id).await?;
+                let day = load_usage_summary_for_session(
+                    &path,
+                    platform,
+                    user_id,
+                    cli_profile,
+                    session_id,
+                )
+                .await?;
                 total.messages += day.messages;
                 total.tokens_prompt += day.tokens_prompt;
                 total.tokens_completion += day.tokens_completion;
@@ -851,22 +858,24 @@ async fn load_usage_summary(
     platform: &str,
     user_id: &str,
 ) -> Result<UsageSummary, StoreError> {
-    load_usage_summary_filtered(path, platform, user_id, None).await
+    load_usage_summary_filtered(path, platform, user_id, None, None).await
 }
 
 async fn load_usage_summary_for_session(
     path: &Path,
     platform: &str,
     user_id: &str,
+    cli_profile: &str,
     session_id: &str,
 ) -> Result<UsageSummary, StoreError> {
-    load_usage_summary_filtered(path, platform, user_id, Some(session_id)).await
+    load_usage_summary_filtered(path, platform, user_id, Some(cli_profile), Some(session_id)).await
 }
 
 async fn load_usage_summary_filtered(
     path: &Path,
     platform: &str,
     user_id: &str,
+    cli_profile: Option<&str>,
     session_id: Option<&str>,
 ) -> Result<UsageSummary, StoreError> {
     let mut summary = UsageSummary::default();
@@ -882,6 +891,7 @@ async fn load_usage_summary_filtered(
         if let Ok(entry) = serde_json::from_str::<UsageEntry>(line)
             && entry.platform == platform
             && entry.user_id == user_id
+            && cli_profile.is_none_or(|profile| entry.cli_profile == profile)
             && session_id.is_none_or(|sid| entry.session_id.as_deref() == Some(sid))
         {
             summary.messages += 1;
