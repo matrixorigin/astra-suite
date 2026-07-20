@@ -198,13 +198,13 @@ fn create_fake_claude_stream_script(result: &serde_json::Value) -> tempfile::Tem
     dir
 }
 
-fn create_local_command_claude_stream_script(output: &str) -> tempfile::TempDir {
+fn create_system_status_claude_stream_script(subtype: &str, content: &str) -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
     let script_path = dir.path().join("fake_cli.sh");
-    let local_command = serde_json::json!({
+    let system_status = serde_json::json!({
         "type": "system",
-        "subtype": "local_command",
-        "content": format!("<local-command-stdout>{output}</local-command-stdout>")
+        "subtype": subtype,
+        "content": content
     });
     let result = serde_json::json!({
         "type": "result",
@@ -218,7 +218,7 @@ fn create_local_command_claude_stream_script(output: &str) -> tempfile::TempDir 
     });
     let content = format!(
         "#!/bin/sh\ncase \"$*\" in *--version*) echo '2.1.0'; exit 0;; esac\nwhile IFS= read -r line; do\n  printf '%s\\n' '{}'\n  printf '%s\\n' '{}'\ndone\n",
-        local_command.to_string().replace('\'', "'\\''"),
+        system_status.to_string().replace('\'', "'\\''"),
         result.to_string().replace('\'', "'\\''")
     );
     std::fs::write(&script_path, content).unwrap();
@@ -252,6 +252,49 @@ fn create_one_local_command_then_empty_claude_script() -> tempfile::TempDir {
         "#!/bin/sh\ncase \"$*\" in *--version*) echo '2.1.0'; exit 0;; esac\nturn=0\nwhile IFS= read -r line; do\n  turn=$((turn + 1))\n  if [ \"$turn\" -eq 1 ]; then printf '%s\\n' '{}'; fi\n  printf '%s\\n' '{}'\ndone\n",
         local_command.to_string().replace('\'', "'\\''"),
         result.to_string().replace('\'', "'\\''")
+    );
+    std::fs::write(&script_path, content).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    dir
+}
+
+fn create_compact_cumulative_usage_claude_script() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let script_path = dir.path().join("fake_cli.sh");
+    let result = |text: &str, input: u64, output: u64, cost: f64| {
+        serde_json::json!({
+            "type": "result",
+            "subtype": "success",
+            "is_error": false,
+            "session_id": "compact-cumulative-session",
+            "result": text,
+            "usage": {"input_tokens": 0, "output_tokens": 0},
+            "modelUsage": {
+                "test-model": {
+                    "inputTokens": input,
+                    "outputTokens": output,
+                    "cacheCreationInputTokens": 30,
+                    "cacheReadInputTokens": 0,
+                    "costUSD": cost,
+                    "contextWindow": 200000,
+                    "maxOutputTokens": 32000
+                }
+            },
+            "total_cost_usd": cost
+        })
+    };
+    let baseline = result("baseline", 100, 20, 0.01);
+    let unchanged = result("", 100, 20, 0.01);
+    let increased = result("", 160, 45, 0.02);
+    let content = format!(
+        "#!/bin/sh\ncase \"$*\" in *--version*) echo '2.1.0'; exit 0;; esac\nturn=0\nwhile IFS= read -r line; do\n  turn=$((turn + 1))\n  case \"$turn\" in\n    1) printf '%s\\n' '{}' ;;\n    2) printf '%s\\n' '{}' ;;\n    *) printf '%s\\n' '{}' ;;\n  esac\ndone\n",
+        baseline.to_string().replace('\'', "'\\''"),
+        unchanged.to_string().replace('\'', "'\\''"),
+        increased.to_string().replace('\'', "'\\''")
     );
     std::fs::write(&script_path, content).unwrap();
     #[cfg(unix)]
@@ -2056,7 +2099,10 @@ async fn compact_routes_only_claude_to_slow_path() {
 
 #[tokio::test]
 async fn compact_not_enough_messages_is_not_reported_as_success() {
-    let fake_cli = create_local_command_claude_stream_script("Not enough messages to compact.");
+    let fake_cli = create_system_status_claude_stream_script(
+        "local_command",
+        "<local-command-stdout>Not enough messages to compact.</local-command-stdout>",
+    );
     let mut config = TestGateway::build_config(&script_path(&fake_cli));
     config.cli = CliProfile::Claude {
         bin: script_path(&fake_cli),
@@ -2078,6 +2124,122 @@ async fn compact_not_enough_messages_is_not_reported_as_success() {
 
     assert!(response.contains("内容太少"), "response: {response}");
     assert!(!response.contains("会话已压缩"), "response: {response}");
+}
+
+#[tokio::test]
+async fn compact_boundary_is_reported_as_confirmed_success() {
+    let fake_cli =
+        create_system_status_claude_stream_script("compact_boundary", "Conversation compacted");
+    let mut config = TestGateway::build_config(&script_path(&fake_cli));
+    config.cli = CliProfile::Claude {
+        bin: script_path(&fake_cli),
+        model: Some("test-claude".into()),
+        stream_json: true,
+        extra_args: vec![],
+        env: Default::default(),
+        env_file: None,
+    };
+    let gateway = TestGateway::with_config(config).await;
+    let outputs = Arc::new(Mutex::new(Vec::new()));
+    let adapter = MockPlatformAdapter::new(mpsc::channel(1).1, outputs);
+
+    let response = gateway
+        .runner
+        .handle_message(
+            &msg("chat-compact-boundary", "user-1", "/compact"),
+            &adapter,
+        )
+        .await
+        .unwrap();
+
+    assert!(response.contains("会话已压缩"), "response: {response}");
+    assert!(!response.contains("无法确认"), "response: {response}");
+}
+
+#[tokio::test]
+async fn compact_empty_result_with_model_activity_is_reported_as_success() {
+    let result = serde_json::json!({
+        "type": "result",
+        "subtype": "success",
+        "is_error": false,
+        "session_id": "compact-model-activity-session",
+        "result": "",
+        "usage": {"input_tokens": 0, "output_tokens": 0},
+        "modelUsage": {
+            "test-model": {
+                "inputTokens": 100,
+                "outputTokens": 20,
+                "cacheCreationInputTokens": 30,
+                "cacheReadInputTokens": 0,
+                "costUSD": 0.01,
+                "contextWindow": 200000,
+                "maxOutputTokens": 32000
+            }
+        },
+        "total_cost_usd": 0.01
+    });
+    let fake_cli = create_fake_claude_stream_script(&result);
+    let mut config = TestGateway::build_config(&script_path(&fake_cli));
+    config.cli = CliProfile::Claude {
+        bin: script_path(&fake_cli),
+        model: Some("test-claude".into()),
+        stream_json: true,
+        extra_args: vec![],
+        env: Default::default(),
+        env_file: None,
+    };
+    let gateway = TestGateway::with_config(config).await;
+    let outputs = Arc::new(Mutex::new(Vec::new()));
+    let adapter = MockPlatformAdapter::new(mpsc::channel(1).1, outputs);
+
+    let response = gateway
+        .runner
+        .handle_message(&msg("chat-compact-usage", "user-1", "/compact"), &adapter)
+        .await
+        .unwrap();
+
+    assert!(response.contains("会话已压缩"), "response: {response}");
+    assert!(!response.contains("无法确认"), "response: {response}");
+}
+
+#[tokio::test]
+async fn compact_confirmation_uses_persistent_usage_delta() {
+    let fake_cli = create_compact_cumulative_usage_claude_script();
+    let mut config = TestGateway::build_config(&script_path(&fake_cli));
+    config.cli = CliProfile::Claude {
+        bin: script_path(&fake_cli),
+        model: Some("test-claude".into()),
+        stream_json: true,
+        extra_args: vec![],
+        env: Default::default(),
+        env_file: None,
+    };
+    let gateway = TestGateway::with_config(config).await;
+    let outputs = Arc::new(Mutex::new(Vec::new()));
+    let adapter = MockPlatformAdapter::new(mpsc::channel(1).1, outputs);
+
+    let baseline = gateway
+        .runner
+        .handle_message(&msg("chat-compact-delta", "user-1", "baseline"), &adapter)
+        .await
+        .unwrap();
+    assert!(baseline.contains("baseline"), "response: {baseline}");
+
+    let unchanged = gateway
+        .runner
+        .handle_message(&msg("chat-compact-delta", "user-1", "/compact"), &adapter)
+        .await
+        .unwrap();
+    assert!(unchanged.contains("无法确认"), "response: {unchanged}");
+    assert!(!unchanged.contains("会话已压缩"), "response: {unchanged}");
+
+    let increased = gateway
+        .runner
+        .handle_message(&msg("chat-compact-delta", "user-1", "/compact"), &adapter)
+        .await
+        .unwrap();
+    assert!(increased.contains("会话已压缩"), "response: {increased}");
+    assert!(!increased.contains("无法确认"), "response: {increased}");
 }
 
 #[tokio::test]
