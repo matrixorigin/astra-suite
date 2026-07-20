@@ -122,6 +122,7 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
                 None
             };
             let resolved_model = ctx.resolved_cli.model_name();
+            let reasoning_effort = ctx.resolved_cli.reasoning_effort();
             let yaml_default = ctx.config.cli.model_name();
             let model_line = match resolved_model {
                 Some(id) => {
@@ -130,7 +131,10 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
                     } else {
                         "用户切换"
                     };
-                    format!("- 模型: `{id}` ({source})")
+                    match reasoning_effort {
+                        Some(effort) => format!("- 模型: `{id}` ({source}) · effort: `{effort}`"),
+                        None => format!("- 模型: `{id}` ({source})"),
+                    }
                 }
                 None => "- 模型: (CLI 默认,yaml 未配置 cli.model)".to_string(),
             };
@@ -2657,11 +2661,14 @@ struct CodexReasoningEffort {
 async fn codex_model_entries(
     profile: &crate::cli_bridge::CliProfile,
 ) -> Result<Vec<ModelEntry>, String> {
-    let crate::cli_bridge::CliProfile::Codex { bin, .. } = profile else {
+    let crate::cli_bridge::CliProfile::Codex {
+        bin, extra_args, ..
+    } = profile
+    else {
         return Ok(Vec::new());
     };
 
-    match codex_app_server_models(bin).await {
+    match codex_app_server_models(bin, extra_args).await {
         Ok(models) if !models.is_empty() => return Ok(codex_model_entries_from_app_server(models)),
         Ok(_) => {
             tracing::warn!("Codex app-server model/list returned no models; using debug catalog")
@@ -2739,18 +2746,24 @@ fn codex_model_entries_from_app_server(models: Vec<CodexAppServerModel>) -> Vec<
     entries
 }
 
-async fn codex_app_server_models(bin: &str) -> Result<Vec<CodexAppServerModel>, String> {
-    let mut child = tokio::process::Command::new(bin)
+async fn codex_app_server_models(
+    bin: &str,
+    extra_args: &[String],
+) -> Result<Vec<CodexAppServerModel>, String> {
+    let mut command = tokio::process::Command::new(bin);
+    command
         .arg("app-server")
         .arg("--listen")
         .arg("stdio://")
+        .args(extra_args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::null());
+    let mut child = command
         .spawn()
         .map_err(|e| format!("启动 `{bin} app-server`: {e}"))?;
     let result = async {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
         let mut stdin = child
             .stdin
             .take()
@@ -2783,7 +2796,7 @@ async fn codex_app_server_models(bin: &str) -> Result<Vec<CodexAppServerModel>, 
             );
             write_app_server_request(&mut stdin, request_id, "model/list", params).await?;
             let response = wait_app_server_response(&mut lines, request_id, deadline).await?;
-            let page: CodexAppServerModelPage = serde_json::from_value(response["data"].clone())
+            let page: CodexAppServerModelPage = serde_json::from_value(response)
                 .map_err(|e| format!("解析 Codex model/list: {e}"))?;
             models.extend(page.data);
             match page.next_cursor.filter(|cursor| !cursor.trim().is_empty()) {
@@ -3429,6 +3442,27 @@ mod tests {
     }
 
     #[test]
+    fn codex_model_list_parses_the_full_result_envelope() {
+        let result = serde_json::json!({
+            "data": [{
+                "model": "gpt-test",
+                "displayName": "GPT Test",
+                "description": "test model",
+                "hidden": false,
+                "supportedReasoningEfforts": [{"reasoningEffort": "high"}],
+                "defaultReasoningEffort": "high"
+            }],
+            "nextCursor": null
+        });
+        let page: CodexAppServerModelPage = serde_json::from_value(result).unwrap();
+        assert_eq!(page.data.len(), 1);
+        assert_eq!(
+            page.data[0].default_reasoning_effort.as_deref(),
+            Some("high")
+        );
+    }
+
+    #[test]
     fn display_model_name_uses_discovered_entries() {
         let entries = vec![
             default_model_entry(),
@@ -3580,6 +3614,43 @@ mod tests {
     cmd_test!(cmd_status_works_without_db, "/status", |r| {
         assert!(r.unwrap().contains("astra"));
     });
+
+    #[tokio::test]
+    async fn cmd_status_includes_codex_reasoning_effort() {
+        let config = test_config();
+        let cli = crate::cli_bridge::CliProfile::Codex {
+            bin: "codex".into(),
+            model: Some("gpt-5.6-sol".into()),
+            reasoning_effort: Some("high".into()),
+            sandbox: "workspace-write".into(),
+            stream_json: true,
+            extra_args: vec![],
+            skip_git_repo_check: false,
+            ephemeral: false,
+        };
+        let astra = astra::Client::new("http://localhost:8080", None).unwrap();
+        let ctx = CommandContext {
+            astra: &astra,
+            config: &config,
+            store: None,
+            platform: "test",
+            chat_id: "chat_1",
+            user_id: "user_1",
+            resolved_cli: &cli,
+            resolved_provider_config: None,
+            trace_repo: None,
+            project_dirs: &config.project_dirs,
+            cli_availability: &[],
+            auth_status: None,
+            active_requests: None,
+            codex_app_pool: None,
+            gateway_start: chrono::Utc::now(),
+        };
+
+        let result = handle_command(&ctx, "/status").await.unwrap();
+        assert!(result.contains("模型: `gpt-5.6-sol`"), "{result}");
+        assert!(result.contains("effort: `high`"), "{result}");
+    }
 
     #[tokio::test]
     async fn cmd_status_includes_auth_circuit_status_when_available() {
