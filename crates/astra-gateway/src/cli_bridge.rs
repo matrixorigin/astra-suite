@@ -584,12 +584,12 @@ impl CliProfile {
                 if let Some(m) = model {
                     cmd.arg("--model").arg(m);
                 }
+                for arg in extra_args {
+                    cmd.arg(arg);
+                }
                 if let Some(effort) = self.reasoning_effort() {
                     cmd.arg("-c")
                         .arg(format!("model_reasoning_effort={effort:?}"));
-                }
-                for arg in extra_args {
-                    cmd.arg(arg);
                 }
                 if let Some(dir) = working_dir {
                     cmd.current_dir(dir);
@@ -3526,7 +3526,7 @@ printf '%s\n' '{"type":"assistant.message_delta","data":{"deltaContent":"from sc
             reasoning_effort: Some("high".into()),
             sandbox: "workspace-write".into(),
             stream_json: true,
-            extra_args: vec![],
+            extra_args: vec!["-c".into(), "model_reasoning_effort=\"low\"".into()],
             skip_git_repo_check: false,
             ephemeral: false,
         };
@@ -3541,6 +3541,11 @@ printf '%s\n' '{"type":"assistant.message_delta","data":{"deltaContent":"from sc
         assert!(args.contains(&std::ffi::OsStr::new("--model")));
         assert!(args.contains(&std::ffi::OsStr::new("o3")));
         assert!(args.contains(&std::ffi::OsStr::new("model_reasoning_effort=\"high\"")));
+        assert_eq!(
+            args.iter()
+                .rposition(|arg| *arg == std::ffi::OsStr::new("model_reasoning_effort=\"high\"")),
+            Some(args.len() - 1)
+        );
     }
 
     #[test]
