@@ -136,7 +136,12 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
                         None => format!("- 模型: `{id}` ({source})"),
                     }
                 }
-                None => "- 模型: (CLI 默认,yaml 未配置 cli.model)".to_string(),
+                None => match reasoning_effort {
+                    Some(effort) => {
+                        format!("- 模型: (CLI 默认,yaml 未配置 cli.model) · effort: `{effort}`")
+                    }
+                    None => "- 模型: (CLI 默认,yaml 未配置 cli.model)".to_string(),
+                },
             };
             let mut lines = vec![
                 "📊 **状态**".to_string(),
@@ -3649,6 +3654,43 @@ mod tests {
 
         let result = handle_command(&ctx, "/status").await.unwrap();
         assert!(result.contains("模型: `gpt-5.6-sol`"), "{result}");
+        assert!(result.contains("effort: `high`"), "{result}");
+    }
+
+    #[tokio::test]
+    async fn cmd_status_includes_effort_for_codex_default_model() {
+        let config = test_config();
+        let cli = crate::cli_bridge::CliProfile::Codex {
+            bin: "codex".into(),
+            model: None,
+            reasoning_effort: Some("high".into()),
+            sandbox: "workspace-write".into(),
+            stream_json: true,
+            extra_args: vec![],
+            skip_git_repo_check: false,
+            ephemeral: false,
+        };
+        let astra = astra::Client::new("http://localhost:8080", None).unwrap();
+        let ctx = CommandContext {
+            astra: &astra,
+            config: &config,
+            store: None,
+            platform: "test",
+            chat_id: "chat_1",
+            user_id: "user_1",
+            resolved_cli: &cli,
+            resolved_provider_config: None,
+            trace_repo: None,
+            project_dirs: &config.project_dirs,
+            cli_availability: &[],
+            auth_status: None,
+            active_requests: None,
+            codex_app_pool: None,
+            gateway_start: chrono::Utc::now(),
+        };
+
+        let result = handle_command(&ctx, "/status").await.unwrap();
+        assert!(result.contains("模型: (CLI 默认"), "{result}");
         assert!(result.contains("effort: `high`"), "{result}");
     }
 
