@@ -943,9 +943,7 @@ impl GatewayRunner {
                 // error message back and the existing session stays warm.
                 let should_kill = if let Some(arg) = msg.text.strip_prefix("/model ") {
                     let arg = arg.trim();
-                    !arg.eq_ignore_ascii_case("refresh")
-                        && !response.starts_with("⚠️ 未识别模型")
-                        && !response.starts_with("⚠️ 模型设置失败")
+                    !arg.eq_ignore_ascii_case("refresh") && response.starts_with("🤖 模型已切换:")
                 } else {
                     true
                 };
