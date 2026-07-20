@@ -11,10 +11,12 @@ use crate::trace_model::{
 };
 use serde_json::Value;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
+    process::Stdio,
     sync::{Arc, LazyLock},
     time::{Duration, Instant},
 };
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::Mutex;
 
 static MODEL_ENTRY_CACHE: LazyLock<Mutex<HashMap<String, ModelEntryCacheValue>>> =
@@ -120,6 +122,7 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
                 None
             };
             let resolved_model = ctx.resolved_cli.model_name();
+            let reasoning_effort = ctx.resolved_cli.reasoning_effort();
             let yaml_default = ctx.config.cli.model_name();
             let model_line = match resolved_model {
                 Some(id) => {
@@ -128,7 +131,10 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
                     } else {
                         "用户切换"
                     };
-                    format!("- 模型: `{id}` ({source})")
+                    match reasoning_effort {
+                        Some(effort) => format!("- 模型: `{id}` ({source}) · effort: `{effort}`"),
+                        None => format!("- 模型: `{id}` ({source})"),
+                    }
                 }
                 None => "- 模型: (CLI 默认,yaml 未配置 cli.model)".to_string(),
             };
@@ -414,6 +420,11 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
 
         "/model" => {
             let current_model = ctx.resolved_cli.model_name();
+            let current_effort = ctx.resolved_cli.reasoning_effort();
+            let is_codex = matches!(
+                ctx.resolved_cli,
+                crate::cli_bridge::CliProfile::Codex { .. }
+            );
             // Config default: the `cli.model` field in gateway.yaml. When the
             // user has no per-user override, resolve_cli_profile returns this
             // untouched, so current_model == config_default_model.
@@ -431,13 +442,13 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
                     .unwrap_or_else(|| "默认".to_string());
                 let mut lines = if refresh {
                     vec![
-                        format!("🤖 当前: **{current_display}**"),
+                        format_model_status(&current_display, current_effort),
                         "缓存 已刷新 · `/model refresh`".to_string(),
                         String::new(),
                     ]
                 } else {
                     vec![
-                        format!("🤖 当前: **{current_display}**"),
+                        format_model_status(&current_display, current_effort),
                         format!(
                             "缓存 {} · `/model refresh`",
                             format_cache_age(model_list.cache_age)
@@ -468,14 +479,27 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
                     } else {
                         entry.desc.to_string()
                     };
+                    let effort = if is_codex && !entry.reasoning_efforts.is_empty() {
+                        let default = entry.default_reasoning_effort.as_deref().unwrap_or("auto");
+                        format!(
+                            " · effort 默认 `{default}`，可选 `{}`",
+                            entry.reasoning_efforts.join("|")
+                        )
+                    } else {
+                        String::new()
+                    };
                     lines.push(format!(
-                        "{idx}. **{label}**{mark} · {desc}",
+                        "{idx}. **{label}**{mark} · {desc}{effort}",
                         idx = i + 1,
                         label = entry.label,
                     ));
                 }
                 lines.push(String::new());
-                lines.push("切换: `/model <编号|名称|完整id>`".into());
+                lines.push(if is_codex {
+                    "切换: `/model <编号|名称|完整id> [effort]`".into()
+                } else {
+                    "切换: `/model <编号|名称|完整id>`".into()
+                });
                 return Some(lines.join("\n"));
             }
 
@@ -483,7 +507,17 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
                 return Some(denial);
             }
 
-            let resolved = resolve_model_input(arg, &entries);
+            let mut args = arg.split_whitespace();
+            let model_arg = args.next().unwrap_or_default();
+            let requested_effort = args.next();
+            if args.next().is_some() || (!is_codex && requested_effort.is_some()) {
+                return Some(if is_codex {
+                    "⚠️ 用法: `/model <编号|名称|完整id> [effort]`".into()
+                } else {
+                    "⚠️ 当前 CLI 不支持在 `/model` 中指定 reasoning effort".into()
+                });
+            }
+            let resolved = resolve_model_input(model_arg, &entries);
             if matches!(resolved, ResolvedModel::Unrecognized) {
                 return Some(format!(
                     "⚠️ 未识别模型: `{arg}`，当前模型未改变。\n\
@@ -491,14 +525,86 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
                 ));
             }
 
+            let effort = if is_codex {
+                match &resolved {
+                    ResolvedModel::Default if requested_effort.is_some() => {
+                        return Some("⚠️ `/model 默认` 不接受 reasoning effort".into());
+                    }
+                    ResolvedModel::Default => None,
+                    ResolvedModel::Id(id) => {
+                        let entry = entries
+                            .iter()
+                            .find(|entry| entry.full_id.as_deref() == Some(id));
+                        if let Some(requested) = requested_effort {
+                            let Some(entry) = entry else {
+                                return Some("⚠️ 当前 Codex 模型目录未提供该模型的 effort 信息，请先 `/model refresh`".into());
+                            };
+                            if entry.reasoning_efforts.is_empty() {
+                                return Some("⚠️ 当前 Codex 模型目录不支持 effort 选择，请先 `/model refresh` 后重试".into());
+                            }
+                            if !entry.supports_effort(requested) {
+                                return Some(format!(
+                                    "⚠️ `{id}` 不支持 effort `{requested}`；可选: `{}`",
+                                    entry.reasoning_efforts.join("|"),
+                                ));
+                            }
+                            Some(requested.to_ascii_lowercase())
+                        } else {
+                            entry.and_then(|entry| entry.default_reasoning_effort.clone())
+                        }
+                    }
+                    ResolvedModel::Unrecognized => unreachable!(),
+                }
+            } else {
+                None
+            };
+
             let Some(store) = ctx.store else {
                 let display = match &resolved {
                     ResolvedModel::Default => "默认".to_string(),
                     ResolvedModel::Id(id) => display_model_name(id, &entries),
                     ResolvedModel::Unrecognized => unreachable!(),
                 };
-                return Some(format!("🤖 模型已切换: `{display}`\n(下次消息生效)"));
+                return Some(match effort {
+                    Some(effort) => {
+                        format!("🤖 模型已切换: `{display}` · effort `{effort}`\n(下次消息生效)")
+                    }
+                    None => format!("🤖 模型已切换: `{display}`\n(下次消息生效)"),
+                });
             };
+
+            if is_codex {
+                let selection = match &resolved {
+                    ResolvedModel::Default => store::CodexModelSelection::default(),
+                    ResolvedModel::Id(id) => store::CodexModelSelection {
+                        model: Some(id.clone()),
+                        effort: effort.clone(),
+                    },
+                    ResolvedModel::Unrecognized => unreachable!(),
+                };
+                let value = match serde_json::to_string(&selection) {
+                    Ok(value) => value,
+                    Err(e) => return Some(format!("⚠️ 模型设置失败: {e}")),
+                };
+                let selection_key = store::codex_model_selection_preference_key(ctx.chat_id);
+                if let Err(e) = store
+                    .set_user_preference(ctx.platform, ctx.user_id, &selection_key, &value)
+                    .await
+                {
+                    return Some(format!("⚠️ 模型设置失败: {e}"));
+                }
+                let display = match &resolved {
+                    ResolvedModel::Default => "默认".to_string(),
+                    ResolvedModel::Id(id) => display_model_name(id, &entries),
+                    ResolvedModel::Unrecognized => unreachable!(),
+                };
+                return Some(match effort {
+                    Some(effort) => {
+                        format!("🤖 模型已切换: `{display}` · effort `{effort}`\n(下次消息生效)")
+                    }
+                    None => format!("🤖 模型已切换: `{display}`\n(下次消息生效)"),
+                });
+            }
 
             let model_key = store::model_preference_key(ctx.resolved_cli.name(), Some(ctx.chat_id));
             let (stored_value, display) = match &resolved {
@@ -2057,6 +2163,10 @@ pub(crate) struct ModelEntry {
     resolved_id: Option<String>,
     /// Extra shorthand aliases for resolution (e.g. ["deepseek", "ds"]).
     aliases: Vec<String>,
+    /// Dynamically reported Codex reasoning efforts. Empty for other CLIs and
+    /// for the compatibility fallback catalog.
+    reasoning_efforts: Vec<String>,
+    default_reasoning_effort: Option<String>,
 }
 
 impl ModelEntry {
@@ -2066,6 +2176,12 @@ impl ModelEntry {
             (Some(id), Some(cur)) => id == cur,
             _ => false,
         }
+    }
+
+    fn supports_effort(&self, effort: &str) -> bool {
+        self.reasoning_efforts
+            .iter()
+            .any(|candidate| candidate.eq_ignore_ascii_case(effort))
     }
 }
 
@@ -2212,6 +2328,7 @@ fn cli_profile_model_cache_key(profile: &crate::cli_bridge::CliProfile) -> Strin
             extra_args,
             skip_git_repo_check,
             ephemeral,
+            ..
         } => format!(
             "bin={bin};model={model:?};sandbox={sandbox};stream={stream_json};extra={extra_args:?};skip_git={skip_git_repo_check};ephemeral={ephemeral}"
         ),
@@ -2266,6 +2383,8 @@ fn default_model_entry() -> ModelEntry {
         full_id: None,
         resolved_id: None,
         aliases: vec![],
+        reasoning_efforts: vec![],
+        default_reasoning_effort: None,
     }
 }
 
@@ -2329,6 +2448,8 @@ async fn astra_model_entries(
             full_id: Some(item.name),
             resolved_id: None,
             aliases,
+            reasoning_efforts: vec![],
+            default_reasoning_effort: None,
         });
     }
 
@@ -2365,6 +2486,8 @@ async fn claude_model_entries(ctx: &CommandContext<'_>) -> Result<Vec<ModelEntry
                     full_id: Some(model),
                     resolved_id: None,
                     aliases: aliases.into_iter().map(str::to_string).collect(),
+                    reasoning_efforts: vec![],
+                    default_reasoning_effort: None,
                 },
             );
         }
@@ -2379,6 +2502,8 @@ async fn claude_model_entries(ctx: &CommandContext<'_>) -> Result<Vec<ModelEntry
                 full_id: Some(model),
                 resolved_id: None,
                 aliases: vec!["custom".into()],
+                reasoning_efforts: vec![],
+                default_reasoning_effort: None,
             },
         );
     }
@@ -2507,12 +2632,51 @@ struct CodexModelItem {
     visibility: Option<String>,
 }
 
+#[derive(serde::Deserialize)]
+struct CodexAppServerModelPage {
+    data: Vec<CodexAppServerModel>,
+    #[serde(rename = "nextCursor")]
+    next_cursor: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct CodexAppServerModel {
+    model: String,
+    #[serde(rename = "displayName")]
+    display_name: String,
+    description: String,
+    hidden: bool,
+    #[serde(rename = "supportedReasoningEfforts")]
+    supported_reasoning_efforts: Vec<CodexReasoningEffort>,
+    #[serde(rename = "defaultReasoningEffort")]
+    default_reasoning_effort: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct CodexReasoningEffort {
+    #[serde(rename = "reasoningEffort")]
+    reasoning_effort: String,
+}
+
 async fn codex_model_entries(
     profile: &crate::cli_bridge::CliProfile,
 ) -> Result<Vec<ModelEntry>, String> {
-    let crate::cli_bridge::CliProfile::Codex { bin, .. } = profile else {
+    let crate::cli_bridge::CliProfile::Codex {
+        bin, extra_args, ..
+    } = profile
+    else {
         return Ok(Vec::new());
     };
+
+    match codex_app_server_models(bin, extra_args).await {
+        Ok(models) if !models.is_empty() => return Ok(codex_model_entries_from_app_server(models)),
+        Ok(_) => {
+            tracing::warn!("Codex app-server model/list returned no models; using debug catalog")
+        }
+        Err(error) => {
+            tracing::warn!(%error, "Codex app-server model/list failed; using debug catalog without effort metadata")
+        }
+    }
 
     let output = tokio::time::timeout(
         Duration::from_secs(8),
@@ -2524,16 +2688,12 @@ async fn codex_model_entries(
     .await
     .map_err(|_| format!("`{bin} debug models` 超时"))?
     .map_err(|e| format!("运行 `{bin} debug models`: {e}"))?;
-
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(format!(
-            "`{bin} debug models` 退出码 {}: {}",
-            output.status.code().unwrap_or(-1),
-            stderr.trim()
+            "`{bin} debug models` 退出码 {}",
+            output.status.code().unwrap_or(-1)
         ));
     }
-
     let catalog: CodexModelCatalog = serde_json::from_slice(&output.stdout)
         .map_err(|e| format!("解析 `{bin} debug models` 输出: {e}"))?;
     let mut entries = vec![default_model_entry()];
@@ -2551,6 +2711,8 @@ async fn codex_model_entries(
                 full_id: Some(item.slug),
                 resolved_id: None,
                 aliases,
+                reasoning_efforts: vec![],
+                default_reasoning_effort: None,
             },
         );
     }
@@ -2558,6 +2720,134 @@ async fn codex_model_entries(
         return Err("Codex 返回的模型列表为空".into());
     }
     Ok(entries)
+}
+
+fn codex_model_entries_from_app_server(models: Vec<CodexAppServerModel>) -> Vec<ModelEntry> {
+    let mut entries = vec![default_model_entry()];
+    for model in models.into_iter().filter(|model| !model.hidden) {
+        let efforts = model
+            .supported_reasoning_efforts
+            .into_iter()
+            .map(|effort| effort.reasoning_effort)
+            .collect();
+        push_unique_model_entry(
+            &mut entries,
+            ModelEntry {
+                label: model.display_name,
+                desc: model.description,
+                full_id: Some(model.model.clone()),
+                resolved_id: None,
+                aliases: codex_model_aliases(&model.model),
+                reasoning_efforts: efforts,
+                default_reasoning_effort: model.default_reasoning_effort,
+            },
+        );
+    }
+    entries
+}
+
+async fn codex_app_server_models(
+    bin: &str,
+    extra_args: &[String],
+) -> Result<Vec<CodexAppServerModel>, String> {
+    let mut command = tokio::process::Command::new(bin);
+    command
+        .arg("app-server")
+        .arg("--listen")
+        .arg("stdio://")
+        .args(extra_args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let mut child = command
+        .spawn()
+        .map_err(|e| format!("启动 `{bin} app-server`: {e}"))?;
+    let result = async {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or("Codex app-server stdin unavailable")?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or("Codex app-server stdout unavailable")?;
+        let mut lines = BufReader::new(stdout).lines();
+        write_app_server_request(
+            &mut stdin,
+            1,
+            "initialize",
+            serde_json::json!({
+                "clientInfo": { "name": "astra-gateway", "version": env!("CARGO_PKG_VERSION") },
+                "capabilities": { "experimentalApi": true }
+            }),
+        )
+        .await?;
+        wait_app_server_response(&mut lines, 1, deadline).await?;
+
+        let mut models = Vec::new();
+        let mut cursor: Option<String> = None;
+        let mut seen_cursors = HashSet::new();
+        for page in 0..10_u64 {
+            let request_id = page + 2;
+            let params = cursor.as_ref().map_or_else(
+                || serde_json::json!({}),
+                |cursor| serde_json::json!({ "cursor": cursor }),
+            );
+            write_app_server_request(&mut stdin, request_id, "model/list", params).await?;
+            let response = wait_app_server_response(&mut lines, request_id, deadline).await?;
+            let page: CodexAppServerModelPage = serde_json::from_value(response)
+                .map_err(|e| format!("解析 Codex model/list: {e}"))?;
+            models.extend(page.data);
+            match page.next_cursor.filter(|cursor| !cursor.trim().is_empty()) {
+                Some(next) if seen_cursors.insert(next.clone()) => cursor = Some(next),
+                Some(_) => return Err("Codex model/list returned a repeated cursor".into()),
+                None => return Ok(models),
+            }
+        }
+        Err("Codex model/list exceeded the 10-page limit".into())
+    }
+    .await;
+    let _ = child.kill().await;
+    let _ = child.wait().await;
+    result
+}
+
+async fn write_app_server_request(
+    stdin: &mut tokio::process::ChildStdin,
+    id: u64,
+    method: &str,
+    params: Value,
+) -> Result<(), String> {
+    let request = serde_json::json!({ "id": id, "method": method, "params": params });
+    let line = serde_json::to_string(&request).map_err(|e| e.to_string())?;
+    stdin
+        .write_all(line.as_bytes())
+        .await
+        .map_err(|e| e.to_string())?;
+    stdin.write_all(b"\n").await.map_err(|e| e.to_string())?;
+    stdin.flush().await.map_err(|e| e.to_string())
+}
+
+async fn wait_app_server_response(
+    lines: &mut tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
+    request_id: u64,
+    deadline: tokio::time::Instant,
+) -> Result<Value, String> {
+    tokio::time::timeout_at(deadline, async {
+        while let Some(line) = lines.next_line().await.map_err(|e| e.to_string())? {
+            let response: Value = serde_json::from_str(&line).map_err(|e| e.to_string())?;
+            if response["id"].as_u64() == Some(request_id) {
+                if let Some(error) = response.get("error") {
+                    return Err(format!("Codex app-server error: {error}"));
+                }
+                return Ok(response["result"].clone());
+            }
+        }
+        Err("Codex app-server closed stdout".into())
+    })
+    .await
+    .map_err(|_| format!("Codex app-server response {request_id} timed out"))?
 }
 
 fn codex_model_aliases(slug: &str) -> Vec<String> {
@@ -2724,6 +3014,13 @@ fn display_model_name(id: &str, entries: &[ModelEntry]) -> String {
         }
     }
     id.to_string()
+}
+
+fn format_model_status(model: &str, effort: Option<&str>) -> String {
+    match effort {
+        Some(effort) => format!("🤖 当前: **{model}** · effort `{effort}`"),
+        None => format!("🤖 当前: **{model}**"),
+    }
 }
 
 #[cfg(test)]
@@ -3054,6 +3351,8 @@ mod tests {
                 full_id: Some("qwen3.7-max".into()),
                 resolved_id: None,
                 aliases: vec!["haiku".into()],
+                reasoning_efforts: vec![],
+                default_reasoning_effort: None,
             },
             ModelEntry {
                 label: "deepseek-v4-pro".into(),
@@ -3061,6 +3360,8 @@ mod tests {
                 full_id: Some("deepseek-v4-pro".into()),
                 resolved_id: None,
                 aliases: vec!["deepseek".into(), "ds".into()],
+                reasoning_efforts: vec![],
+                default_reasoning_effort: None,
             },
         ];
         fn id(r: ResolvedModel) -> String {
@@ -3116,6 +3417,52 @@ mod tests {
     }
 
     #[test]
+    fn codex_catalog_exposes_dynamic_reasoning_efforts() {
+        let entries = codex_model_entries_from_app_server(vec![CodexAppServerModel {
+            model: "gpt-test".into(),
+            display_name: "GPT Test".into(),
+            description: "test model".into(),
+            hidden: false,
+            supported_reasoning_efforts: vec![
+                CodexReasoningEffort {
+                    reasoning_effort: "low".into(),
+                },
+                CodexReasoningEffort {
+                    reasoning_effort: "ultra".into(),
+                },
+            ],
+            default_reasoning_effort: Some("low".into()),
+        }]);
+        let model = entries
+            .iter()
+            .find(|entry| entry.full_id.as_deref() == Some("gpt-test"))
+            .unwrap();
+        assert!(model.supports_effort("ULTRA"));
+        assert_eq!(model.default_reasoning_effort.as_deref(), Some("low"));
+    }
+
+    #[test]
+    fn codex_model_list_parses_the_full_result_envelope() {
+        let result = serde_json::json!({
+            "data": [{
+                "model": "gpt-test",
+                "displayName": "GPT Test",
+                "description": "test model",
+                "hidden": false,
+                "supportedReasoningEfforts": [{"reasoningEffort": "high"}],
+                "defaultReasoningEffort": "high"
+            }],
+            "nextCursor": null
+        });
+        let page: CodexAppServerModelPage = serde_json::from_value(result).unwrap();
+        assert_eq!(page.data.len(), 1);
+        assert_eq!(
+            page.data[0].default_reasoning_effort.as_deref(),
+            Some("high")
+        );
+    }
+
+    #[test]
     fn display_model_name_uses_discovered_entries() {
         let entries = vec![
             default_model_entry(),
@@ -3125,6 +3472,8 @@ mod tests {
                 full_id: Some("qwen3.7-max".into()),
                 resolved_id: None,
                 aliases: vec!["haiku".into()],
+                reasoning_efforts: vec![],
+                default_reasoning_effort: None,
             },
         ];
         assert_eq!(display_model_name("qwen3.7-max", &entries), "qwen3.7-max");
@@ -3141,6 +3490,8 @@ mod tests {
                 full_id: Some("qwen3.7-max".into()),
                 resolved_id: None,
                 aliases: vec!["haiku".into()],
+                reasoning_efforts: vec![],
+                default_reasoning_effort: None,
             },
         ];
 
@@ -3173,6 +3524,8 @@ mod tests {
                 full_id: Some("qwen3.7-max".into()),
                 resolved_id: None,
                 aliases: vec!["haiku".into()],
+                reasoning_efforts: vec![],
+                default_reasoning_effort: None,
             },
         ];
 
@@ -3261,6 +3614,43 @@ mod tests {
     cmd_test!(cmd_status_works_without_db, "/status", |r| {
         assert!(r.unwrap().contains("astra"));
     });
+
+    #[tokio::test]
+    async fn cmd_status_includes_codex_reasoning_effort() {
+        let config = test_config();
+        let cli = crate::cli_bridge::CliProfile::Codex {
+            bin: "codex".into(),
+            model: Some("gpt-5.6-sol".into()),
+            reasoning_effort: Some("high".into()),
+            sandbox: "workspace-write".into(),
+            stream_json: true,
+            extra_args: vec![],
+            skip_git_repo_check: false,
+            ephemeral: false,
+        };
+        let astra = astra::Client::new("http://localhost:8080", None).unwrap();
+        let ctx = CommandContext {
+            astra: &astra,
+            config: &config,
+            store: None,
+            platform: "test",
+            chat_id: "chat_1",
+            user_id: "user_1",
+            resolved_cli: &cli,
+            resolved_provider_config: None,
+            trace_repo: None,
+            project_dirs: &config.project_dirs,
+            cli_availability: &[],
+            auth_status: None,
+            active_requests: None,
+            codex_app_pool: None,
+            gateway_start: chrono::Utc::now(),
+        };
+
+        let result = handle_command(&ctx, "/status").await.unwrap();
+        assert!(result.contains("模型: `gpt-5.6-sol`"), "{result}");
+        assert!(result.contains("effort: `high`"), "{result}");
+    }
 
     #[tokio::test]
     async fn cmd_status_includes_auth_circuit_status_when_available() {

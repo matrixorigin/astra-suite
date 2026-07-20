@@ -122,7 +122,7 @@ agents through `gateway_send_attachment`.
 | `/new`                         | Start a new conversation |
 | `/cli` / `/cli claude`         | Show / switch CLI backend |
 | `/reasoning on\|off`           | Toggle explicit reasoning / thinking blocks |
-| `/model` / `/model opus`       | Show / switch model |
+| `/model` / `/model opus`       | Show / switch model; Codex also accepts `/model <model> [effort]` using the live model-supported levels |
 | `/workspace <path>`            | Switch working directory |
 | `/session list\|switch`        | Session history |
 | `/inspect`                     | Harness: tokens, cost, tools, warnings |

@@ -618,6 +618,23 @@ pub fn model_preference_key(cli_name: &str, chat_id: Option<&str>) -> String {
     }
 }
 
+/// Atomic per-conversation Codex model selection, including its reasoning
+/// effort. A tombstone (`model: null`, `effort: null`) deliberately suppresses
+/// the legacy model preference key.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct CodexModelSelection {
+    pub model: Option<String>,
+    pub effort: Option<String>,
+}
+
+pub fn codex_model_selection_preference_key(chat_id: &str) -> String {
+    let safe_chat: String = chat_id
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    format!("codex_model_selection_{safe_chat}")
+}
+
 // ─── Storage configuration ────────────────────────────────────────────────
 
 /// Backend selection and connection parameters for gateway persistence.
@@ -973,6 +990,25 @@ mod tests {
             "model_override_claude"
         );
         assert_eq!(model_preference_key("codex", None), "model_override_codex");
+    }
+
+    #[test]
+    fn codex_selection_key_is_chat_scoped() {
+        assert_eq!(
+            codex_model_selection_preference_key("group:123"),
+            "codex_model_selection_group_123"
+        );
+        let selection = CodexModelSelection {
+            model: Some("gpt-5.6-sol".into()),
+            effort: Some("high".into()),
+        };
+        assert_eq!(
+            serde_json::from_str::<CodexModelSelection>(
+                &serde_json::to_string(&selection).unwrap()
+            )
+            .unwrap(),
+            selection
+        );
     }
 
     #[test]

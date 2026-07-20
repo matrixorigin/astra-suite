@@ -725,7 +725,40 @@ impl GatewayRunner {
         // Apply per-user model override scoped to this CLI. Empty string is the
         // "use default" sentinel written by `/model 默认` — treat as no override.
         let model_key = store::model_preference_key(profile.name(), Some(chat_id));
-        if let Some(ref store) = self.store
+        if matches!(profile, CliProfile::Codex { .. }) {
+            let selection_key = store::codex_model_selection_preference_key(chat_id);
+            let selection = if let Some(ref store) = self.store {
+                store
+                    .get_user_preference(platform, user_id, &selection_key)
+                    .await
+                    .ok()
+                    .flatten()
+                    .and_then(|value| {
+                        serde_json::from_str::<store::CodexModelSelection>(&value).ok()
+                    })
+            } else {
+                None
+            };
+            if let Some(selection) = selection {
+                let has_model_override = selection.model.is_some();
+                if let Some(model) = selection.model {
+                    profile.set_model_override(model);
+                }
+                // A selected model with no catalog effort is the compatibility
+                // fallback and must omit effort. The reset tombstone instead
+                // leaves the YAML profile default intact.
+                if has_model_override {
+                    profile.set_reasoning_effort_override(selection.effort);
+                }
+            } else if let Some(ref store) = self.store
+                && let Ok(Some(model_name)) = store
+                    .get_user_preference(platform, user_id, &model_key)
+                    .await
+                && !model_name.is_empty()
+            {
+                profile.set_model_override(model_name);
+            }
+        } else if let Some(ref store) = self.store
             && let Ok(Some(model_name)) = store
                 .get_user_preference(platform, user_id, &model_key)
                 .await

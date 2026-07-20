@@ -136,24 +136,7 @@ impl CodexAppPool {
             params["cwd"] = Value::String(dir.to_string_lossy().to_string());
         }
 
-        match profile {
-            CliProfile::Codex {
-                model: Some(model), ..
-            } => {
-                params["model"] = Value::String(model.clone());
-            }
-            CliProfile::Astra {
-                model,
-                permission_mode,
-                ..
-            } => {
-                if let Some(model) = model {
-                    params["model"] = Value::String(model.clone());
-                }
-                params["permissionMode"] = Value::String(permission_mode.clone());
-            }
-            _ => {}
-        }
+        apply_turn_profile_params(&mut params, profile);
 
         let response = handle.request("turn/start", params).await?;
         if let Some(turn_id) = response["turn"]["id"].as_str() {
@@ -437,6 +420,34 @@ impl CodexAppPool {
         self.processes.insert(key.to_string(), handle);
         tracing::info!(pid, key, "spawned codex app-server process");
         Ok(())
+    }
+}
+
+fn apply_turn_profile_params(params: &mut Value, profile: &CliProfile) {
+    match profile {
+        CliProfile::Codex {
+            model,
+            reasoning_effort,
+            ..
+        } => {
+            if let Some(model) = model {
+                params["model"] = Value::String(model.clone());
+            }
+            if let Some(effort) = reasoning_effort {
+                params["effort"] = Value::String(effort.clone());
+            }
+        }
+        CliProfile::Astra {
+            model,
+            permission_mode,
+            ..
+        } => {
+            if let Some(model) = model {
+                params["model"] = Value::String(model.clone());
+            }
+            params["permissionMode"] = Value::String(permission_mode.clone());
+        }
+        _ => {}
     }
 }
 
@@ -1222,6 +1233,7 @@ mod tests {
         let profile = CliProfile::Codex {
             bin: "codex".into(),
             model: Some("gpt-5.5".into()),
+            reasoning_effort: None,
             sandbox: "workspace-write".into(),
             stream_json: true,
             extra_args: vec![],
@@ -1240,6 +1252,30 @@ mod tests {
         assert_eq!(params["ephemeral"], true);
         assert_eq!(params["developerInstructions"], "system prompt");
         assert_eq!(params["approvalPolicy"], "never");
+    }
+
+    #[test]
+    fn codex_turn_includes_effort_only_when_configured() {
+        let mut params = serde_json::json!({});
+        let profile = CliProfile::Codex {
+            bin: "codex".into(),
+            model: Some("gpt-5.6-sol".into()),
+            reasoning_effort: Some("ultra".into()),
+            sandbox: "workspace-write".into(),
+            stream_json: true,
+            extra_args: vec![],
+            skip_git_repo_check: false,
+            ephemeral: false,
+        };
+        apply_turn_profile_params(&mut params, &profile);
+        assert_eq!(params["model"], "gpt-5.6-sol");
+        assert_eq!(params["effort"], "ultra");
+
+        let mut params = serde_json::json!({});
+        let mut profile = profile;
+        profile.set_reasoning_effort_override(None);
+        apply_turn_profile_params(&mut params, &profile);
+        assert!(params.get("effort").is_none());
     }
 
     #[test]
@@ -1307,6 +1343,7 @@ mod tests {
         let profile = CliProfile::Codex {
             bin: "codex".into(),
             model: None,
+            reasoning_effort: None,
             sandbox: "workspace-write".into(),
             stream_json: true,
             extra_args: vec![],
@@ -1331,6 +1368,7 @@ mod tests {
         let profile = CliProfile::Codex {
             bin: "codex".into(),
             model: None,
+            reasoning_effort: None,
             sandbox: "workspace-write".into(),
             stream_json: true,
             extra_args: vec![],
@@ -1364,6 +1402,7 @@ mod tests {
         let profile = CliProfile::Codex {
             bin: "codex".into(),
             model: None,
+            reasoning_effort: None,
             sandbox: "workspace-write".into(),
             stream_json: true,
             extra_args: vec![],
@@ -1635,6 +1674,7 @@ mod tests {
         let profile = CliProfile::Codex {
             bin: "codex".into(),
             model: None,
+            reasoning_effort: None,
             sandbox: "read-only".into(),
             stream_json: true,
             extra_args: vec![],

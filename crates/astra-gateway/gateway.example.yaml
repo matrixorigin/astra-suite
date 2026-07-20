@@ -186,6 +186,7 @@ providers:
 #     type: codex
 #     bin: codex
 #     model: o3                        # optional model override
+#     reasoning_effort: high            # optional default; `/model` can override per chat
 #     sandbox: workspace-write         # read-only | workspace-write | danger-full-access
 #     stream_json: true                # JSONL streaming via --json
 #     skip_git_repo_check: false
