@@ -241,6 +241,10 @@ pub enum CliProfile {
         #[serde(default = "default_codex_bin")]
         bin: String,
         model: Option<String>,
+        /// Optional default reasoning effort. A `/model` selection can override
+        /// this per conversation.
+        #[serde(default)]
+        reasoning_effort: Option<String>,
         /// Sandbox policy: "read-only" | "workspace-write" | "danger-full-access".
         #[serde(default = "default_codex_sandbox")]
         sandbox: String,
@@ -557,6 +561,7 @@ impl CliProfile {
                 extra_args,
                 skip_git_repo_check,
                 ephemeral,
+                ..
             } => {
                 let mut cmd = Command::new(bin);
                 if let Some(sid) = session_id {
@@ -578,6 +583,10 @@ impl CliProfile {
                 }
                 if let Some(m) = model {
                     cmd.arg("--model").arg(m);
+                }
+                if let Some(effort) = self.reasoning_effort() {
+                    cmd.arg("-c")
+                        .arg(format!("model_reasoning_effort={effort:?}"));
                 }
                 for arg in extra_args {
                     cmd.arg(arg);
@@ -770,6 +779,24 @@ impl CliProfile {
                 *model = Some(model_name);
             }
             _ => {}
+        }
+    }
+
+    pub fn set_reasoning_effort_override(&mut self, effort: Option<String>) {
+        if let Self::Codex {
+            reasoning_effort, ..
+        } = self
+        {
+            *reasoning_effort = effort;
+        }
+    }
+
+    pub fn reasoning_effort(&self) -> Option<&str> {
+        match self {
+            Self::Codex {
+                reasoning_effort, ..
+            } => reasoning_effort.as_deref(),
+            _ => None,
         }
     }
 
@@ -3118,6 +3145,7 @@ printf '%s\n' '{"type":"assistant.message_delta","data":{"deltaContent":"from sc
         let codex = CliProfile::Codex {
             bin: "codex".into(),
             model: None,
+            reasoning_effort: None,
             sandbox: "workspace-write".into(),
             stream_json: true,
             extra_args: vec![],
@@ -3495,6 +3523,7 @@ printf '%s\n' '{"type":"assistant.message_delta","data":{"deltaContent":"from sc
         let p = CliProfile::Codex {
             bin: "codex".into(),
             model: Some("o3".into()),
+            reasoning_effort: Some("high".into()),
             sandbox: "workspace-write".into(),
             stream_json: true,
             extra_args: vec![],
@@ -3511,6 +3540,7 @@ printf '%s\n' '{"type":"assistant.message_delta","data":{"deltaContent":"from sc
         assert!(args.contains(&std::ffi::OsStr::new("--json")));
         assert!(args.contains(&std::ffi::OsStr::new("--model")));
         assert!(args.contains(&std::ffi::OsStr::new("o3")));
+        assert!(args.contains(&std::ffi::OsStr::new("model_reasoning_effort=\"high\"")));
     }
 
     #[test]
@@ -3518,6 +3548,7 @@ printf '%s\n' '{"type":"assistant.message_delta","data":{"deltaContent":"from sc
         let p = CliProfile::Codex {
             bin: "codex".into(),
             model: None,
+            reasoning_effort: None,
             sandbox: "read-only".into(),
             stream_json: true,
             extra_args: vec![],
@@ -3539,6 +3570,7 @@ printf '%s\n' '{"type":"assistant.message_delta","data":{"deltaContent":"from sc
         let p = CliProfile::Codex {
             bin: "codex".into(),
             model: None,
+            reasoning_effort: None,
             sandbox: "workspace-write".into(),
             stream_json: false,
             extra_args: vec!["--quiet".into()],
