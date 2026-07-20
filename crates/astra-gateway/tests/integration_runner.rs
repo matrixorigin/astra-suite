@@ -198,6 +198,70 @@ fn create_fake_claude_stream_script(result: &serde_json::Value) -> tempfile::Tem
     dir
 }
 
+fn create_local_command_claude_stream_script(output: &str) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let script_path = dir.path().join("fake_cli.sh");
+    let local_command = serde_json::json!({
+        "type": "system",
+        "subtype": "local_command",
+        "content": format!("<local-command-stdout>{output}</local-command-stdout>")
+    });
+    let result = serde_json::json!({
+        "type": "result",
+        "subtype": "success",
+        "is_error": false,
+        "session_id": "compact-session",
+        "result": "",
+        "usage": {"input_tokens": 0, "output_tokens": 0},
+        "modelUsage": {},
+        "total_cost_usd": 0.0
+    });
+    let content = format!(
+        "#!/bin/sh\ncase \"$*\" in *--version*) echo '2.1.0'; exit 0;; esac\nwhile IFS= read -r line; do\n  printf '%s\\n' '{}'\n  printf '%s\\n' '{}'\ndone\n",
+        local_command.to_string().replace('\'', "'\\''"),
+        result.to_string().replace('\'', "'\\''")
+    );
+    std::fs::write(&script_path, content).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    dir
+}
+
+fn create_one_local_command_then_empty_claude_script() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let script_path = dir.path().join("fake_cli.sh");
+    let local_command = serde_json::json!({
+        "type": "system",
+        "subtype": "local_command",
+        "content": "<local-command-stdout>Not enough messages to compact.</local-command-stdout>"
+    });
+    let result = serde_json::json!({
+        "type": "result",
+        "subtype": "success",
+        "is_error": false,
+        "session_id": "compact-two-turn-session",
+        "result": "",
+        "usage": {"input_tokens": 0, "output_tokens": 0},
+        "modelUsage": {},
+        "total_cost_usd": 0.0
+    });
+    let content = format!(
+        "#!/bin/sh\ncase \"$*\" in *--version*) echo '2.1.0'; exit 0;; esac\nturn=0\nwhile IFS= read -r line; do\n  turn=$((turn + 1))\n  if [ \"$turn\" -eq 1 ]; then printf '%s\\n' '{}'; fi\n  printf '%s\\n' '{}'\ndone\n",
+        local_command.to_string().replace('\'', "'\\''"),
+        result.to_string().replace('\'', "'\\''")
+    );
+    std::fs::write(&script_path, content).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    dir
+}
+
 fn create_tracking_claude_stream_script() -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
     let script_path = dir.path().join("fake_cli.sh");
@@ -1988,6 +2052,67 @@ async fn compact_routes_only_claude_to_slow_path() {
     let claude = TestGateway::with_config(config).await;
     let routed = claude.runner.handle_fast(&command).await;
     assert!(routed.is_err(), "Claude /compact must reach the slow path");
+}
+
+#[tokio::test]
+async fn compact_not_enough_messages_is_not_reported_as_success() {
+    let fake_cli = create_local_command_claude_stream_script("Not enough messages to compact.");
+    let mut config = TestGateway::build_config(&script_path(&fake_cli));
+    config.cli = CliProfile::Claude {
+        bin: script_path(&fake_cli),
+        model: Some("test-claude".into()),
+        stream_json: true,
+        extra_args: vec![],
+        env: Default::default(),
+        env_file: None,
+    };
+    let gateway = TestGateway::with_config(config).await;
+    let outputs = Arc::new(Mutex::new(Vec::new()));
+    let adapter = MockPlatformAdapter::new(mpsc::channel(1).1, outputs);
+
+    let response = gateway
+        .runner
+        .handle_message(&msg("chat-compact-local", "user-1", "/compact"), &adapter)
+        .await
+        .unwrap();
+
+    assert!(response.contains("内容太少"), "response: {response}");
+    assert!(!response.contains("会话已压缩"), "response: {response}");
+}
+
+#[tokio::test]
+async fn local_command_output_does_not_leak_into_next_turn() {
+    let fake_cli = create_one_local_command_then_empty_claude_script();
+    let mut config = TestGateway::build_config(&script_path(&fake_cli));
+    config.cli = CliProfile::Claude {
+        bin: script_path(&fake_cli),
+        model: Some("test-claude".into()),
+        stream_json: true,
+        extra_args: vec![],
+        env: Default::default(),
+        env_file: None,
+    };
+    let gateway = TestGateway::with_config(config).await;
+    let outputs = Arc::new(Mutex::new(Vec::new()));
+    let adapter = MockPlatformAdapter::new(mpsc::channel(1).1, outputs);
+
+    let compact = gateway
+        .runner
+        .handle_message(&msg("chat-compact-two", "user-1", "/compact"), &adapter)
+        .await
+        .unwrap();
+    assert!(compact.contains("内容太少"), "response: {compact}");
+
+    let next = gateway
+        .runner
+        .handle_message(&msg("chat-compact-two", "user-1", "next"), &adapter)
+        .await
+        .unwrap();
+    assert!(!next.contains("内容太少"), "stale local output: {next}");
+    assert!(
+        !next.contains("Not enough messages"),
+        "stale local output: {next}"
+    );
 }
 
 #[tokio::test]

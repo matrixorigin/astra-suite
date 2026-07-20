@@ -2695,8 +2695,8 @@ impl GatewayRunner {
             .unwrap_or(result.stdout.trim())
             .to_string();
 
-        if let Some(fallback) = compact_success_fallback(&message_text, result.success, &text) {
-            text = fallback.to_string();
+        if let Some(response) = compact_response_override(&message_text, result.success, &text) {
+            text = response.to_string();
         }
 
         // Strip <think>...</think> blocks that some models emit as plain text
@@ -4668,15 +4668,34 @@ fn build_final_message(
     }
 }
 
-fn compact_success_fallback(
+fn compact_response_override(
     message: &str,
     success: bool,
     response_text: &str,
 ) -> Option<&'static str> {
     let message = message.trim();
     let is_compact = message == "/compact" || message.starts_with("/compact ");
-    (is_compact && success && response_text.trim().is_empty())
-        .then_some("✅ 会话已压缩，可以继续对话。原始历史记录仍然保留。")
+    if !is_compact || !success {
+        return None;
+    }
+    let response_text = response_text.trim();
+    if response_text.is_empty() {
+        return Some("⚠️ 未收到 Claude 的压缩状态，无法确认会话是否已压缩；请重试 `/compact`。");
+    }
+    let normalized = response_text.to_ascii_lowercase();
+    if normalized.contains("not enough messages to compact") {
+        return Some(
+            "ℹ️ 当前会话内容太少，Claude 未执行压缩；继续对话即可，稍后可再次使用 `/compact`。",
+        );
+    }
+    if normalized == "compacted"
+        || normalized.starts_with("compacted (")
+        || normalized == "conversation compacted"
+        || normalized.starts_with("conversation compacted (")
+    {
+        return Some("✅ 会话已压缩，可以继续对话。原始历史记录仍然保留。");
+    }
+    None
 }
 
 /// Strip `<think>...</think>` / `<thinking>...</thinking>` blocks from complete text.
@@ -4861,17 +4880,39 @@ mod tests {
     use super::*;
 
     #[test]
-    fn compact_empty_success_gets_visible_confirmation() {
+    fn compact_empty_success_reports_unknown_state() {
         assert_eq!(
-            compact_success_fallback("/compact", true, ""),
+            compact_response_override("/compact", true, ""),
+            Some("⚠️ 未收到 Claude 的压缩状态，无法确认会话是否已压缩；请重试 `/compact`。")
+        );
+        assert_eq!(
+            compact_response_override("/compact focus on fixes", true, "  "),
+            Some("⚠️ 未收到 Claude 的压缩状态，无法确认会话是否已压缩；请重试 `/compact`。")
+        );
+        assert_eq!(compact_response_override("/compact", false, ""), None);
+        assert_eq!(compact_response_override("hello", true, ""), None);
+    }
+
+    #[test]
+    fn compact_local_command_result_is_not_misreported() {
+        assert_eq!(
+            compact_response_override("/compact", true, "Not enough messages to compact."),
+            Some(
+                "ℹ️ 当前会话内容太少，Claude 未执行压缩；继续对话即可，稍后可再次使用 `/compact`。"
+            )
+        );
+        assert_eq!(
+            compact_response_override("/compact", true, "Compacted (ctrl+o to see full summary)"),
             Some("✅ 会话已压缩，可以继续对话。原始历史记录仍然保留。")
         );
         assert_eq!(
-            compact_success_fallback("/compact focus on fixes", true, "  "),
-            Some("✅ 会话已压缩，可以继续对话。原始历史记录仍然保留。")
+            compact_response_override("/compact", true, "Not compacted"),
+            None
         );
-        assert_eq!(compact_success_fallback("/compact", false, ""), None);
-        assert_eq!(compact_success_fallback("hello", true, ""), None);
+        assert_eq!(
+            compact_response_override("/compact", true, "Could not be compacted"),
+            None
+        );
     }
 
     #[test]
