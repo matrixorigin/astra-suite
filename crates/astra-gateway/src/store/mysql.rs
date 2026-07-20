@@ -62,6 +62,8 @@ impl MysqlGatewayStore {
                 max_output_tokens BIGINT,
                 cost_usd DOUBLE,
                 raw_usage_json JSON,
+                status VARCHAR(32) NOT NULL DEFAULT 'success',
+                failure_kind VARCHAR(128),
                 tool_calls INT NOT NULL DEFAULT 0,
                 elapsed_ms BIGINT NOT NULL DEFAULT 0,
                 created_at DATETIME(6) DEFAULT NOW(6),
@@ -85,6 +87,8 @@ impl MysqlGatewayStore {
             "ALTER TABLE gw_usage ADD COLUMN max_output_tokens BIGINT",
             "ALTER TABLE gw_usage ADD COLUMN cost_usd DOUBLE",
             "ALTER TABLE gw_usage ADD COLUMN raw_usage_json JSON",
+            "ALTER TABLE gw_usage ADD COLUMN status VARCHAR(32) NOT NULL DEFAULT 'success'",
+            "ALTER TABLE gw_usage ADD COLUMN failure_kind VARCHAR(128)",
         ] {
             let _ = sqlx::query(migration).execute(&self.pool).await;
         }
@@ -343,7 +347,11 @@ impl GatewayStore for MysqlGatewayStore {
         astra_session_id: &str,
         cli_profile: &str,
     ) -> Result<(), StoreError> {
-        // Mark old sessions for this CLI as not current
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| StoreError::Database(e.to_string()))?;
         sqlx::query(
             "UPDATE gw_sessions SET is_current = FALSE
              WHERE platform = ? AND chat_id = ? AND cli_profile = ? AND is_current = TRUE",
@@ -351,11 +359,10 @@ impl GatewayStore for MysqlGatewayStore {
         .bind(platform)
         .bind(chat_id)
         .bind(cli_profile)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .map_err(|e| StoreError::Database(e.to_string()))?;
 
-        // Check if this session already exists for this CLI
         let existing: Option<(i64,)> = sqlx::query_as(
             "SELECT id FROM gw_sessions
              WHERE platform = ? AND chat_id = ? AND cli_profile = ? AND astra_session_id = ?",
@@ -364,21 +371,19 @@ impl GatewayStore for MysqlGatewayStore {
         .bind(chat_id)
         .bind(cli_profile)
         .bind(astra_session_id)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(|e| StoreError::Database(e.to_string()))?;
 
         if let Some((id,)) = existing {
-            // Reactivate existing session
             sqlx::query(
                 "UPDATE gw_sessions SET is_current = TRUE, last_active = NOW(6) WHERE id = ?",
             )
             .bind(id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await
             .map_err(|e| StoreError::Database(e.to_string()))?;
         } else {
-            // Insert new
             sqlx::query(
                 "INSERT INTO gw_sessions (platform, chat_id, user_id, cli_profile, astra_session_id, is_current)
                  VALUES (?, ?, ?, ?, ?, TRUE)",
@@ -388,10 +393,13 @@ impl GatewayStore for MysqlGatewayStore {
             .bind(user_id)
             .bind(cli_profile)
             .bind(astra_session_id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await
             .map_err(|e| StoreError::Database(e.to_string()))?;
         }
+        tx.commit()
+            .await
+            .map_err(|e| StoreError::Database(e.to_string()))?;
         Ok(())
     }
 
@@ -449,7 +457,11 @@ impl GatewayStore for MysqlGatewayStore {
         cli_profile: &str,
         target_session_id: &str,
     ) -> Result<bool, StoreError> {
-        // Check target exists
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| StoreError::Database(e.to_string()))?;
         let exists: Option<(i64,)> = sqlx::query_as(
             "SELECT id FROM gw_sessions
              WHERE platform = ? AND chat_id = ? AND cli_profile = ? AND astra_session_id = ?",
@@ -458,15 +470,17 @@ impl GatewayStore for MysqlGatewayStore {
         .bind(chat_id)
         .bind(cli_profile)
         .bind(target_session_id)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(|e| StoreError::Database(e.to_string()))?;
 
         if exists.is_none() {
+            tx.rollback()
+                .await
+                .map_err(|e| StoreError::Database(e.to_string()))?;
             return Ok(false);
         }
 
-        // Clear current
         sqlx::query(
             "UPDATE gw_sessions SET is_current = FALSE
              WHERE platform = ? AND chat_id = ? AND cli_profile = ?",
@@ -474,11 +488,10 @@ impl GatewayStore for MysqlGatewayStore {
         .bind(platform)
         .bind(chat_id)
         .bind(cli_profile)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .map_err(|e| StoreError::Database(e.to_string()))?;
 
-        // Set target as current
         sqlx::query(
             "UPDATE gw_sessions SET is_current = TRUE, last_active = NOW(6)
              WHERE platform = ? AND chat_id = ? AND cli_profile = ? AND astra_session_id = ?",
@@ -487,10 +500,13 @@ impl GatewayStore for MysqlGatewayStore {
         .bind(chat_id)
         .bind(cli_profile)
         .bind(target_session_id)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .map_err(|e| StoreError::Database(e.to_string()))?;
 
+        tx.commit()
+            .await
+            .map_err(|e| StoreError::Database(e.to_string()))?;
         Ok(true)
     }
 
@@ -759,9 +775,10 @@ impl GatewayStore for MysqlGatewayStore {
                 platform, user_id, cli_profile, model, trace_id, request_id, run_id, session_id,
                 tokens_prompt, tokens_completion, cached_input_tokens, cache_creation_input_tokens,
                 cache_read_input_tokens, reasoning_output_tokens, total_tokens, context_window,
-                max_output_tokens, cost_usd, raw_usage_json, tool_calls, elapsed_ms
+                max_output_tokens, cost_usd, raw_usage_json, status, failure_kind, tool_calls,
+                elapsed_ms
              )
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&record.platform)
         .bind(&record.user_id)
@@ -782,6 +799,8 @@ impl GatewayStore for MysqlGatewayStore {
         .bind(record.max_output_tokens.map(|v| v as i64))
         .bind(record.cost_usd)
         .bind(&record.raw_usage_json)
+        .bind(record.status.as_str())
+        .bind(&record.failure_kind)
         .bind(record.tool_calls as i32)
         .bind(record.elapsed_ms as i64)
         .execute(&self.pool)
@@ -809,7 +828,7 @@ impl GatewayStore for MysqlGatewayStore {
             f64,
             i64,
         )> = sqlx::query_as(
-            "SELECT COUNT(*),
+            "SELECT COUNT(CASE WHEN status IN ('success', 'provider_error', 'cli_error') THEN 1 END),
                     COALESCE(SUM(tokens_prompt),0),
                     COALESCE(SUM(tokens_completion),0),
                     COALESCE(SUM(cached_input_tokens),0),
@@ -885,7 +904,7 @@ impl GatewayStore for MysqlGatewayStore {
             f64,
             i64,
         )> = sqlx::query_as(
-            "SELECT COUNT(*),
+            "SELECT COUNT(CASE WHEN status IN ('success', 'provider_error', 'cli_error') THEN 1 END),
                     COALESCE(SUM(tokens_prompt),0),
                     COALESCE(SUM(tokens_completion),0),
                     COALESCE(SUM(cached_input_tokens),0),
@@ -963,7 +982,7 @@ impl GatewayStore for MysqlGatewayStore {
             f64,
             i64,
         )> = sqlx::query_as(
-            "SELECT COUNT(*),
+            "SELECT COUNT(CASE WHEN status IN ('success', 'provider_error', 'cli_error') THEN 1 END),
                     COALESCE(SUM(tokens_prompt),0),
                     COALESCE(SUM(tokens_completion),0),
                     COALESCE(SUM(cached_input_tokens),0),

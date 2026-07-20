@@ -142,6 +142,8 @@ impl GatewayStore for SqliteGatewayStore {
                 max_output_tokens INTEGER,
                 cost_usd REAL,
                 raw_usage_json TEXT,
+                status TEXT NOT NULL DEFAULT 'success',
+                failure_kind TEXT,
                 tool_calls INTEGER NOT NULL DEFAULT 0,
                 elapsed_ms INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT DEFAULT (strftime('%Y-%m-%d %H:%M:%f', 'now'))
@@ -164,6 +166,8 @@ impl GatewayStore for SqliteGatewayStore {
             "ALTER TABLE gw_usage ADD COLUMN max_output_tokens INTEGER",
             "ALTER TABLE gw_usage ADD COLUMN cost_usd REAL",
             "ALTER TABLE gw_usage ADD COLUMN raw_usage_json TEXT",
+            "ALTER TABLE gw_usage ADD COLUMN status TEXT NOT NULL DEFAULT 'success'",
+            "ALTER TABLE gw_usage ADD COLUMN failure_kind TEXT",
         ] {
             let _ = sqlx::query(migration).execute(&self.pool).await;
         }
@@ -339,7 +343,7 @@ impl GatewayStore for SqliteGatewayStore {
         astra_session_id: &str,
         cli_profile: &str,
     ) -> Result<(), StoreError> {
-        // Mark old sessions for this CLI as not current.
+        let mut tx = self.pool.begin().await?;
         sqlx::query(
             "UPDATE gw_sessions SET is_current = 0
              WHERE platform = ? AND chat_id = ? AND cli_profile = ? AND is_current = 1",
@@ -347,10 +351,9 @@ impl GatewayStore for SqliteGatewayStore {
         .bind(platform)
         .bind(chat_id)
         .bind(cli_profile)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
 
-        // Check if this session_id already exists for this CLI.
         let existing: Option<(i64,)> = sqlx::query_as(
             "SELECT id FROM gw_sessions
              WHERE platform = ? AND chat_id = ? AND cli_profile = ? AND astra_session_id = ?",
@@ -359,19 +362,17 @@ impl GatewayStore for SqliteGatewayStore {
         .bind(chat_id)
         .bind(cli_profile)
         .bind(astra_session_id)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *tx)
         .await?;
 
         if let Some((id,)) = existing {
-            // Reactivate existing session.
             sqlx::query(
                 "UPDATE gw_sessions SET is_current = 1, last_active = strftime('%Y-%m-%d %H:%M:%f', 'now') WHERE id = ?",
             )
             .bind(id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
         } else {
-            // Insert new session.
             sqlx::query(
                 "INSERT INTO gw_sessions (platform, chat_id, user_id, cli_profile, astra_session_id, is_current)
                  VALUES (?, ?, ?, ?, ?, 1)",
@@ -381,9 +382,10 @@ impl GatewayStore for SqliteGatewayStore {
             .bind(user_id)
             .bind(cli_profile)
             .bind(astra_session_id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
         }
+        tx.commit().await?;
         Ok(())
     }
 
@@ -439,7 +441,7 @@ impl GatewayStore for SqliteGatewayStore {
         cli_profile: &str,
         target_session_id: &str,
     ) -> Result<bool, StoreError> {
-        // Check target exists.
+        let mut tx = self.pool.begin().await?;
         let exists: Option<(i64,)> = sqlx::query_as(
             "SELECT id FROM gw_sessions
              WHERE platform = ? AND chat_id = ? AND cli_profile = ? AND astra_session_id = ?",
@@ -448,14 +450,14 @@ impl GatewayStore for SqliteGatewayStore {
         .bind(chat_id)
         .bind(cli_profile)
         .bind(target_session_id)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *tx)
         .await?;
 
         if exists.is_none() {
+            tx.rollback().await?;
             return Ok(false);
         }
 
-        // Clear current.
         sqlx::query(
             "UPDATE gw_sessions SET is_current = 0
              WHERE platform = ? AND chat_id = ? AND cli_profile = ?",
@@ -463,10 +465,9 @@ impl GatewayStore for SqliteGatewayStore {
         .bind(platform)
         .bind(chat_id)
         .bind(cli_profile)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
 
-        // Set target as current.
         sqlx::query(
             "UPDATE gw_sessions SET is_current = 1, last_active = strftime('%Y-%m-%d %H:%M:%f', 'now')
              WHERE platform = ? AND chat_id = ? AND cli_profile = ? AND astra_session_id = ?",
@@ -475,9 +476,10 @@ impl GatewayStore for SqliteGatewayStore {
         .bind(chat_id)
         .bind(cli_profile)
         .bind(target_session_id)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
 
+        tx.commit().await?;
         Ok(true)
     }
 
@@ -735,9 +737,10 @@ impl GatewayStore for SqliteGatewayStore {
                 platform, user_id, cli_profile, model, trace_id, request_id, run_id, session_id,
                 tokens_prompt, tokens_completion, cached_input_tokens, cache_creation_input_tokens,
                 cache_read_input_tokens, reasoning_output_tokens, total_tokens, context_window,
-                max_output_tokens, cost_usd, raw_usage_json, tool_calls, elapsed_ms
+                max_output_tokens, cost_usd, raw_usage_json, status, failure_kind, tool_calls,
+                elapsed_ms
              )
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&r.platform)
         .bind(&r.user_id)
@@ -758,6 +761,8 @@ impl GatewayStore for SqliteGatewayStore {
         .bind(r.max_output_tokens.map(|v| v as i64))
         .bind(r.cost_usd)
         .bind(&r.raw_usage_json)
+        .bind(r.status.as_str())
+        .bind(&r.failure_kind)
         .bind(r.tool_calls as i32)
         .bind(r.elapsed_ms as i64)
         .execute(&self.pool)
@@ -784,7 +789,7 @@ impl GatewayStore for SqliteGatewayStore {
             f64,
             i64,
         )> = sqlx::query_as(
-            "SELECT COUNT(*),
+            "SELECT COUNT(CASE WHEN status IN ('success', 'provider_error', 'cli_error') THEN 1 END),
                     COALESCE(SUM(tokens_prompt), 0),
                     COALESCE(SUM(tokens_completion), 0),
                     COALESCE(SUM(cached_input_tokens), 0),
@@ -860,7 +865,7 @@ impl GatewayStore for SqliteGatewayStore {
             f64,
             i64,
         )> = sqlx::query_as(
-            "SELECT COUNT(*),
+            "SELECT COUNT(CASE WHEN status IN ('success', 'provider_error', 'cli_error') THEN 1 END),
                     COALESCE(SUM(tokens_prompt), 0),
                     COALESCE(SUM(tokens_completion), 0),
                     COALESCE(SUM(cached_input_tokens), 0),
@@ -938,7 +943,7 @@ impl GatewayStore for SqliteGatewayStore {
             f64,
             i64,
         )> = sqlx::query_as(
-            "SELECT COUNT(*),
+            "SELECT COUNT(CASE WHEN status IN ('success', 'provider_error', 'cli_error') THEN 1 END),
                     COALESCE(SUM(tokens_prompt), 0),
                     COALESCE(SUM(tokens_completion), 0),
                     COALESCE(SUM(cached_input_tokens), 0),
@@ -1374,6 +1379,14 @@ mod tests {
                 .await
                 .unwrap()
         );
+        assert_eq!(
+            store
+                .get_current_session("wx", "c1", "astra")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("sess-1")
+        );
 
         // Reset.
         store.reset_session("wx", "c1", "astra").await.unwrap();
@@ -1464,6 +1477,8 @@ mod tests {
                 max_output_tokens: None,
                 cost_usd: None,
                 raw_usage_json: None,
+                status: crate::store::UsageStatus::Success,
+                failure_kind: None,
                 tool_calls: 3,
                 elapsed_ms: 5000,
             })
@@ -1479,6 +1494,81 @@ mod tests {
 
         let total = store.get_usage_total("wx", "u1").await.unwrap();
         assert_eq!(total.messages, 1);
+    }
+
+    #[tokio::test]
+    async fn usage_status_distinguishes_non_turn_failures() {
+        let store = make_store().await;
+        let base = UsageRecord {
+            platform: "wx".into(),
+            user_id: "u-status".into(),
+            cli_profile: "claude".into(),
+            model: Some("test".into()),
+            trace_id: None,
+            request_id: None,
+            run_id: None,
+            session_id: Some("session-status".into()),
+            tokens_prompt: 10,
+            tokens_completion: 2,
+            cached_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+            reasoning_output_tokens: 0,
+            total_tokens: 12,
+            context_window: None,
+            max_output_tokens: None,
+            cost_usd: Some(0.01),
+            raw_usage_json: None,
+            status: crate::store::UsageStatus::Success,
+            failure_kind: None,
+            tool_calls: 0,
+            elapsed_ms: 1,
+        };
+        store.record_usage(&base).await.unwrap();
+
+        let mut cancelled = base.clone();
+        cancelled.status = crate::store::UsageStatus::Cancelled;
+        cancelled.failure_kind = Some("cancelled_by_user".into());
+        cancelled.tokens_prompt = 3;
+        cancelled.tokens_completion = 1;
+        cancelled.total_tokens = 4;
+        cancelled.cost_usd = Some(0.004);
+        store.record_usage(&cancelled).await.unwrap();
+
+        let mut preflight = base.clone();
+        preflight.status = crate::store::UsageStatus::PreflightFailed;
+        preflight.failure_kind = Some("cli_unavailable".into());
+        preflight.tokens_prompt = 0;
+        preflight.tokens_completion = 0;
+        preflight.total_tokens = 0;
+        preflight.cost_usd = Some(0.0);
+        store.record_usage(&preflight).await.unwrap();
+
+        let total = store.get_usage_total("wx", "u-status").await.unwrap();
+        assert_eq!(total.messages, 1);
+        assert_eq!(
+            total.total_tokens, 16,
+            "partial cancelled usage is retained"
+        );
+        assert!((total.cost_usd - 0.014).abs() < 1e-9);
+
+        let rows: Vec<(String, Option<String>)> = sqlx::query_as(
+            "SELECT status, failure_kind FROM gw_usage
+             WHERE platform = ? AND user_id = ? ORDER BY id",
+        )
+        .bind("wx")
+        .bind("u-status")
+        .fetch_all(store.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                ("success".into(), None),
+                ("cancelled".into(), Some("cancelled_by_user".into())),
+                ("preflight_failed".into(), Some("cli_unavailable".into())),
+            ]
+        );
     }
 
     #[tokio::test]
@@ -1506,6 +1596,8 @@ mod tests {
                     max_output_tokens: None,
                     cost_usd: None,
                     raw_usage_json: None,
+                    status: crate::store::UsageStatus::Success,
+                    failure_kind: None,
                     tool_calls: 0,
                     elapsed_ms: 1,
                 })
@@ -1931,6 +2023,8 @@ mod tests {
                     max_output_tokens: None,
                     cost_usd: None,
                     raw_usage_json: None,
+                    status: crate::store::UsageStatus::Success,
+                    failure_kind: None,
                     tool_calls: i as u32 + 1,
                     elapsed_ms: 1000,
                 })
@@ -2194,11 +2288,8 @@ mod tests {
             result.expect("task panicked");
         }
 
-        // Note: set_current_session does "deactivate old" + "insert new" in separate
-        // queries without a transaction. Under concurrent execution, multiple sessions
-        // can end up with is_current=1 (a known SQLite single-writer race).
-        // However, get_current_session uses ORDER BY last_active DESC LIMIT 1,
-        // so it always returns a single deterministic answer.
+        // The deactivate + activate/insert sequence is transactional, so
+        // concurrent writers must still leave exactly one current session.
         let current = store
             .get_current_session("wx", "chat1", "astra")
             .await
@@ -2219,6 +2310,11 @@ mod tests {
             sessions.len(),
             5,
             "all 5 concurrent sessions should exist in the database"
+        );
+        let current_count = sessions.iter().filter(|s| s.is_current).count();
+        assert_eq!(
+            current_count, 1,
+            "concurrent session creation must leave exactly one current session"
         );
 
         // After a final sequential set_current_session, exactly 1 should be current.

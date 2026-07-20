@@ -42,8 +42,10 @@ struct GatewayMcpServer {
     env: BTreeMap<String, String>,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn generate_gateway_mcp_config(
     storage_env: &McpStorageEnv,
+    config_identity: &str,
     platform: &str,
     chat_id: &str,
     user_id: &str,
@@ -71,7 +73,7 @@ pub fn generate_gateway_mcp_config(
         }
     });
 
-    let hash = simple_hash(chat_id);
+    let hash = simple_hash(config_identity);
     let path = std::env::temp_dir().join(format!("gw-mcp-{hash}.json"));
     let content = serde_json::to_string_pretty(&config).map_err(std::io::Error::other)?;
     std::fs::write(&path, &content)?;
@@ -146,8 +148,8 @@ fn absolutize(path: impl AsRef<Path>) -> PathBuf {
     }
 }
 
-pub fn cleanup_mcp_config(chat_id: &str) {
-    let hash = simple_hash(chat_id);
+pub fn cleanup_mcp_config(config_identity: &str) {
+    let hash = simple_hash(config_identity);
     let path = std::env::temp_dir().join(format!("gw-mcp-{hash}.json"));
     let _ = std::fs::remove_file(path);
 }
@@ -166,6 +168,7 @@ mod tests {
     #[test]
     fn gateway_mcp_config_generates_claude_file_and_codex_config() {
         let chat_id = format!("mcp-config-test-{}", std::process::id());
+        let config_identity = format!("wecom:claude:{chat_id}");
         let storage_env = McpStorageEnv {
             database_url: None,
             sqlite_path: Some("/tmp/gateway.sqlite".into()),
@@ -173,6 +176,7 @@ mod tests {
 
         let generated = generate_gateway_mcp_config(
             &storage_env,
+            &config_identity,
             "wecom",
             &chat_id,
             "user-1",
@@ -212,6 +216,47 @@ mod tests {
             Some(&"/tmp/gateway.sqlite".to_string())
         );
 
-        cleanup_mcp_config(&chat_id);
+        let config_path = generated.claude_config_path.clone();
+        cleanup_mcp_config(&config_identity);
+        assert!(!config_path.exists());
+    }
+
+    #[test]
+    fn config_identity_is_separate_from_chat_context() {
+        let chat_id = format!("shared-chat-{}", std::process::id());
+        let storage_env = McpStorageEnv {
+            database_url: None,
+            sqlite_path: None,
+        };
+
+        let first = generate_gateway_mcp_config(
+            &storage_env,
+            "mock-a:claude:shared-chat",
+            "mock-a",
+            &chat_id,
+            "user-1",
+            &[],
+            None,
+            None,
+        )
+        .unwrap();
+        let second = generate_gateway_mcp_config(
+            &storage_env,
+            "mock-b:claude:shared-chat",
+            "mock-b",
+            &chat_id,
+            "user-1",
+            &[],
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert_ne!(first.claude_config_path, second.claude_config_path);
+        assert_eq!(first.codex.env.get("GW_MCP_CHAT_ID"), Some(&chat_id));
+        assert_eq!(second.codex.env.get("GW_MCP_CHAT_ID"), Some(&chat_id));
+
+        cleanup_mcp_config("mock-a:claude:shared-chat");
+        cleanup_mcp_config("mock-b:claude:shared-chat");
     }
 }

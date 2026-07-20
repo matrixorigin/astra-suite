@@ -1651,10 +1651,12 @@ async fn handle_approval_response_command(
     }
 
     let decision = if is_deny { "deny" } else { "allow_once" };
+    let pool_key =
+        crate::runner::persistent_pool_key(ctx.platform, ctx.chat_id, ctx.resolved_cli.name());
     match pool
         .lock()
         .await
-        .respond_current_approval(ctx.chat_id, decision)
+        .respond_current_approval(&pool_key, decision)
         .await
     {
         Ok(()) => {

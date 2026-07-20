@@ -3,15 +3,17 @@
 //! Each inbound message spawns `astra chat -m "..." --session-id X`
 //! and streams CLI progress to the chat platform while waiting for output.
 
-use crate::cli_bridge::{self, CliProfile, CliProgress, ReasoningDisplay, ReasoningKind};
+use crate::cli_bridge::{
+    self, CliProfile, CliProgress, CliResult, ReasoningDisplay, ReasoningKind,
+};
 use crate::commands::{self, CommandContext};
 use crate::config::{DEFAULT_ASTRA_BASE_URL, GatewayConfig};
 use crate::gateway_context::GatewayContext;
 use crate::mcp::tools_cron;
 use crate::platforms::{FeedbackEvent, InboundMessage, OutboundAttachment, PlatformAdapter};
-use crate::store::{self, GatewayStore};
+use crate::store::{self, GatewayStore, UsageStatus};
 use crate::trace_model::{
-    ConversationKey, GatewayEventKind, GatewayRequest, OutboxId, RequestId, RequestStatus,
+    ConversationKey, GatewayEventKind, GatewayRequest, OutboxId, RequestId, RequestStatus, RunId,
     RunStatus, TraceId, TraceRepository, TraceWriter,
 };
 use futures_util::future::select_all;
@@ -51,6 +53,76 @@ const WECOM_POST_STREAM_HEARTBEAT: Duration = Duration::from_secs(120);
 #[allow(dead_code)]
 const PROGRESSIVE_FLUSH_INTERVAL: Duration = Duration::from_secs(8);
 const PROGRESSIVE_MIN_CHARS: usize = 200;
+
+pub(crate) fn persistent_pool_key(
+    platform: &str,
+    effective_chat_id: &str,
+    cli_profile: &str,
+) -> String {
+    format!(
+        "p{}:{platform}|c{}:{cli_profile}|{effective_chat_id}",
+        platform.len(),
+        cli_profile.len()
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AttemptOutcome {
+    Success,
+    ProviderError,
+    CliError,
+    Cancelled,
+    PreflightFailed,
+    InternalError,
+}
+
+impl AttemptOutcome {
+    fn from_result(result: &CliResult) -> Self {
+        if result.provider_error.is_some() {
+            Self::ProviderError
+        } else if result.success {
+            Self::Success
+        } else {
+            Self::CliError
+        }
+    }
+
+    fn usage_status(self) -> UsageStatus {
+        match self {
+            Self::Success => UsageStatus::Success,
+            Self::ProviderError => UsageStatus::ProviderError,
+            Self::CliError => UsageStatus::CliError,
+            Self::Cancelled => UsageStatus::Cancelled,
+            Self::PreflightFailed => UsageStatus::PreflightFailed,
+            Self::InternalError => UsageStatus::InternalError,
+        }
+    }
+
+    fn run_status(self) -> RunStatus {
+        if self == Self::Success {
+            RunStatus::Succeeded
+        } else {
+            RunStatus::Failed
+        }
+    }
+
+    fn is_failure(self) -> bool {
+        self != Self::Success
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct AttemptUsage {
+    prompt: u64,
+    completion: u64,
+    cached: u64,
+    cache_creation: u64,
+    cache_read: u64,
+    reasoning: u64,
+    total: u64,
+    cost_usd: Option<f64>,
+    tool_calls: u32,
+}
 
 fn is_astra_app_server_startup_error(error: &str) -> bool {
     error.contains("codex app-server stdout closed")
@@ -404,6 +476,9 @@ pub struct GatewayRunner {
     /// Active CLI turns indexed by trace_id. Used by `/esc` to interrupt
     /// running turns immediately instead of only marking DB state.
     active_requests: Arc<dashmap::DashMap<String, CancellationToken>>,
+    /// Serializes session mutations against terminal session persistence.
+    /// Entries exist only while one or more turns for that conversation are active.
+    session_states: Arc<tokio::sync::Mutex<HashMap<String, SessionGenerationState>>>,
     /// Per-conversation send circuit breaker. Workers check this before
     /// emitting heartbeats — stops sending after consecutive failures to
     /// avoid message flood when platform is unreachable.
@@ -418,6 +493,12 @@ pub struct GatewayRunner {
     codex_app_pool: Arc<tokio::sync::Mutex<crate::codex_app_pool::CodexAppPool>>,
     runtime_api_url: Option<String>,
     runtime_api_token: Option<String>,
+}
+
+#[derive(Default)]
+struct SessionGenerationState {
+    generation: u64,
+    active_attempts: u32,
 }
 
 /// No-op adapter used in spawned CLI tasks (typing/heartbeats not available in background).
@@ -573,6 +654,7 @@ impl GatewayRunner {
             shared_auth,
             request_counter: AtomicU32::new(0),
             active_requests: Arc::new(dashmap::DashMap::new()),
+            session_states: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             send_health: SendCircuitBreaker::default(),
             gateway_start: chrono::Utc::now(),
             cli_pool: Arc::new(tokio::sync::Mutex::new(
@@ -929,35 +1011,52 @@ impl GatewayRunner {
             codex_app_pool: Some(&self.codex_app_pool),
             gateway_start: self.gateway_start,
         };
+        let command = msg.text.trim();
+        let may_mutate_session = command.starts_with("/new")
+            || command.starts_with("/reset")
+            || command.starts_with("/model ")
+            || command.starts_with("/cli ")
+            || command.starts_with("/workspace ")
+            || command.starts_with("/ws ")
+            || command.split_whitespace().next() == Some("/session");
+        let mut session_states = if may_mutate_session {
+            Some(self.session_states.lock().await)
+        } else {
+            None
+        };
         if let Some(response) = commands::handle_command(&cmd_ctx, &msg.text).await {
             // Commands that invalidate the long-lived process (model/session/workspace change)
-            let command = msg.text.trim();
-            let switched_session =
-                command.starts_with("/session switch ") && response.starts_with("✅ 已切换到会话");
-            let invalidates_pool = command.starts_with("/new")
-                || command.starts_with("/reset")
-                || command.starts_with("/model ")
-                || command.starts_with("/cli ")
-                || command.starts_with("/workspace ")
-                || command.starts_with("/ws ")
+            let switched_session = command.split_whitespace().next() == Some("/session")
+                && response.starts_with("✅ 已切换到会话");
+            let session_reset = (command.starts_with("/new") || command.starts_with("/reset"))
+                && response.starts_with("🔄 ");
+            let model_switched =
+                command.starts_with("/model ") && response.starts_with("🤖 模型已切换:");
+            let cli_switched = command.starts_with("/cli ") && response.starts_with("✅ 已切换到");
+            let workspace_switched = (command.starts_with("/workspace ")
+                || command.starts_with("/ws "))
+                && response.starts_with("📂 工作目录已切换:");
+            let invalidates_session = session_reset
+                || model_switched
+                || cli_switched
+                || workspace_switched
                 || switched_session;
-            if invalidates_pool {
-                // For /model, only reset the pool when the argument actually
-                // resolved to a valid model. Otherwise the user just gets an
-                // error message back and the existing session stays warm.
-                let should_kill = if let Some(arg) = msg.text.strip_prefix("/model ") {
-                    let arg = arg.trim();
-                    !arg.eq_ignore_ascii_case("refresh") && response.starts_with("🤖 模型已切换:")
-                } else {
-                    true
-                };
-                if should_kill {
-                    self.cli_pool.lock().await.kill(&effective_chat_id);
-                    self.codex_app_pool.lock().await.kill(&effective_chat_id);
-                }
+            let pool_key =
+                persistent_pool_key(msg.platform, &effective_chat_id, cli_profile.name());
+            if invalidates_session
+                && let Some(states) = session_states.as_mut()
+                && let Some(state) = states.get_mut(&pool_key)
+            {
+                state.generation = state.generation.wrapping_add(1);
+            }
+            drop(session_states);
+            if invalidates_session {
+                self.cli_pool.lock().await.kill(&pool_key);
+                self.codex_app_pool.lock().await.kill(&pool_key);
             }
             return Ok(Some(response));
         }
+        drop(session_states);
         // Not a slash command — needs CLI (slow path)
         Err(msg.clone())
     }
@@ -1082,8 +1181,13 @@ impl GatewayRunner {
         }
 
         let cli_name = cli_profile.name().to_string();
+        let session_state_key = persistent_pool_key(msg.platform, &effective_chat_id, &cli_name);
 
-        // Auto-reset session if policy triggers
+        // Read the starting session and register this turn while holding the same
+        // gate used by fast session mutations. A late result can then be prevented
+        // from overwriting a `/new` or `/session switch` that happened mid-turn.
+        let mut session_states = self.session_states.lock().await;
+        let mut auto_reset = false;
         if let Some(ref store) = self.store
             && let Ok(Some(last_active_str)) = store
                 .get_session_last_active(msg.platform, &effective_chat_id, &cli_name)
@@ -1100,6 +1204,10 @@ impl GatewayRunner {
                 {
                     tracing::warn!(error = %e, "session auto-reset failed");
                 } else {
+                    if let Some(state) = session_states.get_mut(&session_state_key) {
+                        state.generation = state.generation.wrapping_add(1);
+                    }
+                    auto_reset = true;
                     tracing::info!(cli = cli_name, "session auto-reset by policy");
                 }
             }
@@ -1114,6 +1222,15 @@ impl GatewayRunner {
         } else {
             None
         };
+        let session_state = session_states.entry(session_state_key.clone()).or_default();
+        session_state.active_attempts = session_state.active_attempts.saturating_add(1);
+        let session_generation = session_state.generation;
+        drop(session_states);
+
+        if auto_reset {
+            self.cli_pool.lock().await.kill(&session_state_key);
+            self.codex_app_pool.lock().await.kill(&session_state_key);
+        }
 
         let trace_writer = trace.as_ref().and_then(|trace| {
             self.trace_repo.as_ref().map(|repo| {
@@ -1132,6 +1249,13 @@ impl GatewayRunner {
                     run_id = Some(id);
                 }
                 Err(e) => {
+                    let mut session_states = self.session_states.lock().await;
+                    if let Some(state) = session_states.get_mut(&session_state_key) {
+                        state.active_attempts = state.active_attempts.saturating_sub(1);
+                        if state.active_attempts == 0 {
+                            session_states.remove(&session_state_key);
+                        }
+                    }
                     tracing::info!(error = %e, "queued request skipped before CLI start");
                     return None;
                 }
@@ -1161,23 +1285,21 @@ impl GatewayRunner {
         // Check CLI is available before spawning
         let availability = cli_bridge::probe_cli(&cli_profile).await;
         if !availability.is_available() {
-            if let Some(writer) = trace_writer.as_ref() {
-                if let Some(ref run_id) = run_id {
-                    let _ = writer
-                        .finish_run(run_id, RunStatus::Failed, None, Some("CLI unavailable"))
-                        .await;
-                }
-                let _ = writer.fail_request("CLI unavailable").await;
-            }
-            self.record_zero_usage_failure(
+            self.finalize_attempt(
                 &msg,
+                &effective_chat_id,
+                session_generation,
                 &cli_name,
                 &cli_profile,
                 trace.as_ref(),
-                run_id.as_ref().map(ToString::to_string),
-                session_id.clone(),
+                trace_writer.as_ref(),
+                run_id.as_ref(),
+                session_id.as_deref(),
+                None,
+                AttemptOutcome::PreflightFailed,
+                Some("cli_unavailable"),
+                Some("CLI unavailable"),
                 Duration::ZERO,
-                "cli_unavailable",
             )
             .await;
             let text = cli_bridge::onboarding_message(&cli_profile, &availability);
@@ -1195,28 +1317,21 @@ impl GatewayRunner {
 
         // Check auth circuit breaker before spawning CLI
         if let Some(auth_msg) = self.check_auth_circuit(&cli_name) {
-            if let Some(writer) = trace_writer.as_ref() {
-                if let Some(ref run_id) = run_id {
-                    let _ = writer
-                        .finish_run(
-                            run_id,
-                            RunStatus::Failed,
-                            None,
-                            Some("auth circuit breaker open"),
-                        )
-                        .await;
-                }
-                let _ = writer.fail_request("auth circuit breaker open").await;
-            }
-            self.record_zero_usage_failure(
+            self.finalize_attempt(
                 &msg,
+                &effective_chat_id,
+                session_generation,
                 &cli_name,
                 &cli_profile,
                 trace.as_ref(),
-                run_id.as_ref().map(ToString::to_string),
-                session_id.clone(),
+                trace_writer.as_ref(),
+                run_id.as_ref(),
+                session_id.as_deref(),
+                None,
+                AttemptOutcome::PreflightFailed,
+                Some("auth_circuit_open"),
+                Some("auth circuit breaker open"),
                 Duration::ZERO,
-                "auth_circuit_open",
             )
             .await;
             return Some(
@@ -1363,6 +1478,7 @@ impl GatewayRunner {
         let use_claude_pool = supports_claude_pool;
         let use_codex_app_pool = supports_codex_app_pool;
         let use_codex_mcp = matches!(&cli_profile, CliProfile::Codex { .. });
+        let persistent_pool_key = persistent_pool_key(msg.platform, &effective_chat_id, &cli_name);
 
         let storage_env = if use_claude_pool || use_codex_mcp {
             match &self.config.storage {
@@ -1391,6 +1507,7 @@ impl GatewayRunner {
         let mcp_config = if let Some(ref env) = storage_env {
             write_mcp_config_file(
                 env,
+                &persistent_pool_key,
                 msg.platform,
                 &effective_chat_id,
                 &msg.user_id,
@@ -1406,7 +1523,8 @@ impl GatewayRunner {
         let cli_handle = if use_claude_pool {
             // Long-lived process path: send message via pool, forward progress events
             let pool = self.cli_pool.clone();
-            let pool_key = effective_chat_id.clone();
+            let pool_key = persistent_pool_key.clone();
+            let pool_chat_id = effective_chat_id.clone();
             let profile = cli_profile.clone();
             let msg_text = message_text.clone();
             let sp = system_prompt.clone();
@@ -1427,6 +1545,7 @@ impl GatewayRunner {
             let project_dirs = self.config.project_dirs.clone();
             let runtime_api_url = self.runtime_api_url.clone();
             let runtime_api_token = self.runtime_api_token.clone();
+            let pool_session_states = self.session_states.clone();
 
             tokio::spawn(async move {
                 let mut attempt_sid = sid;
@@ -1524,37 +1643,57 @@ impl GatewayRunner {
                         && !retried_stale_session
                         && !kill_token.is_cancelled()
                     {
-                        if let Some(ref store) = pool_store {
-                            let _ = store
-                                .reset_session(&pool_platform, &pool_key, &pool_cli_name)
-                                .await;
-                        }
-                        tracing::info!(
-                            key = %pool_key,
-                            "pool: cleared stale session; retrying without resume"
-                        );
-                        pool.lock().await.kill(&pool_key);
-                        // Regenerate MCP config file since kill() deleted it
-                        if let Some(ref env) = storage_env_clone
-                            && let Err(e) = write_mcp_config_file(
-                                env,
-                                &pool_platform,
-                                &pool_key,
-                                &pool_user_id,
-                                &project_dirs,
-                                runtime_api_url.as_deref(),
-                                runtime_api_token.as_deref(),
-                            )
-                        {
-                            tracing::warn!(
+                        let session_is_current = {
+                            let session_states = pool_session_states.lock().await;
+                            let generation_matches = session_states
+                                .get(&pool_key)
+                                .is_some_and(|state| state.generation == session_generation);
+                            if generation_matches {
+                                if let Some(ref store) = pool_store {
+                                    store
+                                        .reset_session(
+                                            &pool_platform,
+                                            &pool_chat_id,
+                                            &pool_cli_name,
+                                        )
+                                        .await
+                                        .is_ok()
+                                } else {
+                                    true
+                                }
+                            } else {
+                                false
+                            }
+                        };
+                        if session_is_current {
+                            tracing::info!(
                                 key = %pool_key,
-                                error = %e,
-                                "failed to regenerate MCP config for stale-session retry"
+                                "pool: cleared stale session; retrying without resume"
                             );
+                            pool.lock().await.kill(&pool_key);
+                            // Regenerate MCP config file since kill() deleted it
+                            if let Some(ref env) = storage_env_clone
+                                && let Err(e) = write_mcp_config_file(
+                                    env,
+                                    &pool_key,
+                                    &pool_platform,
+                                    &pool_chat_id,
+                                    &pool_user_id,
+                                    &project_dirs,
+                                    runtime_api_url.as_deref(),
+                                    runtime_api_token.as_deref(),
+                                )
+                            {
+                                tracing::warn!(
+                                    key = %pool_key,
+                                    error = %e,
+                                    "failed to regenerate MCP config for stale-session retry"
+                                );
+                            }
+                            attempt_sid = None;
+                            retried_stale_session = true;
+                            continue;
                         }
-                        attempt_sid = None;
-                        retried_stale_session = true;
-                        continue;
                     }
 
                     // Process exited without producing a result event
@@ -1607,7 +1746,7 @@ impl GatewayRunner {
         } else if use_codex_app_pool {
             // Long-lived Codex app-server path: JSON-RPC thread + turn protocol.
             let pool = self.codex_app_pool.clone();
-            let pool_key = effective_chat_id.clone();
+            let pool_key = persistent_pool_key.clone();
             let profile = cli_profile.clone();
             let msg_text = message_text.clone();
             let sp = system_prompt.clone();
@@ -2197,23 +2336,32 @@ impl GatewayRunner {
         // and return an interrupt confirmation
         // without processing the result as a normal completion.
         if cancel_token.is_cancelled() {
-            if let Some(writer) = trace_writer.as_ref()
-                && let Err(e) = writer.fail_request("interrupted by user").await
-            {
-                tracing::warn!(error = %e, "failed to mark trace as interrupted");
-            }
-            if let Err(e) = cli_handle.await {
-                tracing::debug!(error = %e, "cli task join error after cancel");
-            }
-            self.record_zero_usage_failure(
+            let cancelled_result = match cli_handle.await {
+                Ok(Ok(result)) => Some(result),
+                Ok(Err(e)) => {
+                    tracing::debug!(error = %e, "CLI returned no result after cancel");
+                    None
+                }
+                Err(e) => {
+                    tracing::debug!(error = %e, "cli task join error after cancel");
+                    None
+                }
+            };
+            self.finalize_attempt(
                 &msg,
+                &effective_chat_id,
+                session_generation,
                 &cli_name,
                 &cli_profile,
                 trace.as_ref(),
-                run_id.as_ref().map(ToString::to_string),
-                session_id.clone(),
+                trace_writer.as_ref(),
+                run_id.as_ref(),
+                session_id.as_deref(),
+                cancelled_result.as_ref(),
+                AttemptOutcome::Cancelled,
+                Some("cancelled_by_user"),
+                Some("interrupted by user"),
                 start.elapsed(),
-                "cancelled",
             )
             .await;
             tracing::info!(tag = %request_tag, "task interrupted, skipping result processing");
@@ -2239,23 +2387,21 @@ impl GatewayRunner {
                         auth.invalidate().await;
                     }
                 }
-                if let Some(writer) = trace_writer.as_ref() {
-                    if let Some(ref run_id) = run_id {
-                        let _ = writer
-                            .finish_run(run_id, RunStatus::Failed, None, Some(&e))
-                            .await;
-                    }
-                    let _ = writer.fail_request(&e).await;
-                }
-                self.record_zero_usage_failure(
+                self.finalize_attempt(
                     &msg,
+                    &effective_chat_id,
+                    session_generation,
                     &cli_name,
                     &cli_profile,
                     trace.as_ref(),
-                    run_id.as_ref().map(ToString::to_string),
-                    session_id.clone(),
+                    trace_writer.as_ref(),
+                    run_id.as_ref(),
+                    session_id.as_deref(),
+                    None,
+                    AttemptOutcome::InternalError,
+                    Some("cli_execution_error"),
+                    Some(&e),
                     start.elapsed(),
-                    "cli_execution_error",
                 )
                 .await;
                 let text = cli_bridge::translate_cli_error(&cli_profile, -1, &e);
@@ -2272,23 +2418,22 @@ impl GatewayRunner {
                 );
             }
             Err(e) => {
-                if let Some(writer) = trace_writer.as_ref() {
-                    if let Some(ref run_id) = run_id {
-                        let _ = writer
-                            .finish_run(run_id, RunStatus::Failed, None, Some(&e.to_string()))
-                            .await;
-                    }
-                    let _ = writer.fail_request(&e.to_string()).await;
-                }
-                self.record_zero_usage_failure(
+                let error = e.to_string();
+                self.finalize_attempt(
                     &msg,
+                    &effective_chat_id,
+                    session_generation,
                     &cli_name,
                     &cli_profile,
                     trace.as_ref(),
-                    run_id.as_ref().map(ToString::to_string),
-                    session_id.clone(),
+                    trace_writer.as_ref(),
+                    run_id.as_ref(),
+                    session_id.as_deref(),
+                    None,
+                    AttemptOutcome::InternalError,
+                    Some("cli_task_join_error"),
+                    Some(&error),
                     start.elapsed(),
-                    "cli_task_join_error",
                 )
                 .await;
                 return Some(
@@ -2307,7 +2452,24 @@ impl GatewayRunner {
         // Stale session recovery: if CLI says the stored session/thread is gone,
         // clear it and retry without resume. Some backends report this on stderr
         // while still exiting 0, so do not gate on exit_code.
-        if cli_profile.is_stale_session_error(&result.stderr) && session_id.is_some() {
+        if cli_profile.is_stale_session_error(&result.stderr) && session_id.is_some() && {
+            let session_states = self.session_states.lock().await;
+            let generation_matches = session_states
+                .get(&session_state_key)
+                .is_some_and(|state| state.generation == session_generation);
+            if generation_matches {
+                if let Some(ref store) = self.store {
+                    store
+                        .reset_session(msg.platform, &effective_chat_id, &cli_name)
+                        .await
+                        .is_ok()
+                } else {
+                    true
+                }
+            } else {
+                false
+            }
+        } {
             if let Some(writer) = trace_writer.as_ref()
                 && let Some(ref run_id) = run_id
             {
@@ -2324,11 +2486,12 @@ impl GatewayRunner {
                 cli = cli_name,
                 "stale session detected — clearing and retrying"
             );
-            if let Some(ref store) = self.store {
-                let _ = store
-                    .reset_session(msg.platform, &effective_chat_id, &cli_name)
-                    .await;
-            }
+            // The database session and the live app-server/process handle are
+            // one logical continuation state. Drop any stale handle before the
+            // one-shot recovery so the following turn cannot resume the old
+            // in-memory thread again.
+            self.cli_pool.lock().await.kill(&persistent_pool_key);
+            self.codex_app_pool.lock().await.kill(&persistent_pool_key);
             let retry_run_id = if let Some(writer) = trace_writer.as_ref() {
                 writer.start_run(&cli_name, None).await.ok()
             } else {
@@ -2349,14 +2512,23 @@ impl GatewayRunner {
                 Ok(retry_result) => retry_result,
                 Err(e) => {
                     let trace_error = format!("stale session retry failed: {e}");
-                    if let Some(writer) = trace_writer.as_ref()
-                        && let Some(ref retry_run_id) = retry_run_id
-                    {
-                        let _ = writer
-                            .finish_run(retry_run_id, RunStatus::Failed, None, Some(&trace_error))
-                            .await;
-                        let _ = writer.fail_request(&trace_error).await;
-                    }
+                    self.finalize_attempt(
+                        &msg,
+                        &effective_chat_id,
+                        session_generation,
+                        &cli_name,
+                        &cli_profile,
+                        trace.as_ref(),
+                        trace_writer.as_ref(),
+                        retry_run_id.as_ref(),
+                        None,
+                        None,
+                        AttemptOutcome::InternalError,
+                        Some("stale_session_retry_error"),
+                        Some(&trace_error),
+                        start.elapsed(),
+                    )
+                    .await;
                     let text = cli_bridge::translate_cli_error(&cli_profile, -1, &e);
                     return Some(
                         self.outbound_response(
@@ -2388,68 +2560,29 @@ impl GatewayRunner {
                 upstream_request_id = ?provider_error.request_id,
                 "Claude provider request failed"
             );
-            if let Some(writer) = trace_writer.as_ref() {
-                if let Some(ref run_id) = run_id {
-                    let _ = writer
-                        .finish_run(
-                            run_id,
-                            RunStatus::Failed,
-                            Some(result.exit_code),
-                            Some(&trace_error),
-                        )
-                        .await;
-                }
-                let _ = writer.fail_request(&trace_error).await;
-            }
-
             let elapsed = start.elapsed();
-            let prompt_tok = result.tokens_prompt.unwrap_or(0);
-            let completion_tok = result.tokens_completion.unwrap_or(0);
-            let cache_create_tok = result.cache_creation_input_tokens.unwrap_or(0);
-            let cache_read_tok = result.cache_read_input_tokens.unwrap_or(0);
-            let cached_tok = result.cached_input_tokens.unwrap_or(0);
-            let reasoning_tok = result.reasoning_output_tokens.unwrap_or(0);
-            let total_tok = result.total_tokens.unwrap_or_else(|| {
-                prompt_tok + completion_tok + cache_create_tok + cache_read_tok + reasoning_tok
-            });
-            let failure_cost_usd = if total_tok == 0 {
-                Some(0.0)
-            } else {
-                result.cost_usd
-            };
-            if let Some(ref store) = self.store
-                && let Err(e) = store
-                    .record_usage(&store::UsageRecord {
-                        platform: msg.platform.to_string(),
-                        user_id: msg.user_id.clone(),
-                        cli_profile: cli_name.clone(),
-                        model: cli_profile.model_name().map(String::from),
-                        trace_id: trace.as_ref().map(|t| t.trace_id.to_string()),
-                        request_id: trace.as_ref().map(|t| t.request_id.to_string()),
-                        run_id: run_id.as_ref().map(ToString::to_string),
-                        session_id: result.session_id.clone(),
-                        tokens_prompt: prompt_tok,
-                        tokens_completion: completion_tok,
-                        cached_input_tokens: cached_tok,
-                        cache_creation_input_tokens: cache_create_tok,
-                        cache_read_input_tokens: cache_read_tok,
-                        reasoning_output_tokens: reasoning_tok,
-                        total_tokens: total_tok,
-                        context_window: result.context_window,
-                        max_output_tokens: result.max_output_tokens,
-                        cost_usd: failure_cost_usd,
-                        raw_usage_json: result.raw_usage_json.clone(),
-                        tool_calls: result.tool_calls_count.unwrap_or(0),
-                        elapsed_ms: elapsed.as_millis() as u64,
-                    })
-                    .await
-            {
-                tracing::warn!(error = %e, "failed to record provider failure usage");
-            }
+            let usage = self
+                .finalize_attempt(
+                    &msg,
+                    &effective_chat_id,
+                    session_generation,
+                    &cli_name,
+                    &cli_profile,
+                    trace.as_ref(),
+                    trace_writer.as_ref(),
+                    run_id.as_ref(),
+                    session_id.as_deref(),
+                    Some(&result),
+                    AttemptOutcome::ProviderError,
+                    Some(&provider_error.kind),
+                    Some(&trace_error),
+                    elapsed,
+                )
+                .await;
 
             let mut stats_parts = vec![format_elapsed(elapsed)];
-            if failure_cost_usd.unwrap_or(0.0) > 0.001 {
-                stats_parts.push(format!("${:.3}", failure_cost_usd.unwrap_or(0.0)));
+            if usage.cost_usd.unwrap_or(0.0) > 0.001 {
+                stats_parts.push(format!("${:.3}", usage.cost_usd.unwrap_or(0.0)));
             }
             if !self.config.response_footer {
                 stats_parts.clear();
@@ -2513,72 +2646,24 @@ impl GatewayRunner {
                 } else {
                     &result.stderr
                 };
-                if let Some(writer) = trace_writer.as_ref() {
-                    if let Some(ref run_id) = run_id {
-                        let _ = writer
-                            .finish_run(
-                                run_id,
-                                RunStatus::Failed,
-                                Some(result.exit_code),
-                                Some(error_text.trim()),
-                            )
-                            .await;
-                    }
-                    let _ = writer.fail_request(error_text.trim()).await;
-                }
                 let elapsed = start.elapsed();
-                let prompt_tok = result.tokens_prompt.unwrap_or(0);
-                let completion_tok = result.tokens_completion.unwrap_or(0);
-                let cache_create_tok = result.cache_creation_input_tokens.unwrap_or(0);
-                let cache_read_tok = result.cache_read_input_tokens.unwrap_or(0);
-                let cached_tok = result.cached_input_tokens.unwrap_or(0);
-                let reasoning_tok = result.reasoning_output_tokens.unwrap_or(0);
-                let total_tok = result.total_tokens.unwrap_or_else(|| {
-                    prompt_tok + completion_tok + cache_create_tok + cache_read_tok + reasoning_tok
-                });
-                let failure_cost_usd = if total_tok == 0 {
-                    Some(0.0)
-                } else {
-                    result.cost_usd
-                };
-                if let Some(ref store) = self.store
-                    && let Err(e) = store
-                        .record_usage(&store::UsageRecord {
-                            platform: msg.platform.to_string(),
-                            user_id: msg.user_id.clone(),
-                            cli_profile: cli_name.clone(),
-                            model: cli_profile.model_name().map(String::from),
-                            trace_id: result
-                                .trace_id
-                                .clone()
-                                .or_else(|| trace.as_ref().map(|t| t.trace_id.to_string())),
-                            request_id: result
-                                .request_id
-                                .clone()
-                                .or_else(|| trace.as_ref().map(|t| t.request_id.to_string())),
-                            run_id: result
-                                .run_id
-                                .clone()
-                                .or_else(|| run_id.as_ref().map(ToString::to_string)),
-                            session_id: result.session_id.clone(),
-                            tokens_prompt: prompt_tok,
-                            tokens_completion: completion_tok,
-                            cached_input_tokens: cached_tok,
-                            cache_creation_input_tokens: cache_create_tok,
-                            cache_read_input_tokens: cache_read_tok,
-                            reasoning_output_tokens: reasoning_tok,
-                            total_tokens: total_tok,
-                            context_window: result.context_window,
-                            max_output_tokens: result.max_output_tokens,
-                            cost_usd: failure_cost_usd,
-                            raw_usage_json: result.raw_usage_json.clone(),
-                            tool_calls: result.tool_calls_count.unwrap_or(0),
-                            elapsed_ms: elapsed.as_millis() as u64,
-                        })
-                        .await
-                {
-                    tracing::warn!(error = %e, "failed to record CLI failure usage");
-                }
+                self.finalize_attempt(
+                    &msg,
+                    &effective_chat_id,
+                    session_generation,
+                    &cli_name,
+                    &cli_profile,
+                    trace.as_ref(),
+                    trace_writer.as_ref(),
+                    run_id.as_ref(),
+                    session_id.as_deref(),
+                    Some(&result),
+                    AttemptOutcome::CliError,
+                    result.error_kind.as_deref().or(Some("cli_error")),
+                    Some(error_text.trim()),
+                    elapsed,
+                )
+                .await;
                 let text = cli_bridge::translate_cli_error(
                     &cli_profile,
                     result.exit_code,
@@ -2598,50 +2683,9 @@ impl GatewayRunner {
             }
         }
 
-        if let Some(writer) = trace_writer.as_ref()
-            && let Some(ref run_id) = run_id
-        {
-            let status = if result.success {
-                RunStatus::Succeeded
-            } else {
-                RunStatus::Failed
-            };
-            let error = if result.success {
-                None
-            } else {
-                Some(result.stderr.as_str())
-            };
-            let _ = writer
-                .finish_run(run_id, status, Some(result.exit_code), error)
-                .await;
-        }
-
         // Clear auth failure counter on success
         if result.success {
             self.clear_auth_failure(&cli_name);
-        }
-
-        // Save session_id to DB (if available), scoped by CLI profile
-        if let Some(ref store) = self.store {
-            if let Some(ref sid) = result.session_id {
-                if let Err(e) = store
-                    .set_current_session(
-                        msg.platform,
-                        &effective_chat_id,
-                        &msg.user_id,
-                        sid,
-                        &cli_name,
-                    )
-                    .await
-                {
-                    tracing::warn!(error = %e, "failed to persist session");
-                }
-            } else if let Err(e) = store
-                .touch_session(msg.platform, &effective_chat_id, &cli_name)
-                .await
-            {
-                tracing::warn!(error = %e, "failed to touch session");
-            }
         }
 
         // Use the parsed text field (from --json), fallback to raw stdout
@@ -2690,16 +2734,42 @@ impl GatewayRunner {
 
         // Append token usage stats + cost estimate
         let elapsed = start.elapsed();
-        let prompt_tok = result.tokens_prompt.unwrap_or(0);
-        let completion_tok = result.tokens_completion.unwrap_or(0);
-        let cache_create_tok = result.cache_creation_input_tokens.unwrap_or(0);
-        let cache_read_tok = result.cache_read_input_tokens.unwrap_or(0);
-        let cached_tok = result.cached_input_tokens.unwrap_or(0);
-        let reasoning_tok = result.reasoning_output_tokens.unwrap_or(0);
-        let total_tok = result.total_tokens.unwrap_or_else(|| {
-            prompt_tok + completion_tok + cache_create_tok + cache_read_tok + reasoning_tok
+        let outcome = AttemptOutcome::from_result(&result);
+        let terminal_error = outcome.is_failure().then(|| {
+            if !result.stderr.trim().is_empty() {
+                result.stderr.trim()
+            } else if !result.stdout.trim().is_empty() {
+                result.stdout.trim()
+            } else {
+                "CLI request failed"
+            }
         });
-        let cost = result.cost_usd.unwrap_or_else(|| {
+        let usage = self
+            .finalize_attempt(
+                &msg,
+                &effective_chat_id,
+                session_generation,
+                &cli_name,
+                &cli_profile,
+                trace.as_ref(),
+                trace_writer.as_ref(),
+                run_id.as_ref(),
+                session_id.as_deref(),
+                Some(&result),
+                outcome,
+                result.error_kind.as_deref(),
+                terminal_error,
+                elapsed,
+            )
+            .await;
+        let prompt_tok = usage.prompt;
+        let completion_tok = usage.completion;
+        let cache_create_tok = usage.cache_creation;
+        let cache_read_tok = usage.cache_read;
+        let cached_tok = usage.cached;
+        let reasoning_tok = usage.reasoning;
+        let total_tok = usage.total;
+        let cost = usage.cost_usd.unwrap_or_else(|| {
             (prompt_tok as f64 * 3.0 + completion_tok as f64 * 15.0) / 1_000_000.0
         });
         let mut stats_parts = Vec::new();
@@ -2735,7 +2805,7 @@ impl GatewayRunner {
                 format_tokens(context_window)
             ));
         }
-        let tool_count_total = result.tool_calls_count.unwrap_or(0);
+        let tool_count_total = usage.tool_calls;
         if tool_count_total > 0 {
             stats_parts.push(format!("🔧{tool_count_total}"));
         }
@@ -2758,46 +2828,6 @@ impl GatewayRunner {
             progressive_delivery_len,
             &request_tag,
         );
-
-        // Record usage to DB
-        if let Some(ref store) = self.store
-            && let Err(e) = store
-                .record_usage(&store::UsageRecord {
-                    platform: msg.platform.to_string(),
-                    user_id: msg.user_id.clone(),
-                    cli_profile: cli_name.clone(),
-                    model: cli_profile.model_name().map(String::from),
-                    trace_id: result
-                        .trace_id
-                        .clone()
-                        .or_else(|| trace.as_ref().map(|t| t.trace_id.to_string())),
-                    request_id: result
-                        .request_id
-                        .clone()
-                        .or_else(|| trace.as_ref().map(|t| t.request_id.to_string())),
-                    run_id: result
-                        .run_id
-                        .clone()
-                        .or_else(|| run_id.as_ref().map(ToString::to_string)),
-                    session_id: result.session_id.clone(),
-                    tokens_prompt: prompt_tok,
-                    tokens_completion: completion_tok,
-                    cached_input_tokens: cached_tok,
-                    cache_creation_input_tokens: cache_create_tok,
-                    cache_read_input_tokens: cache_read_tok,
-                    reasoning_output_tokens: reasoning_tok,
-                    total_tokens: total_tok,
-                    context_window: result.context_window,
-                    max_output_tokens: result.max_output_tokens,
-                    cost_usd: result.cost_usd,
-                    raw_usage_json: result.raw_usage_json.clone(),
-                    tool_calls: result.tool_calls_count.unwrap_or(0),
-                    elapsed_ms: elapsed.as_millis() as u64,
-                })
-                .await
-        {
-            tracing::warn!(error = %e, "failed to record usage");
-        }
 
         // Scheduled turns share the normal conversation queue, pool, and
         // session, but the scheduler owns delivery and lifecycle decisions.
@@ -2923,48 +2953,165 @@ impl GatewayRunner {
     }
 
     #[allow(clippy::too_many_arguments)]
-    async fn record_zero_usage_failure(
+    async fn finalize_attempt(
         &self,
         msg: &InboundMessage,
+        effective_chat_id: &str,
+        session_generation: u64,
         cli_name: &str,
         cli_profile: &CliProfile,
         trace: Option<&OutboxDeliveryTrace>,
-        run_id: Option<String>,
-        session_id: Option<String>,
+        trace_writer: Option<&TraceWriter<'_>>,
+        run_id: Option<&RunId>,
+        previous_session_id: Option<&str>,
+        result: Option<&CliResult>,
+        outcome: AttemptOutcome,
+        failure_kind: Option<&str>,
+        error_message: Option<&str>,
         elapsed: Duration,
-        failure_kind: &str,
-    ) {
-        let Some(store) = self.store.as_ref() else {
-            return;
-        };
-        if let Err(e) = store
-            .record_usage(&store::UsageRecord {
-                platform: msg.platform.to_string(),
-                user_id: msg.user_id.clone(),
-                cli_profile: cli_name.to_string(),
-                model: cli_profile.model_name().map(String::from),
-                trace_id: trace.map(|trace| trace.trace_id.to_string()),
-                request_id: trace.map(|trace| trace.request_id.to_string()),
-                run_id,
-                session_id,
-                tokens_prompt: 0,
-                tokens_completion: 0,
-                cached_input_tokens: 0,
-                cache_creation_input_tokens: 0,
-                cache_read_input_tokens: 0,
-                reasoning_output_tokens: 0,
-                total_tokens: 0,
-                context_window: None,
-                max_output_tokens: None,
-                cost_usd: Some(0.0),
-                raw_usage_json: None,
-                tool_calls: 0,
-                elapsed_ms: elapsed.as_millis() as u64,
-            })
-            .await
-        {
-            tracing::warn!(error = %e, failure_kind, "failed to record zero-usage failure");
+    ) -> AttemptUsage {
+        let usage = result.map_or_else(AttemptUsage::default, |result| {
+            let prompt = result.tokens_prompt.unwrap_or(0);
+            let completion = result.tokens_completion.unwrap_or(0);
+            let cached = result.cached_input_tokens.unwrap_or(0);
+            let cache_creation = result.cache_creation_input_tokens.unwrap_or(0);
+            let cache_read = result.cache_read_input_tokens.unwrap_or(0);
+            let reasoning = result.reasoning_output_tokens.unwrap_or(0);
+            let total = result
+                .total_tokens
+                .unwrap_or(prompt + completion + cache_creation + cache_read + reasoning);
+            let cost_usd = if outcome.is_failure() && total == 0 {
+                Some(0.0)
+            } else {
+                result.cost_usd
+            };
+            AttemptUsage {
+                prompt,
+                completion,
+                cached,
+                cache_creation,
+                cache_read,
+                reasoning,
+                total,
+                cost_usd,
+                tool_calls: result.tool_calls_count.unwrap_or(0),
+            }
+        });
+
+        if let Some(writer) = trace_writer {
+            if let Some(run_id) = run_id
+                && let Err(e) = writer
+                    .finish_run(
+                        run_id,
+                        outcome.run_status(),
+                        result.map(|result| result.exit_code),
+                        error_message,
+                    )
+                    .await
+            {
+                tracing::warn!(error = %e, "failed to finish CLI trace run");
+            }
+            if outcome.is_failure()
+                && let Err(e) = writer
+                    .fail_request(error_message.unwrap_or("CLI request failed"))
+                    .await
+            {
+                tracing::warn!(error = %e, "failed to mark CLI trace request as failed");
+            }
         }
+
+        let result_session_id = result.and_then(|result| result.session_id.as_deref());
+        let session_state_key = persistent_pool_key(msg.platform, effective_chat_id, cli_name);
+        let mut session_states = self.session_states.lock().await;
+        let generation_is_current = session_states
+            .get(&session_state_key)
+            .is_some_and(|state| state.generation == session_generation);
+        if let Some(store) = self.store.as_ref() {
+            if generation_is_current && let Some(session_id) = result_session_id {
+                if let Err(e) = store
+                    .set_current_session(
+                        msg.platform,
+                        effective_chat_id,
+                        &msg.user_id,
+                        session_id,
+                        cli_name,
+                    )
+                    .await
+                {
+                    tracing::warn!(error = %e, "failed to persist terminal CLI session");
+                }
+            } else if generation_is_current
+                && outcome == AttemptOutcome::Success
+                && let Err(e) = store
+                    .touch_session(msg.platform, effective_chat_id, cli_name)
+                    .await
+            {
+                tracing::warn!(error = %e, "failed to touch terminal CLI session");
+            }
+        }
+
+        if !generation_is_current {
+            tracing::info!(
+                key = %session_state_key,
+                "skipped stale terminal session persistence after session mutation"
+            );
+        }
+        let remove_session_state = if let Some(state) = session_states.get_mut(&session_state_key) {
+            state.active_attempts = state.active_attempts.saturating_sub(1);
+            state.active_attempts == 0
+        } else {
+            false
+        };
+        if remove_session_state {
+            session_states.remove(&session_state_key);
+        }
+        drop(session_states);
+
+        if let Some(store) = self.store.as_ref() {
+            let failure_kind = failure_kind
+                .map(String::from)
+                .or_else(|| result.and_then(|result| result.error_kind.clone()));
+            if let Err(e) = store
+                .record_usage(&store::UsageRecord {
+                    platform: msg.platform.to_string(),
+                    user_id: msg.user_id.clone(),
+                    cli_profile: cli_name.to_string(),
+                    model: cli_profile.model_name().map(String::from),
+                    trace_id: result
+                        .and_then(|result| result.trace_id.clone())
+                        .or_else(|| trace.map(|trace| trace.trace_id.to_string())),
+                    request_id: result
+                        .and_then(|result| result.request_id.clone())
+                        .or_else(|| trace.map(|trace| trace.request_id.to_string())),
+                    run_id: result
+                        .and_then(|result| result.run_id.clone())
+                        .or_else(|| run_id.map(ToString::to_string)),
+                    session_id: result_session_id.or(previous_session_id).map(String::from),
+                    tokens_prompt: usage.prompt,
+                    tokens_completion: usage.completion,
+                    cached_input_tokens: usage.cached,
+                    cache_creation_input_tokens: usage.cache_creation,
+                    cache_read_input_tokens: usage.cache_read,
+                    reasoning_output_tokens: usage.reasoning,
+                    total_tokens: usage.total,
+                    context_window: result.and_then(|result| result.context_window),
+                    max_output_tokens: result.and_then(|result| result.max_output_tokens),
+                    cost_usd: usage
+                        .cost_usd
+                        .or_else(|| outcome.is_failure().then_some(0.0)),
+                    raw_usage_json: result.and_then(|result| result.raw_usage_json.clone()),
+                    status: outcome.usage_status(),
+                    failure_kind,
+                    tool_calls: usage.tool_calls,
+                    elapsed_ms: elapsed.as_millis() as u64,
+                })
+                .await
+            {
+                tracing::warn!(error = %e, ?outcome, "failed to record terminal CLI usage");
+            }
+        }
+
+        usage
     }
 
     fn effective_chat_id(&self, msg: &InboundMessage) -> String {
@@ -3801,8 +3948,10 @@ impl GatewayRunner {
 /// Write the gateway MCP config file for a conversation and return the generated config.
 /// Used both for the initial pool spawn and for regeneration after a stale-session
 /// retry (kill() deletes the file, so it must be rewritten before the retry reuses it).
+#[allow(clippy::too_many_arguments)]
 fn write_mcp_config_file(
     env: &crate::mcp::config::McpStorageEnv,
+    config_identity: &str,
     platform: &str,
     chat_id: &str,
     user_id: &str,
@@ -3812,6 +3961,7 @@ fn write_mcp_config_file(
 ) -> Result<crate::mcp::config::GeneratedMcpConfig, String> {
     crate::mcp::config::generate_gateway_mcp_config(
         env,
+        config_identity,
         platform,
         chat_id,
         user_id,

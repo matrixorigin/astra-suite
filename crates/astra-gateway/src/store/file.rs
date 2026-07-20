@@ -12,7 +12,7 @@
 
 use super::{
     CronJobRecord, CronJobSpec, DueJob, GatewayStore, PlatformCredential, SessionRecord,
-    SkillRecord, StoreError, UsageRecord, UsageSummary, next_cron_run_str,
+    SkillRecord, StoreError, UsageRecord, UsageStatus, UsageSummary, next_cron_run_str,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -101,6 +101,10 @@ struct UsageEntry {
     max_output_tokens: Option<u64>,
     cost_usd: Option<f64>,
     raw_usage_json: Option<String>,
+    #[serde(default)]
+    status: UsageStatus,
+    #[serde(default)]
+    failure_kind: Option<String>,
     tool_calls: u32,
     elapsed_ms: u64,
     created_at: String,
@@ -356,23 +360,24 @@ impl GatewayStore for FileGatewayStore {
     ) -> Result<bool, StoreError> {
         let mut sessions = self.sessions.write().await;
         let key = session_key(platform, chat_id, cli_profile);
-        let mut found = false;
         if let Some(entries) = sessions.get_mut(&key) {
+            if !entries.iter().any(|e| e.session_id == target_session_id) {
+                return Ok(false);
+            }
             for e in entries.iter_mut() {
                 if e.session_id == target_session_id {
                     e.is_current = true;
                     e.last_active = now_str();
-                    found = true;
                 } else {
                     e.is_current = false;
                 }
             }
+        } else {
+            return Ok(false);
         }
         drop(sessions);
-        if found {
-            self.flush_sessions().await?;
-        }
-        Ok(found)
+        self.flush_sessions().await?;
+        Ok(true)
     }
 
     async fn find_sessions_by_prefix(
@@ -607,6 +612,8 @@ impl GatewayStore for FileGatewayStore {
             max_output_tokens: record.max_output_tokens,
             cost_usd: record.cost_usd,
             raw_usage_json: record.raw_usage_json.clone(),
+            status: record.status,
+            failure_kind: record.failure_kind.clone(),
             tool_calls: record.tool_calls,
             elapsed_ms: record.elapsed_ms,
             created_at: now_str(),
@@ -894,7 +901,9 @@ async fn load_usage_summary_filtered(
             && cli_profile.is_none_or(|profile| entry.cli_profile == profile)
             && session_id.is_none_or(|sid| entry.session_id.as_deref() == Some(sid))
         {
-            summary.messages += 1;
+            if entry.status.counts_as_message() {
+                summary.messages += 1;
+            }
             summary.tokens_prompt += entry.tokens_prompt;
             summary.tokens_completion += entry.tokens_completion;
             summary.cached_input_tokens += entry.cached_input_tokens;
@@ -1147,6 +1156,8 @@ mod tests {
             max_output_tokens: None,
             cost_usd: None,
             raw_usage_json: None,
+            status: UsageStatus::Success,
+            failure_kind: None,
             tool_calls: 2,
             elapsed_ms: 3000,
         };

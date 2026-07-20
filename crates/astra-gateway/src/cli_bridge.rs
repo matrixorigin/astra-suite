@@ -1364,27 +1364,6 @@ fn cost_delta(current: Option<f64>, previous: Option<f64>) -> Option<f64> {
     })
 }
 
-fn usage_snapshot_rolled_back(
-    current: &ClaudeUsageSnapshot,
-    previous: &ClaudeUsageSnapshot,
-) -> bool {
-    [
-        (current.tokens_prompt, previous.tokens_prompt),
-        (current.tokens_completion, previous.tokens_completion),
-        (
-            current.cache_creation_input_tokens,
-            previous.cache_creation_input_tokens,
-        ),
-        (
-            current.cache_read_input_tokens,
-            previous.cache_read_input_tokens,
-        ),
-    ]
-    .into_iter()
-    .any(|(current, previous)| matches!((current, previous), (Some(value), Some(old)) if value < old))
-        || matches!((current.cost_usd, previous.cost_usd), (Some(value), Some(old)) if value < old)
-}
-
 pub(crate) fn normalize_claude_pool_usage(
     result: &mut CliResult,
     previous: &mut Option<ClaudeUsageSnapshot>,
@@ -1424,30 +1403,21 @@ pub(crate) fn normalize_claude_pool_usage(
         result.cached_input_tokens = Some(0);
         result.cost_usd = current.cost_usd.map(|_| 0.0);
     } else if let Some(old) = previous.as_ref() {
-        if usage_snapshot_rolled_back(&current, old) {
-            // Persistent process replacement or provider counter reset. A
-            // rollback in any cumulative field invalidates the whole old
-            // snapshot; mixing deltas and absolute values would mischarge the
-            // current turn.
-            result.tokens_prompt = current.tokens_prompt;
-            result.tokens_completion = current.tokens_completion;
-            result.cache_creation_input_tokens = current.cache_creation_input_tokens;
-            result.cache_read_input_tokens = current.cache_read_input_tokens;
-            result.cached_input_tokens = current.cache_read_input_tokens;
-            result.cost_usd = current.cost_usd;
-        } else {
-            result.tokens_prompt = usage_delta(current.tokens_prompt, old.tokens_prompt);
-            result.tokens_completion =
-                usage_delta(current.tokens_completion, old.tokens_completion);
-            result.cache_creation_input_tokens = usage_delta(
-                current.cache_creation_input_tokens,
-                old.cache_creation_input_tokens,
-            );
-            result.cache_read_input_tokens =
-                usage_delta(current.cache_read_input_tokens, old.cache_read_input_tokens);
-            result.cached_input_tokens = result.cache_read_input_tokens;
-            result.cost_usd = cost_delta(current.cost_usd, old.cost_usd);
-        }
+        // Counter resets can be field-specific. Difference counters that are
+        // still monotonic, and use only the reset field's current value as its
+        // new-process baseline. Treating the whole snapshot as absolute when
+        // one field rolls back would duplicate lifetime usage in every other
+        // field.
+        result.tokens_prompt = usage_delta(current.tokens_prompt, old.tokens_prompt);
+        result.tokens_completion = usage_delta(current.tokens_completion, old.tokens_completion);
+        result.cache_creation_input_tokens = usage_delta(
+            current.cache_creation_input_tokens,
+            old.cache_creation_input_tokens,
+        );
+        result.cache_read_input_tokens =
+            usage_delta(current.cache_read_input_tokens, old.cache_read_input_tokens);
+        result.cached_input_tokens = result.cache_read_input_tokens;
+        result.cost_usd = cost_delta(current.cost_usd, old.cost_usd);
     } else {
         result.tokens_prompt = current.tokens_prompt;
         result.tokens_completion = current.tokens_completion;
@@ -4421,10 +4391,10 @@ extra_args:
         });
         let mut result = parse_claude_result_value(&restarted, 0);
         normalize_claude_pool_usage(&mut result, &mut baseline);
-        assert_eq!(result.tokens_prompt, Some(600));
+        assert_eq!(result.tokens_prompt, Some(100));
         assert_eq!(result.tokens_completion, Some(5));
-        assert_eq!(result.cache_creation_input_tokens, Some(60));
-        assert_eq!(result.cost_usd, Some(5.2));
+        assert_eq!(result.cache_creation_input_tokens, Some(10));
+        assert!((result.cost_usd.unwrap() - 0.2).abs() < 1e-9);
         assert_eq!(baseline.unwrap().tokens_prompt, Some(600));
     }
 }
