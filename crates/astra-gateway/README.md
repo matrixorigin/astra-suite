@@ -119,7 +119,8 @@ agents through `gateway_send_attachment`.
 |--------------------------------|-------------|
 | `/help`                        | Show all commands |
 | `/status`                      | CLI + model + session + harness summary |
-| `/new`                         | Start a new conversation |
+| `/new`                         | Stop the current conversation and start a new one; history remains recoverable |
+| `/compact [instructions]`      | Compact Claude context without deleting the original transcript (Claude profiles only) |
 | `/cli` / `/cli claude`         | Show / switch CLI backend |
 | `/reasoning on\|off`           | Toggle explicit reasoning / thinking blocks |
 | `/model` / `/model opus`       | Show / switch model; Codex also accepts `/model <model> [effort]` using the live model-supported levels |

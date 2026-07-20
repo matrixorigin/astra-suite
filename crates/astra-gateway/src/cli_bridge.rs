@@ -144,6 +144,24 @@ impl ReasoningDisplay {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderError {
+    pub kind: String,
+    pub status: Option<u16>,
+    pub code: Option<String>,
+    pub message: String,
+    pub request_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) struct ClaudeUsageSnapshot {
+    tokens_prompt: Option<u64>,
+    tokens_completion: Option<u64>,
+    cache_creation_input_tokens: Option<u64>,
+    cache_read_input_tokens: Option<u64>,
+    cost_usd: Option<f64>,
+}
+
 #[derive(Debug)]
 pub struct CliResult {
     pub stdout: String,
@@ -151,6 +169,7 @@ pub struct CliResult {
     pub exit_code: i32,
     pub success: bool,
     pub error_kind: Option<String>,
+    pub provider_error: Option<ProviderError>,
     pub trace_id: Option<String>,
     pub request_id: Option<String>,
     pub run_id: Option<String>,
@@ -659,6 +678,7 @@ impl CliProfile {
                         exit_code,
                         success: exit_code == 0,
                         error_kind: default_error_kind(exit_code),
+                        provider_error: None,
                         trace_id: None,
                         request_id: None,
                         run_id: None,
@@ -994,6 +1014,7 @@ fn parse_strict_astra_envelope(
         exit_code,
         success,
         error_kind,
+        provider_error: None,
         trace_id: required_nullable_string(v, "trace_id")?,
         request_id: required_nullable_string(v, "request_id")?,
         run_id: required_nullable_string(v, "run_id")?,
@@ -1074,6 +1095,396 @@ fn first_model_usage(v: &serde_json::Value) -> Option<&serde_json::Value> {
     v["modelUsage"].as_object()?.values().next()
 }
 
+fn cumulative_model_usage(v: &serde_json::Value) -> Option<ClaudeUsageSnapshot> {
+    let models = v["modelUsage"].as_object()?;
+    if models.is_empty() {
+        return None;
+    }
+
+    let sum = |field: &str| {
+        let values = models
+            .values()
+            .map(|usage| usage[field].as_u64())
+            .collect::<Vec<_>>();
+        sum_tokens(&values)
+    };
+
+    Some(ClaudeUsageSnapshot {
+        tokens_prompt: sum("inputTokens"),
+        tokens_completion: sum("outputTokens"),
+        cache_creation_input_tokens: sum("cacheCreationInputTokens"),
+        cache_read_input_tokens: sum("cacheReadInputTokens"),
+        cost_usd: v["total_cost_usd"].as_f64().or_else(|| {
+            let costs = models
+                .values()
+                .filter_map(|usage| usage["costUSD"].as_f64())
+                .collect::<Vec<_>>();
+            (!costs.is_empty()).then(|| costs.into_iter().sum())
+        }),
+    })
+}
+
+fn parse_api_error_payload(text: &str) -> Option<serde_json::Value> {
+    let data = text
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("data:"))?;
+    serde_json::from_str(data.trim()).ok()
+}
+
+fn detect_claude_provider_error(
+    v: &serde_json::Value,
+    text: Option<&str>,
+) -> Option<ProviderError> {
+    let payload = text.and_then(parse_api_error_payload);
+    let status = v["api_error_status"]
+        .as_u64()
+        .and_then(|value| u16::try_from(value).ok())
+        .or_else(|| {
+            v["api_error_status"]
+                .as_str()
+                .and_then(|value| value.parse::<u16>().ok())
+        })
+        .or_else(|| {
+            text.and_then(|value| {
+                value
+                    .strip_prefix("API Error:")?
+                    .split_whitespace()
+                    .next()?
+                    .parse::<u16>()
+                    .ok()
+            })
+        });
+    let code = payload
+        .as_ref()
+        .and_then(|value| value["code"].as_str())
+        .or_else(|| v["error"]["code"].as_str())
+        .map(String::from);
+    let payload_message = payload
+        .as_ref()
+        .and_then(|value| value["message"].as_str())
+        .or_else(|| v["error"]["message"].as_str())
+        .map(String::from);
+    let request_id = payload
+        .as_ref()
+        .and_then(|value| value["request_id"].as_str())
+        .or_else(|| v["request_id"].as_str())
+        .map(String::from);
+    let subtype_is_error = v["subtype"]
+        .as_str()
+        .is_some_and(|subtype| subtype.contains("error"));
+    let text_is_error = text.is_some_and(|value| value.trim_start().starts_with("API Error:"));
+    let is_error = v["is_error"].as_bool().unwrap_or(false)
+        || status.is_some()
+        || subtype_is_error
+        || text_is_error;
+
+    if !is_error {
+        return None;
+    }
+
+    let message = payload_message
+        .or_else(|| {
+            text.map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(String::from)
+        })
+        .unwrap_or_else(|| "provider API request failed".to_string());
+    let context_overflow =
+        code.as_deref() == Some("InvalidParameter") && message.contains("Range of input length");
+
+    Some(ProviderError {
+        kind: if context_overflow {
+            "context_overflow".to_string()
+        } else {
+            "provider_api_error".to_string()
+        },
+        status,
+        code,
+        message,
+        request_id,
+    })
+}
+
+fn claude_audit_usage_json(
+    v: &serde_json::Value,
+    provider_error: Option<&ProviderError>,
+) -> Option<String> {
+    let mut audit = serde_json::Map::new();
+    for field in [
+        "type",
+        "subtype",
+        "is_error",
+        "api_error_status",
+        "duration_ms",
+        "duration_api_ms",
+        "num_turns",
+        "stop_reason",
+        "session_id",
+        "request_id",
+        "total_cost_usd",
+        "terminal_reason",
+        "fast_mode_state",
+        "uuid",
+    ] {
+        if let Some(value) = v.get(field)
+            && (value.is_boolean() || value.is_number() || value.is_string())
+        {
+            audit.insert(field.to_string(), value.clone());
+        }
+    }
+    if let Some(usage) = v["usage"].as_object() {
+        let mut safe_usage = serde_json::Map::new();
+        for field in [
+            "input_tokens",
+            "output_tokens",
+            "cache_creation_input_tokens",
+            "cache_read_input_tokens",
+        ] {
+            if let Some(value) = usage.get(field).filter(|value| value.is_number()) {
+                safe_usage.insert(field.to_string(), value.clone());
+            }
+        }
+        if !safe_usage.is_empty() {
+            audit.insert("usage".to_string(), serde_json::Value::Object(safe_usage));
+        }
+    }
+    if let Some(models) = v["modelUsage"].as_object() {
+        let mut safe_models = serde_json::Map::new();
+        for (model, usage) in models {
+            let Some(usage) = usage.as_object() else {
+                continue;
+            };
+            let mut safe_usage = serde_json::Map::new();
+            for field in [
+                "inputTokens",
+                "outputTokens",
+                "cacheCreationInputTokens",
+                "cacheReadInputTokens",
+                "webSearchRequests",
+                "costUSD",
+                "contextWindow",
+                "maxOutputTokens",
+            ] {
+                if let Some(value) = usage.get(field).filter(|value| value.is_number()) {
+                    safe_usage.insert(field.to_string(), value.clone());
+                }
+            }
+            if !safe_usage.is_empty() {
+                safe_models.insert(model.clone(), serde_json::Value::Object(safe_usage));
+            }
+        }
+        if !safe_models.is_empty() {
+            audit.insert(
+                "modelUsage".to_string(),
+                serde_json::Value::Object(safe_models),
+            );
+        }
+    }
+    if let Some(error) = provider_error {
+        audit.insert(
+            "provider_error".to_string(),
+            serde_json::json!({
+                "kind": error.kind,
+                "status": error.status,
+                "code": error.code,
+                "request_id": error.request_id,
+            }),
+        );
+    }
+    raw_json(&serde_json::Value::Object(audit))
+}
+
+pub(crate) fn parse_claude_result_value(v: &serde_json::Value, exit_code: i32) -> CliResult {
+    let usage = &v["usage"];
+    let model_usage = first_model_usage(v);
+    let tokens_prompt = usage["input_tokens"].as_u64();
+    let tokens_completion = usage["output_tokens"].as_u64();
+    let cache_creation_input_tokens = usage["cache_creation_input_tokens"].as_u64();
+    let cache_read_input_tokens = usage["cache_read_input_tokens"].as_u64();
+    let text = v["result"].as_str().map(String::from);
+    let provider_error = detect_claude_provider_error(v, text.as_deref());
+    let success = exit_code == 0 && provider_error.is_none();
+    let error_kind = provider_error
+        .as_ref()
+        .map(|error| error.kind.clone())
+        .or_else(|| default_error_kind(exit_code));
+    let raw_usage_json = claude_audit_usage_json(v, provider_error.as_ref());
+
+    CliResult {
+        stdout: String::new(),
+        stderr: String::new(),
+        exit_code,
+        success,
+        error_kind,
+        provider_error,
+        trace_id: None,
+        request_id: None,
+        run_id: None,
+        session_id: v["session_id"].as_str().map(String::from),
+        text,
+        tool_calls_count: v["num_turns"].as_u64().map(|n| n as u32),
+        tools_used: Vec::new(),
+        tokens_prompt,
+        tokens_completion,
+        cached_input_tokens: cache_read_input_tokens,
+        cache_creation_input_tokens,
+        cache_read_input_tokens,
+        reasoning_output_tokens: None,
+        total_tokens: sum_tokens(&[
+            tokens_prompt,
+            cache_creation_input_tokens,
+            cache_read_input_tokens,
+            tokens_completion,
+        ]),
+        context_window: model_usage.and_then(|m| m["contextWindow"].as_u64()),
+        max_output_tokens: model_usage.and_then(|m| m["maxOutputTokens"].as_u64()),
+        cost_usd: v["total_cost_usd"]
+            .as_f64()
+            .or_else(|| model_usage.and_then(|m| m["costUSD"].as_f64())),
+        // Retain only accounting and request metadata. The upstream envelope
+        // also contains the model response and permission details, which do
+        // not belong in the usage table.
+        raw_usage_json,
+    }
+}
+
+pub(crate) fn claude_local_command_output(v: &serde_json::Value) -> Option<String> {
+    if v["type"].as_str() != Some("system") || v["subtype"].as_str() != Some("local_command") {
+        return None;
+    }
+    let content = v["content"].as_str()?.trim();
+    let output = content
+        .strip_prefix("<local-command-stdout>")
+        .and_then(|value| value.strip_suffix("</local-command-stdout>"))
+        .unwrap_or(content)
+        .trim();
+    (!output.is_empty()).then(|| output.to_string())
+}
+
+pub(crate) fn apply_claude_local_command_output(result: &mut CliResult, output: Option<String>) {
+    if result
+        .text
+        .as_deref()
+        .is_none_or(|text| text.trim().is_empty())
+        && let Some(output) = output
+    {
+        result.text = Some(output);
+    }
+}
+
+fn usage_delta(current: Option<u64>, previous: Option<u64>) -> Option<u64> {
+    current.map(|value| {
+        previous
+            .filter(|old| value >= *old)
+            .map_or(value, |old| value - old)
+    })
+}
+
+fn cost_delta(current: Option<f64>, previous: Option<f64>) -> Option<f64> {
+    current.map(|value| {
+        previous
+            .filter(|old| value >= *old)
+            .map_or(value, |old| value - old)
+    })
+}
+
+pub(crate) fn normalize_claude_pool_usage(
+    result: &mut CliResult,
+    previous: &mut Option<ClaudeUsageSnapshot>,
+) {
+    // Persistent Claude's top-level `usage` is already per turn, while
+    // `modelUsage` and `total_cost_usd` are cumulative for the process. Build
+    // the baseline from the cumulative fields so we do not difference a
+    // per-turn value twice.
+    let current = result
+        .raw_usage_json
+        .as_deref()
+        .and_then(|raw| serde_json::from_str(raw).ok())
+        .as_ref()
+        .and_then(cumulative_model_usage)
+        .unwrap_or(ClaudeUsageSnapshot {
+            tokens_prompt: result.tokens_prompt,
+            tokens_completion: result.tokens_completion,
+            cache_creation_input_tokens: result.cache_creation_input_tokens,
+            cache_read_input_tokens: result.cache_read_input_tokens,
+            cost_usd: result.cost_usd,
+        });
+    let provider_failed_without_usage = result.provider_error.is_some()
+        && sum_tokens(&[
+            result.tokens_prompt,
+            result.tokens_completion,
+            result.cache_creation_input_tokens,
+            result.cache_read_input_tokens,
+        ])
+        .unwrap_or(0)
+            == 0;
+
+    if provider_failed_without_usage {
+        result.tokens_prompt = Some(0);
+        result.tokens_completion = Some(0);
+        result.cache_creation_input_tokens = Some(0);
+        result.cache_read_input_tokens = Some(0);
+        result.cached_input_tokens = Some(0);
+        result.cost_usd = current.cost_usd.map(|_| 0.0);
+    } else if let Some(old) = previous.as_ref() {
+        // Counter resets can be field-specific. Difference counters that are
+        // still monotonic, and use only the reset field's current value as its
+        // new-process baseline. Treating the whole snapshot as absolute when
+        // one field rolls back would duplicate lifetime usage in every other
+        // field.
+        result.tokens_prompt = usage_delta(current.tokens_prompt, old.tokens_prompt);
+        result.tokens_completion = usage_delta(current.tokens_completion, old.tokens_completion);
+        result.cache_creation_input_tokens = usage_delta(
+            current.cache_creation_input_tokens,
+            old.cache_creation_input_tokens,
+        );
+        result.cache_read_input_tokens =
+            usage_delta(current.cache_read_input_tokens, old.cache_read_input_tokens);
+        result.cached_input_tokens = result.cache_read_input_tokens;
+        result.cost_usd = cost_delta(current.cost_usd, old.cost_usd);
+    } else {
+        result.tokens_prompt = current.tokens_prompt;
+        result.tokens_completion = current.tokens_completion;
+        result.cache_creation_input_tokens = current.cache_creation_input_tokens;
+        result.cache_read_input_tokens = current.cache_read_input_tokens;
+        result.cached_input_tokens = current.cache_read_input_tokens;
+        result.cost_usd = current.cost_usd;
+    }
+
+    result.total_tokens = sum_tokens(&[
+        result.tokens_prompt,
+        result.cache_creation_input_tokens,
+        result.cache_read_input_tokens,
+        result.tokens_completion,
+    ]);
+
+    match previous {
+        // Error-only frames frequently repeat cumulative totals. Keep an
+        // established baseline unchanged so the next successful turn is not
+        // charged twice. With no baseline yet, retain the frame as the initial
+        // cumulative snapshot for the same reason.
+        Some(_) if provider_failed_without_usage => {}
+        Some(old) => {
+            if current.tokens_prompt.is_some() {
+                old.tokens_prompt = current.tokens_prompt;
+            }
+            if current.tokens_completion.is_some() {
+                old.tokens_completion = current.tokens_completion;
+            }
+            if current.cache_creation_input_tokens.is_some() {
+                old.cache_creation_input_tokens = current.cache_creation_input_tokens;
+            }
+            if current.cache_read_input_tokens.is_some() {
+                old.cache_read_input_tokens = current.cache_read_input_tokens;
+            }
+            if current.cost_usd.is_some() {
+                old.cost_usd = current.cost_usd;
+            }
+        }
+        slot => *slot = Some(current),
+    }
+}
+
 fn malformed_astra_result(exit_code: i32, reason: String) -> CliResult {
     CliResult {
         stdout: String::new(),
@@ -1081,6 +1492,7 @@ fn malformed_astra_result(exit_code: i32, reason: String) -> CliResult {
         exit_code: if exit_code == 0 { 1 } else { exit_code },
         success: false,
         error_kind: Some("malformed_envelope".to_string()),
+        provider_error: None,
         trace_id: None,
         request_id: None,
         run_id: None,
@@ -1104,63 +1516,30 @@ fn malformed_astra_result(exit_code: i32, reason: String) -> CliResult {
 
 fn parse_claude_json(stdout: &str, exit_code: i32) -> CliResult {
     if let Ok(v) = serde_json::from_str::<serde_json::Value>(stdout) {
-        let usage = &v["usage"];
-        let model_usage = first_model_usage(&v);
-        let tokens_prompt = usage["input_tokens"].as_u64();
-        let tokens_completion = usage["output_tokens"].as_u64();
-        let cache_creation_input_tokens = usage["cache_creation_input_tokens"].as_u64();
-        let cache_read_input_tokens = usage["cache_read_input_tokens"].as_u64();
-        CliResult {
-            stdout: String::new(),
-            stderr: String::new(),
-            exit_code,
-            success: exit_code == 0,
-            error_kind: default_error_kind(exit_code),
-            trace_id: None,
-            request_id: None,
-            run_id: None,
-            session_id: v["session_id"].as_str().map(String::from),
-            text: v["result"].as_str().map(String::from),
-            tool_calls_count: v["num_turns"].as_u64().map(|n| n as u32),
-            tools_used: Vec::new(),
-            tokens_prompt,
-            tokens_completion,
-            cached_input_tokens: cache_read_input_tokens,
-            cache_creation_input_tokens,
-            cache_read_input_tokens,
-            reasoning_output_tokens: None,
-            total_tokens: sum_tokens(&[
-                tokens_prompt,
-                cache_creation_input_tokens,
-                cache_read_input_tokens,
-                tokens_completion,
-            ]),
-            context_window: model_usage.and_then(|m| m["contextWindow"].as_u64()),
-            max_output_tokens: model_usage.and_then(|m| m["maxOutputTokens"].as_u64()),
-            cost_usd: v["total_cost_usd"]
-                .as_f64()
-                .or_else(|| model_usage.and_then(|m| m["costUSD"].as_f64())),
-            raw_usage_json: raw_json(usage),
-        }
+        parse_claude_result_value(&v, exit_code)
     } else {
-        plain_result(stdout, exit_code)
+        parse_claude_plain_result(stdout, exit_code)
     }
+}
+
+fn parse_claude_plain_result(stdout: &str, exit_code: i32) -> CliResult {
+    let mut result = plain_result(stdout, exit_code);
+    if let Some(provider_error) =
+        detect_claude_provider_error(&serde_json::Value::Null, result.text.as_deref())
+    {
+        result.success = false;
+        result.error_kind = Some(provider_error.kind.clone());
+        result.provider_error = Some(provider_error);
+    }
+    result
 }
 
 /// Parse the accumulated stdout of a `--output-format stream-json` run.
 /// Walks every JSONL line to accumulate tool usage (since the final `result`
 /// frame only carries `num_turns`, not tool metadata).
 fn parse_claude_stream_json_stdout(stdout: &str, exit_code: i32) -> CliResult {
-    let mut session_id: Option<String> = None;
-    let mut text: Option<String> = None;
-    let mut tokens_prompt: Option<u64> = None;
-    let mut tokens_completion: Option<u64> = None;
-    let mut cache_creation_input_tokens: Option<u64> = None;
-    let mut cache_read_input_tokens: Option<u64> = None;
-    let mut context_window: Option<u64> = None;
-    let mut max_output_tokens: Option<u64> = None;
-    let mut cost_usd: Option<f64> = None;
-    let mut raw_usage_json: Option<String> = None;
+    let mut result_value: Option<serde_json::Value> = None;
+    let mut local_command_output: Option<String> = None;
     let mut tools_used: Vec<String> = Vec::new();
     let mut tool_use_count: u32 = 0;
 
@@ -1188,63 +1567,29 @@ fn parse_claude_stream_json_stdout(stdout: &str, exit_code: i32) -> CliResult {
                 }
             }
             Some("result") => {
-                session_id = v["session_id"].as_str().map(String::from);
-                text = v["result"].as_str().map(String::from);
-                let usage = &v["usage"];
-                tokens_prompt = usage["input_tokens"].as_u64();
-                tokens_completion = usage["output_tokens"].as_u64();
-                cache_creation_input_tokens = usage["cache_creation_input_tokens"].as_u64();
-                cache_read_input_tokens = usage["cache_read_input_tokens"].as_u64();
-                if let Some(model_usage) = first_model_usage(&v) {
-                    context_window = model_usage["contextWindow"].as_u64();
-                    max_output_tokens = model_usage["maxOutputTokens"].as_u64();
-                    cost_usd = model_usage["costUSD"].as_f64();
+                result_value = Some(v);
+            }
+            Some("system") => {
+                if let Some(output) = claude_local_command_output(&v) {
+                    local_command_output = Some(output);
                 }
-                cost_usd = v["total_cost_usd"].as_f64().or(cost_usd);
-                raw_usage_json = raw_json(usage);
             }
             _ => {}
         }
     }
 
-    if text.is_some() || session_id.is_some() {
-        let tool_calls_count = if tool_use_count == 0 {
+    if let Some(value) = result_value {
+        let mut result = parse_claude_result_value(&value, exit_code);
+        apply_claude_local_command_output(&mut result, local_command_output);
+        result.tool_calls_count = if tool_use_count == 0 {
             None
         } else {
             Some(tool_use_count)
         };
-        CliResult {
-            stdout: String::new(),
-            stderr: String::new(),
-            exit_code,
-            success: exit_code == 0,
-            error_kind: default_error_kind(exit_code),
-            trace_id: None,
-            request_id: None,
-            run_id: None,
-            session_id,
-            text,
-            tool_calls_count,
-            tools_used,
-            tokens_prompt,
-            tokens_completion,
-            cached_input_tokens: cache_read_input_tokens,
-            cache_creation_input_tokens,
-            cache_read_input_tokens,
-            reasoning_output_tokens: None,
-            total_tokens: sum_tokens(&[
-                tokens_prompt,
-                cache_creation_input_tokens,
-                cache_read_input_tokens,
-                tokens_completion,
-            ]),
-            context_window,
-            max_output_tokens,
-            cost_usd,
-            raw_usage_json,
-        }
+        result.tools_used = tools_used;
+        result
     } else {
-        plain_result(stdout, exit_code)
+        parse_claude_plain_result(stdout, exit_code)
     }
 }
 /// Parse a single stdout JSONL line from `--output-format stream-json` into a
@@ -1444,6 +1789,7 @@ fn parse_copilot_jsonl(stdout: &str, exit_code: i32) -> CliResult {
             exit_code,
             success: exit_code == 0,
             error_kind: default_error_kind(exit_code),
+            provider_error: None,
             trace_id: None,
             request_id: None,
             run_id: None,
@@ -1632,6 +1978,7 @@ fn parse_codex_stream_json_stdout(stdout: &str, exit_code: i32) -> CliResult {
             exit_code,
             success: exit_code == 0,
             error_kind: default_error_kind(exit_code),
+            provider_error: None,
             trace_id: None,
             request_id: None,
             run_id: None,
@@ -1770,6 +2117,7 @@ fn parse_generic_json(
             exit_code,
             success: exit_code == 0,
             error_kind: default_error_kind(exit_code),
+            provider_error: None,
             trace_id: None,
             request_id: None,
             run_id: None,
@@ -1801,6 +2149,7 @@ fn plain_result(stdout: &str, exit_code: i32) -> CliResult {
         exit_code,
         success: exit_code == 0,
         error_kind: default_error_kind(exit_code),
+        provider_error: None,
         trace_id: None,
         request_id: None,
         run_id: None,
@@ -2368,6 +2717,31 @@ pub fn translate_cli_error(profile: &CliProfile, exit_code: i32, stderr: &str) -
         return format!("⏰ `{name}` 响应超时，请重试。");
     }
     format!("⚠️ `{name}` 执行失败 (exit={exit_code})")
+}
+
+pub fn translate_provider_error(profile: &CliProfile, error: &ProviderError) -> String {
+    let upstream_request = error
+        .request_id
+        .as_deref()
+        .map(|request_id| format!("\n上游 request_id: `{request_id}`"))
+        .unwrap_or_default();
+    if error.kind == "context_overflow" {
+        let model = profile.model_name().unwrap_or("当前模型");
+        return format!(
+            "⚠️ `{model}` 会话上下文已超过上游输入上限。请先发送 `/compact`；如果压缩仍失败，请使用 `/new` 开始新会话。{upstream_request}"
+        );
+    }
+
+    let status = error
+        .status
+        .map(|value| format!(" HTTP {value}"))
+        .unwrap_or_default();
+    let code = error
+        .code
+        .as_deref()
+        .map(|value| format!(" `{value}`"))
+        .unwrap_or_default();
+    format!("⚠️ 上游模型服务返回错误{status}{code}。请稍后重试。{upstream_request}")
 }
 
 // Legacy compat
@@ -3836,5 +4210,252 @@ extra_args:
         assert!(events[13].is_none());
         // result → None
         assert!(events[14].is_none());
+    }
+
+    #[test]
+    fn claude_local_command_output_is_preserved_with_empty_result() {
+        let local_command = serde_json::json!({
+            "type": "system",
+            "subtype": "local_command",
+            "content": "<local-command-stdout>Not enough messages to compact.</local-command-stdout>"
+        });
+        assert_eq!(
+            claude_local_command_output(&local_command).as_deref(),
+            Some("Not enough messages to compact.")
+        );
+
+        let result = serde_json::json!({
+            "type": "result",
+            "subtype": "success",
+            "is_error": false,
+            "session_id": "compact-session",
+            "result": "",
+            "usage": {"input_tokens": 0, "output_tokens": 0},
+            "total_cost_usd": 0.0
+        });
+        let stdout = format!("{local_command}\n{result}\n");
+        let parsed = parse_claude_stream_json_stdout(&stdout, 0);
+        assert!(parsed.success);
+        assert_eq!(
+            parsed.text.as_deref(),
+            Some("Not enough messages to compact.")
+        );
+    }
+
+    #[test]
+    fn claude_exit_zero_api_error_is_structured_failure() {
+        let value = serde_json::json!({
+            "type": "result",
+            "subtype": "success",
+            "is_error": false,
+            "api_error_status": 400,
+            "session_id": "2e8c8b02-5c96-45e8-85b3-b74f0bc2f101",
+            "result": "API Error: 400 event:error\ndata:{\"code\":\"InvalidParameter\",\"message\":\"Range of input length should be [1, 983616]\",\"request_id\":\"upstream-123\"}",
+            "usage": {"input_tokens": 0, "output_tokens": 0},
+            "total_cost_usd": 77.5227695
+        });
+
+        let result = parse_claude_result_value(&value, 0);
+        assert!(!result.success);
+        assert_eq!(result.error_kind.as_deref(), Some("context_overflow"));
+        let raw: serde_json::Value =
+            serde_json::from_str(result.raw_usage_json.as_deref().expect("audit usage JSON"))
+                .unwrap();
+        assert!(raw.get("result").is_none());
+        assert_eq!(raw["provider_error"]["status"], 400);
+        assert_eq!(raw["provider_error"]["request_id"], "upstream-123");
+        let error = result.provider_error.expect("structured provider error");
+        assert_eq!(error.status, Some(400));
+        assert_eq!(error.code.as_deref(), Some("InvalidParameter"));
+        assert_eq!(error.request_id.as_deref(), Some("upstream-123"));
+    }
+
+    #[test]
+    fn claude_api_error_text_fallback_and_generic_error() {
+        let result = parse_claude_json("API Error: 503 service unavailable", 0);
+        assert!(!result.success);
+        assert_eq!(
+            result.provider_error.as_ref().map(|error| error.status),
+            Some(Some(503))
+        );
+        assert_eq!(result.error_kind.as_deref(), Some("provider_api_error"));
+
+        let structured = serde_json::json!({
+            "type": "result",
+            "subtype": "error_during_execution",
+            "is_error": true,
+            "error": {"code": "ServiceUnavailable", "message": "try again"},
+            "request_id": "req-generic",
+            "result": "",
+            "usage": {}
+        });
+        let result = parse_claude_result_value(&structured, 0);
+        let error = result.provider_error.expect("generic provider error");
+        assert_eq!(error.kind, "provider_api_error");
+        assert_eq!(error.code.as_deref(), Some("ServiceUnavailable"));
+        assert_eq!(error.request_id.as_deref(), Some("req-generic"));
+    }
+
+    #[test]
+    fn claude_audit_usage_excludes_response_and_permission_details() {
+        let value = serde_json::json!({
+            "type": "result",
+            "subtype": "success",
+            "result": "sensitive model response",
+            "permission_denials": [{"tool": "Read", "path": "/secret/path"}],
+            "session_id": "session-1",
+            "usage": {
+                "input_tokens": 3,
+                "output_tokens": 4,
+                "iterations": [{"prompt": "secret iteration prompt"}],
+                "provider_extension": {"secret": "opaque usage data"}
+            },
+            "modelUsage": {"model": {
+                "inputTokens": 3,
+                "outputTokens": 4,
+                "debug": {"prompt": "secret model debug data"}
+            }},
+            "total_cost_usd": 0.25
+        });
+
+        let result = parse_claude_result_value(&value, 0);
+        assert_eq!(result.text.as_deref(), Some("sensitive model response"));
+        let raw: serde_json::Value =
+            serde_json::from_str(result.raw_usage_json.as_deref().unwrap()).unwrap();
+        assert!(raw.get("result").is_none());
+        assert!(raw.get("permission_denials").is_none());
+        assert!(raw["usage"].get("iterations").is_none());
+        assert!(raw["usage"].get("provider_extension").is_none());
+        assert!(raw["modelUsage"]["model"].get("debug").is_none());
+        assert!(!raw.to_string().contains("secret"));
+        assert_eq!(raw["usage"]["input_tokens"], 3);
+        assert_eq!(raw["modelUsage"]["model"]["outputTokens"], 4);
+    }
+
+    #[test]
+    fn persistent_claude_usage_is_per_turn_delta() {
+        let first = serde_json::json!({
+            "result": "first",
+            "usage": {
+                "input_tokens": 100,
+                "output_tokens": 20,
+                "cache_creation_input_tokens": 10,
+                "cache_read_input_tokens": 40
+            },
+            "modelUsage": {"model": {
+                "inputTokens": 100,
+                "outputTokens": 20,
+                "cacheCreationInputTokens": 10,
+                "cacheReadInputTokens": 40,
+                "costUSD": 1.5
+            }},
+            "total_cost_usd": 1.5
+        });
+        let mut baseline = None;
+        let mut first_result = parse_claude_result_value(&first, 0);
+        normalize_claude_pool_usage(&mut first_result, &mut baseline);
+        assert_eq!(first_result.tokens_prompt, Some(100));
+        assert_eq!(first_result.cost_usd, Some(1.5));
+
+        let second = serde_json::json!({
+            "result": "second",
+            "usage": {
+                "input_tokens": 60,
+                "output_tokens": 12,
+                "cache_creation_input_tokens": 4,
+                "cache_read_input_tokens": 35
+            },
+            "modelUsage": {"model": {
+                "inputTokens": 160,
+                "outputTokens": 32,
+                "cacheCreationInputTokens": 14,
+                "cacheReadInputTokens": 75,
+                "costUSD": 2.1
+            }},
+            "total_cost_usd": 2.1
+        });
+        let mut second_result = parse_claude_result_value(&second, 0);
+        normalize_claude_pool_usage(&mut second_result, &mut baseline);
+        assert_eq!(second_result.tokens_prompt, Some(60));
+        assert_eq!(second_result.tokens_completion, Some(12));
+        assert_eq!(second_result.cache_creation_input_tokens, Some(4));
+        assert_eq!(second_result.cache_read_input_tokens, Some(35));
+        assert!((second_result.cost_usd.unwrap() - 0.6).abs() < 1e-9);
+
+        let repeated_error = serde_json::json!({
+            "api_error_status": 400,
+            "result": "API Error: 400 event:error\ndata:{\"code\":\"InvalidParameter\",\"message\":\"Range of input length should be [1, 983616]\"}",
+            "usage": {"input_tokens": 0, "output_tokens": 0},
+            "modelUsage": {"model": {
+                "inputTokens": 160,
+                "outputTokens": 32,
+                "cacheCreationInputTokens": 14,
+                "cacheReadInputTokens": 75,
+                "costUSD": 2.1
+            }},
+            "total_cost_usd": 2.1
+        });
+        let mut error_result = parse_claude_result_value(&repeated_error, 0);
+        normalize_claude_pool_usage(&mut error_result, &mut baseline);
+        assert_eq!(error_result.total_tokens, Some(0));
+        assert_eq!(error_result.cost_usd, Some(0.0));
+
+        let after_error = serde_json::json!({
+            "result": "after",
+            "usage": {
+                "input_tokens": 30,
+                "output_tokens": 8,
+                "cache_creation_input_tokens": 1,
+                "cache_read_input_tokens": 15
+            },
+            "modelUsage": {"model": {
+                "inputTokens": 190,
+                "outputTokens": 40,
+                "cacheCreationInputTokens": 15,
+                "cacheReadInputTokens": 90,
+                "costUSD": 2.5
+            }},
+            "total_cost_usd": 2.5
+        });
+        let mut after_result = parse_claude_result_value(&after_error, 0);
+        normalize_claude_pool_usage(&mut after_result, &mut baseline);
+        assert_eq!(after_result.tokens_prompt, Some(30));
+        assert_eq!(after_result.tokens_completion, Some(8));
+        assert!((after_result.cost_usd.unwrap() - 0.4).abs() < 1e-9);
+    }
+
+    #[test]
+    fn persistent_claude_counter_rollback_starts_new_baseline() {
+        let mut baseline = Some(ClaudeUsageSnapshot {
+            tokens_prompt: Some(500),
+            tokens_completion: Some(100),
+            cache_creation_input_tokens: Some(50),
+            cache_read_input_tokens: Some(200),
+            cost_usd: Some(5.0),
+        });
+        let restarted = serde_json::json!({
+            "result": "fresh process",
+            "modelUsage": {"claude": {
+                "inputTokens": 600,
+                "outputTokens": 5,
+                "cacheCreationInputTokens": 60,
+                "cacheReadInputTokens": 7,
+                "costUSD": 5.2
+            }},
+            "usage": {
+                "input_tokens": 10,
+                "output_tokens": 5,
+                "cache_creation_input_tokens": 2,
+                "cache_read_input_tokens": 7
+            },
+            "total_cost_usd": 5.2
+        });
+        let mut result = parse_claude_result_value(&restarted, 0);
+        normalize_claude_pool_usage(&mut result, &mut baseline);
+        assert_eq!(result.tokens_prompt, Some(100));
+        assert_eq!(result.tokens_completion, Some(5));
+        assert_eq!(result.cache_creation_input_tokens, Some(10));
+        assert!((result.cost_usd.unwrap() - 0.2).abs() < 1e-9);
+        assert_eq!(baseline.unwrap().tokens_prompt, Some(600));
     }
 }

@@ -3,7 +3,7 @@
 //! Normal messages are sent via stdin to an existing process.
 //! Special operations (model change, rewind, clear) kill and respawn.
 
-use crate::cli_bridge::{self, CliProfile, CliProgress};
+use crate::cli_bridge::{self, ClaudeUsageSnapshot, CliProfile, CliProgress, CliResult};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
@@ -28,6 +28,11 @@ struct ProcessHandle {
     session_id: Arc<Mutex<Option<String>>>,
     /// Last `result` event JSON — reader stores it here for the runner to extract stats.
     last_result: Arc<Mutex<Option<serde_json::Value>>>,
+    /// Output from a Claude local slash command emitted before the result frame.
+    last_local_command_output: Arc<Mutex<Option<String>>>,
+    /// Claude persistent mode reports cumulative usage for the process.
+    /// Keep the previous snapshot so each gateway turn receives only its delta.
+    last_usage_snapshot: Arc<Mutex<Option<ClaudeUsageSnapshot>>>,
     /// Current turn generation — incremented on each begin_turn.
     generation: Arc<std::sync::atomic::AtomicU64>,
     /// Stderr hint: drainer stores notable errors (e.g. stale session) for the runner to check.
@@ -93,6 +98,7 @@ impl CliProcessPool {
 
         // Clear stale result from previous turn (e.g. after interrupt)
         *handle.last_result.lock().await = None;
+        *handle.last_local_command_output.lock().await = None;
 
         // Increment generation and register new progress channel
         let turn_gen = handle
@@ -144,9 +150,22 @@ impl CliProcessPool {
         self.processes.get(key)?.session_id.lock().await.clone()
     }
 
-    /// Take the last `result` JSON from the process (consumed once per turn).
-    pub async fn take_last_result(&self, key: &str) -> Option<serde_json::Value> {
-        self.processes.get(key)?.last_result.lock().await.take()
+    /// Take and normalize the last `result` from the process (consumed once per turn).
+    pub async fn take_last_result(&self, key: &str) -> Option<CliResult> {
+        let handle = self.processes.get(key)?;
+        let value = handle.last_result.lock().await.take()?;
+        let mut result = cli_bridge::parse_claude_result_value(&value, 0);
+        let local_command_output = handle.last_local_command_output.lock().await.take();
+        cli_bridge::apply_claude_local_command_output(&mut result, local_command_output);
+        // Preserve the existing persistent-mode interpretation: a single
+        // model turn is not a tool call, while values above one indicate the
+        // extra agent turns previously shown in the footer.
+        if result.tool_calls_count == Some(1) {
+            result.tool_calls_count = None;
+        }
+        let mut previous = handle.last_usage_snapshot.lock().await;
+        cli_bridge::normalize_claude_pool_usage(&mut result, &mut previous);
+        Some(result)
     }
 
     /// Take a stderr hint (e.g. "No conversation found") stored by the drainer.
@@ -213,6 +232,9 @@ impl CliProcessPool {
             Arc::new(Mutex::new((0, None)));
         let session_id: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
         let last_result: Arc<Mutex<Option<serde_json::Value>>> = Arc::new(Mutex::new(None));
+        let last_local_command_output: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let last_usage_snapshot: Arc<Mutex<Option<ClaudeUsageSnapshot>>> =
+            Arc::new(Mutex::new(None));
         let generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let stderr_hint: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
 
@@ -232,6 +254,7 @@ impl CliProcessPool {
             progress_slot.clone(),
             session_id.clone(),
             last_result.clone(),
+            last_local_command_output.clone(),
             generation.clone(),
             cancel.clone(),
         ));
@@ -258,6 +281,8 @@ impl CliProcessPool {
             cancel,
             session_id,
             last_result,
+            last_local_command_output,
+            last_usage_snapshot,
             generation,
             stderr_hint,
         };
@@ -362,6 +387,7 @@ async fn stdout_reader_task(
     progress_slot: Arc<Mutex<(u64, Option<mpsc::Sender<CliProgress>>)>>,
     session_id: Arc<Mutex<Option<String>>>,
     last_result: Arc<Mutex<Option<serde_json::Value>>>,
+    last_local_command_output: Arc<Mutex<Option<String>>>,
     generation: Arc<std::sync::atomic::AtomicU64>,
     cancel: CancellationToken,
 ) {
@@ -383,20 +409,24 @@ async fn stdout_reader_task(
                         // Track latest generation before processing
                         current_gen = generation.load(std::sync::atomic::Ordering::Relaxed);
 
-                        // Check for result event (turn complete)
-                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed)
-                            && v["type"].as_str() == Some("result")
-                        {
-                            if let Some(sid) = v["session_id"].as_str() {
-                                *session_id.lock().await = Some(sid.to_string());
+                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed) {
+                            // Check for result event (turn complete)
+                            if v["type"].as_str() == Some("result") {
+                                if let Some(sid) = v["session_id"].as_str() {
+                                    *session_id.lock().await = Some(sid.to_string());
+                                }
+                                *last_result.lock().await = Some(v);
+                                // Only clear slot if generation hasn't advanced
+                                let mut slot = progress_slot.lock().await;
+                                if slot.0 == current_gen {
+                                    slot.1 = None;
+                                }
+                                continue;
                             }
-                            *last_result.lock().await = Some(v);
-                            // Only clear slot if generation hasn't advanced
-                            let mut slot = progress_slot.lock().await;
-                            if slot.0 == current_gen {
-                                slot.1 = None;
+                            if let Some(output) = cli_bridge::claude_local_command_output(&v) {
+                                *last_local_command_output.lock().await = Some(output);
+                                continue;
                             }
-                            continue;
                         }
 
                         // Parse as CliProgress and forward to current turn

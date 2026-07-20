@@ -12,7 +12,7 @@
 
 use super::{
     CronJobRecord, CronJobSpec, DueJob, GatewayStore, PlatformCredential, SessionRecord,
-    SkillRecord, StoreError, UsageRecord, UsageSummary, next_cron_run_str,
+    SkillRecord, StoreError, UsageRecord, UsageStatus, UsageSummary, next_cron_run_str,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -101,6 +101,10 @@ struct UsageEntry {
     max_output_tokens: Option<u64>,
     cost_usd: Option<f64>,
     raw_usage_json: Option<String>,
+    #[serde(default)]
+    status: UsageStatus,
+    #[serde(default)]
+    failure_kind: Option<String>,
     tool_calls: u32,
     elapsed_ms: u64,
     created_at: String,
@@ -351,33 +355,48 @@ impl GatewayStore for FileGatewayStore {
         &self,
         platform: &str,
         chat_id: &str,
+        cli_profile: &str,
         target_session_id: &str,
     ) -> Result<bool, StoreError> {
         let mut sessions = self.sessions.write().await;
-        let mut found = false;
-        for entries in sessions.values_mut() {
-            if entries
-                .iter()
-                .any(|e| e.platform == platform && e.chat_id == chat_id)
-            {
-                for e in entries.iter_mut() {
-                    if e.platform == platform && e.chat_id == chat_id {
-                        if e.session_id == target_session_id {
-                            e.is_current = true;
-                            e.last_active = now_str();
-                            found = true;
-                        } else {
-                            e.is_current = false;
-                        }
-                    }
+        let key = session_key(platform, chat_id, cli_profile);
+        if let Some(entries) = sessions.get_mut(&key) {
+            if !entries.iter().any(|e| e.session_id == target_session_id) {
+                return Ok(false);
+            }
+            for e in entries.iter_mut() {
+                if e.session_id == target_session_id {
+                    e.is_current = true;
+                    e.last_active = now_str();
+                } else {
+                    e.is_current = false;
                 }
             }
+        } else {
+            return Ok(false);
         }
         drop(sessions);
-        if found {
-            self.flush_sessions().await?;
-        }
-        Ok(found)
+        self.flush_sessions().await?;
+        Ok(true)
+    }
+
+    async fn find_sessions_by_prefix(
+        &self,
+        platform: &str,
+        chat_id: &str,
+        cli_profile: &str,
+        prefix: &str,
+    ) -> Result<Vec<String>, StoreError> {
+        let key = session_key(platform, chat_id, cli_profile);
+        let sessions = self.sessions.read().await;
+        Ok(sessions
+            .get(&key)
+            .into_iter()
+            .flatten()
+            .filter(|entry| entry.session_id.starts_with(prefix))
+            .take(2)
+            .map(|entry| entry.session_id.clone())
+            .collect())
     }
 
     async fn reset_session(
@@ -593,6 +612,8 @@ impl GatewayStore for FileGatewayStore {
             max_output_tokens: record.max_output_tokens,
             cost_usd: record.cost_usd,
             raw_usage_json: record.raw_usage_json.clone(),
+            status: record.status,
+            failure_kind: record.failure_kind.clone(),
             tool_calls: record.tool_calls,
             elapsed_ms: record.elapsed_ms,
             created_at: now_str(),
@@ -657,6 +678,7 @@ impl GatewayStore for FileGatewayStore {
         &self,
         platform: &str,
         user_id: &str,
+        cli_profile: &str,
         session_id: &str,
     ) -> Result<UsageSummary, StoreError> {
         let dir = self.base_dir.join("usage");
@@ -668,8 +690,14 @@ impl GatewayStore for FileGatewayStore {
         while let Ok(Some(entry)) = entries.next_entry().await {
             let path = entry.path();
             if path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
-                let day =
-                    load_usage_summary_for_session(&path, platform, user_id, session_id).await?;
+                let day = load_usage_summary_for_session(
+                    &path,
+                    platform,
+                    user_id,
+                    cli_profile,
+                    session_id,
+                )
+                .await?;
                 total.messages += day.messages;
                 total.tokens_prompt += day.tokens_prompt;
                 total.tokens_completion += day.tokens_completion;
@@ -837,22 +865,24 @@ async fn load_usage_summary(
     platform: &str,
     user_id: &str,
 ) -> Result<UsageSummary, StoreError> {
-    load_usage_summary_filtered(path, platform, user_id, None).await
+    load_usage_summary_filtered(path, platform, user_id, None, None).await
 }
 
 async fn load_usage_summary_for_session(
     path: &Path,
     platform: &str,
     user_id: &str,
+    cli_profile: &str,
     session_id: &str,
 ) -> Result<UsageSummary, StoreError> {
-    load_usage_summary_filtered(path, platform, user_id, Some(session_id)).await
+    load_usage_summary_filtered(path, platform, user_id, Some(cli_profile), Some(session_id)).await
 }
 
 async fn load_usage_summary_filtered(
     path: &Path,
     platform: &str,
     user_id: &str,
+    cli_profile: Option<&str>,
     session_id: Option<&str>,
 ) -> Result<UsageSummary, StoreError> {
     let mut summary = UsageSummary::default();
@@ -868,9 +898,12 @@ async fn load_usage_summary_filtered(
         if let Ok(entry) = serde_json::from_str::<UsageEntry>(line)
             && entry.platform == platform
             && entry.user_id == user_id
+            && cli_profile.is_none_or(|profile| entry.cli_profile == profile)
             && session_id.is_none_or(|sid| entry.session_id.as_deref() == Some(sid))
         {
-            summary.messages += 1;
+            if entry.status.counts_as_message() {
+                summary.messages += 1;
+            }
             summary.tokens_prompt += entry.tokens_prompt;
             summary.tokens_completion += entry.tokens_completion;
             summary.cached_input_tokens += entry.cached_input_tokens;
@@ -1123,6 +1156,8 @@ mod tests {
             max_output_tokens: None,
             cost_usd: None,
             raw_usage_json: None,
+            status: UsageStatus::Success,
+            failure_kind: None,
             tool_calls: 2,
             elapsed_ms: 3000,
         };

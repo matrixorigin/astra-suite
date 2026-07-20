@@ -250,7 +250,7 @@ pub async fn set_current_session_for_cli(
     astra_session_id: &str,
     cli_profile: &str,
 ) -> Result<(), sqlx::Error> {
-    // Mark old sessions for this CLI as not current
+    let mut tx = pool.begin().await?;
     sqlx::query(
         "UPDATE gw_sessions SET is_current = FALSE
          WHERE platform = ? AND chat_id = ? AND cli_profile = ? AND is_current = TRUE",
@@ -258,10 +258,9 @@ pub async fn set_current_session_for_cli(
     .bind(platform)
     .bind(chat_id)
     .bind(cli_profile)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
 
-    // Check if this session_id already exists for this CLI
     let existing: Option<(i64,)> = sqlx::query_as(
         "SELECT id FROM gw_sessions
          WHERE platform = ? AND chat_id = ? AND cli_profile = ? AND astra_session_id = ?",
@@ -270,17 +269,15 @@ pub async fn set_current_session_for_cli(
     .bind(chat_id)
     .bind(cli_profile)
     .bind(astra_session_id)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await?;
 
     if let Some((id,)) = existing {
-        // Reactivate existing session
         sqlx::query("UPDATE gw_sessions SET is_current = TRUE, last_active = NOW(6) WHERE id = ?")
             .bind(id)
-            .execute(pool)
+            .execute(&mut *tx)
             .await?;
     } else {
-        // Insert new
         sqlx::query(
             "INSERT INTO gw_sessions (platform, chat_id, user_id, cli_profile, astra_session_id, is_current)
              VALUES (?, ?, ?, ?, ?, TRUE)",
@@ -290,9 +287,10 @@ pub async fn set_current_session_for_cli(
         .bind(user_id)
         .bind(cli_profile)
         .bind(astra_session_id)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
     }
+    tx.commit().await?;
     Ok(())
 }
 
@@ -356,44 +354,48 @@ pub async fn switch_session(
     pool: &MySqlPool,
     platform: &str,
     chat_id: &str,
+    cli_profile: &str,
     target_session_id: &str,
 ) -> Result<bool, sqlx::Error> {
-    // Check target exists
+    let mut tx = pool.begin().await?;
     let exists: Option<(i64,)> = sqlx::query_as(
         "SELECT id FROM gw_sessions
-         WHERE platform = ? AND chat_id = ? AND astra_session_id = ?",
+         WHERE platform = ? AND chat_id = ? AND cli_profile = ? AND astra_session_id = ?",
     )
     .bind(platform)
     .bind(chat_id)
+    .bind(cli_profile)
     .bind(target_session_id)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await?;
 
     if exists.is_none() {
+        tx.rollback().await?;
         return Ok(false);
     }
 
-    // Clear current
     sqlx::query(
         "UPDATE gw_sessions SET is_current = FALSE
-         WHERE platform = ? AND chat_id = ?",
+         WHERE platform = ? AND chat_id = ? AND cli_profile = ?",
     )
     .bind(platform)
     .bind(chat_id)
-    .execute(pool)
+    .bind(cli_profile)
+    .execute(&mut *tx)
     .await?;
 
-    // Set target as current
     sqlx::query(
         "UPDATE gw_sessions SET is_current = TRUE, last_active = NOW(6)
-         WHERE platform = ? AND chat_id = ? AND astra_session_id = ?",
+         WHERE platform = ? AND chat_id = ? AND cli_profile = ? AND astra_session_id = ?",
     )
     .bind(platform)
     .bind(chat_id)
+    .bind(cli_profile)
     .bind(target_session_id)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
 
+    tx.commit().await?;
     Ok(true)
 }
 

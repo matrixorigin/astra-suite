@@ -182,6 +182,188 @@ fn create_fake_cli_script_with_ids(
     dir
 }
 
+fn create_fake_claude_stream_script(result: &serde_json::Value) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let script_path = dir.path().join("fake_cli.sh");
+    let content = format!(
+        "#!/bin/sh\ncase \"$*\" in *--version*) echo '2.1.0'; exit 0;; esac\nwhile IFS= read -r line; do\n  printf '%s\\n' '{}'\ndone\n",
+        result.to_string().replace('\'', "'\\''")
+    );
+    std::fs::write(&script_path, content).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    dir
+}
+
+fn create_local_command_claude_stream_script(output: &str) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let script_path = dir.path().join("fake_cli.sh");
+    let local_command = serde_json::json!({
+        "type": "system",
+        "subtype": "local_command",
+        "content": format!("<local-command-stdout>{output}</local-command-stdout>")
+    });
+    let result = serde_json::json!({
+        "type": "result",
+        "subtype": "success",
+        "is_error": false,
+        "session_id": "compact-session",
+        "result": "",
+        "usage": {"input_tokens": 0, "output_tokens": 0},
+        "modelUsage": {},
+        "total_cost_usd": 0.0
+    });
+    let content = format!(
+        "#!/bin/sh\ncase \"$*\" in *--version*) echo '2.1.0'; exit 0;; esac\nwhile IFS= read -r line; do\n  printf '%s\\n' '{}'\n  printf '%s\\n' '{}'\ndone\n",
+        local_command.to_string().replace('\'', "'\\''"),
+        result.to_string().replace('\'', "'\\''")
+    );
+    std::fs::write(&script_path, content).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    dir
+}
+
+fn create_one_local_command_then_empty_claude_script() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let script_path = dir.path().join("fake_cli.sh");
+    let local_command = serde_json::json!({
+        "type": "system",
+        "subtype": "local_command",
+        "content": "<local-command-stdout>Not enough messages to compact.</local-command-stdout>"
+    });
+    let result = serde_json::json!({
+        "type": "result",
+        "subtype": "success",
+        "is_error": false,
+        "session_id": "compact-two-turn-session",
+        "result": "",
+        "usage": {"input_tokens": 0, "output_tokens": 0},
+        "modelUsage": {},
+        "total_cost_usd": 0.0
+    });
+    let content = format!(
+        "#!/bin/sh\ncase \"$*\" in *--version*) echo '2.1.0'; exit 0;; esac\nturn=0\nwhile IFS= read -r line; do\n  turn=$((turn + 1))\n  if [ \"$turn\" -eq 1 ]; then printf '%s\\n' '{}'; fi\n  printf '%s\\n' '{}'\ndone\n",
+        local_command.to_string().replace('\'', "'\\''"),
+        result.to_string().replace('\'', "'\\''")
+    );
+    std::fs::write(&script_path, content).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    dir
+}
+
+fn create_tracking_claude_stream_script() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let script_path = dir.path().join("fake_cli.sh");
+    let starts_path = dir.path().join("starts.log");
+    let result = serde_json::json!({
+        "type": "result",
+        "subtype": "success",
+        "is_error": false,
+        "session_id": "__SESSION_ID__",
+        "result": "ok",
+        "usage": {"input_tokens": 1, "output_tokens": 1},
+        "modelUsage": {"test": {
+            "inputTokens": 1,
+            "outputTokens": 1,
+            "cacheCreationInputTokens": 0,
+            "cacheReadInputTokens": 0,
+            "costUSD": 0.01,
+            "contextWindow": 200000,
+            "maxOutputTokens": 32000
+        }},
+        "total_cost_usd": 0.01
+    });
+    let content = format!(
+        "#!/bin/sh\n\
+         case \"$*\" in *--version*) echo '2.1.0'; exit 0;; esac\n\
+         printf '%s\\n' 'PROCESS_START' >> '{}'\n\
+         printf '%s\\n' \"$*\" >> '{}'\n\
+         sid='new-session'\n\
+         previous=''\n\
+         for arg in \"$@\"; do\n\
+           if [ \"$previous\" = '--resume' ]; then sid=\"$arg\"; break; fi\n\
+           previous=\"$arg\"\n\
+         done\n\
+         while IFS= read -r line; do\n\
+           printf '%s\\n' '{}' | sed \"s/__SESSION_ID__/$sid/g\"\n\
+         done\n",
+        starts_path.display(),
+        starts_path.display(),
+        result.to_string().replace('\'', "'\\''")
+    );
+    std::fs::write(&script_path, content).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    dir
+}
+
+fn create_delayed_session_cli_script() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let script_path = dir.path().join("fake_cli.sh");
+    let started_path = dir.path().join("started");
+    let result = serde_json::json!({
+        "exit_code": 0,
+        "success": true,
+        "session_id": "late-session",
+        "text": "late result",
+        "prompt_tokens": 4,
+        "completion_tokens": 1
+    });
+    let content = format!(
+        "#!/bin/sh\n\
+         case \"$*\" in *--version*) echo 'test 1.0'; exit 0;; esac\n\
+         : > '{}'\n\
+         sleep 1\n\
+         printf '%s\\n' '{}'\n",
+        started_path.display(),
+        result.to_string().replace('\'', "'\\''")
+    );
+    std::fs::write(&script_path, content).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    dir
+}
+
+fn create_delayed_stale_claude_stream_script() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let script_path = dir.path().join("fake_cli.sh");
+    let started_path = dir.path().join("started");
+    let content = format!(
+        "#!/bin/sh\n\
+         case \"$*\" in *--version*) echo '2.1.0'; exit 0;; esac\n\
+         IFS= read -r line\n\
+         : > '{}'\n\
+         sleep 1\n\
+         echo 'No conversation found with session ID' >&2\n\
+         exit 1\n",
+        started_path.display()
+    );
+    std::fs::write(&script_path, content).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    dir
+}
+
 /// Helper to get the script path from a tempdir created by create_fake_cli_script.
 fn script_path(dir: &tempfile::TempDir) -> String {
     dir.path().join("fake_cli.sh").to_string_lossy().to_string()
@@ -205,7 +387,65 @@ fn create_failing_cli_script(exit_code: i32, stderr_msg: &str) -> tempfile::Temp
 fn create_hanging_cli_script() -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("fake_cli.sh");
-    std::fs::write(&path, "#!/bin/sh\nsleep 5").unwrap();
+    std::fs::write(
+        &path,
+        "#!/bin/sh\ncase \"$*\" in *--version*) echo 'test 1.0'; exit 0;; esac\nsleep 5",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    dir
+}
+
+/// Create a persistent Claude script that exits without a result frame.
+fn create_no_result_claude_stream_script() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("fake_cli.sh");
+    std::fs::write(
+        &path,
+        "#!/bin/sh\ncase \"$*\" in *--version*) echo '2.1.0'; exit 0;; esac\nIFS= read -r line\nexit 0",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    dir
+}
+
+/// Create a persistent Claude script that reports partial usage after an interrupt.
+fn create_interrupt_result_claude_stream_script() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("fake_cli.sh");
+    let result = serde_json::json!({
+        "type": "result",
+        "subtype": "success",
+        "is_error": false,
+        "session_id": "cancelled-session",
+        "result": "interrupted",
+        "usage": {"input_tokens": 10, "output_tokens": 3},
+        "modelUsage": {"test": {
+            "inputTokens": 10,
+            "outputTokens": 3,
+            "cacheCreationInputTokens": 0,
+            "cacheReadInputTokens": 0,
+            "costUSD": 0.05
+        }},
+        "total_cost_usd": 0.05
+    });
+    let content = format!(
+        "#!/bin/sh\n\
+         case \"$*\" in *--version*) echo '2.1.0'; exit 0;; esac\n\
+         while IFS= read -r line; do\n\
+           case \"$line\" in *'\"subtype\":\"interrupt\"'*) printf '%s\\n' '{}'; exit 0;; esac\n\
+         done\n",
+        result.to_string().replace('\'', "'\\''")
+    );
+    std::fs::write(&path, content).unwrap();
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -529,6 +769,219 @@ async fn session_idle_reset_triggers_new_session() {
 }
 
 #[tokio::test]
+async fn session_auto_reset_restarts_persistent_claude() {
+    use astra_gateway::session_policy::ResetPolicy;
+
+    let fake_cli = create_tracking_claude_stream_script();
+    let mut config = TestGateway::build_config(&script_path(&fake_cli));
+    config.cli = CliProfile::Claude {
+        bin: script_path(&fake_cli),
+        model: Some("test-claude".into()),
+        stream_json: true,
+        extra_args: vec![],
+        env: Default::default(),
+        env_file: None,
+    };
+    config.session_reset = ResetPolicy::Idle { hours: 0 };
+    config.cli_timeout_secs = 5;
+    let gw = TestGateway::with_config(config).await;
+    let outputs = Arc::new(Mutex::new(Vec::new()));
+    let adapter = MockPlatformAdapter::new(mpsc::channel(1).1, outputs);
+
+    assert!(
+        gw.runner
+            .handle_message(&msg("chat-auto-reset", "user-1", "first"), &adapter)
+            .await
+            .is_some()
+    );
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    assert!(
+        gw.runner
+            .handle_message(&msg("chat-auto-reset", "user-1", "second"), &adapter)
+            .await
+            .is_some()
+    );
+
+    let starts = std::fs::read_to_string(fake_cli.path().join("starts.log")).unwrap();
+    assert_eq!(
+        starts
+            .lines()
+            .filter(|line| *line == "PROCESS_START")
+            .count(),
+        2,
+        "automatic session reset must replace the persistent process: {starts}"
+    );
+}
+
+#[tokio::test]
+async fn new_during_running_turn_is_not_overwritten_by_late_session_result() {
+    let fake_cli = create_delayed_session_cli_script();
+    let config = TestGateway::build_config(&script_path(&fake_cli));
+    let gw = TestGateway::with_config(config).await;
+    let outputs = Arc::new(Mutex::new(Vec::new()));
+    let adapter = Arc::new(MockPlatformAdapter::new(mpsc::channel(1).1, outputs));
+    let cli_name = gw.runner.cli_profile().name().to_string();
+
+    let runner = gw.runner.clone();
+    let task_adapter = adapter.clone();
+    let running_turn = tokio::spawn(async move {
+        runner
+            .handle_message(
+                &msg("chat-session-race", "user-1", "slow turn"),
+                task_adapter.as_ref(),
+            )
+            .await
+    });
+
+    let started_path = fake_cli.path().join("started");
+    for _ in 0..100 {
+        if started_path.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(started_path.exists(), "slow CLI turn did not start");
+
+    let reset = gw
+        .runner
+        .handle_fast(&msg("chat-session-race", "user-1", "/new"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        reset.starts_with("🔄 "),
+        "unexpected /new response: {reset}"
+    );
+
+    assert!(running_turn.await.unwrap().is_some());
+    let current = gw
+        .runner
+        .store()
+        .unwrap()
+        .get_current_session("mock", "chat-session-race", &cli_name)
+        .await
+        .unwrap();
+    assert_eq!(
+        current, None,
+        "late result must not reactivate the session cleared by /new"
+    );
+}
+
+#[tokio::test]
+async fn stale_recovery_does_not_clear_session_switched_during_running_turn() {
+    let fake_cli = create_delayed_stale_claude_stream_script();
+    let mut config = TestGateway::build_config(&script_path(&fake_cli));
+    config.cli = CliProfile::Claude {
+        bin: script_path(&fake_cli),
+        model: Some("test-claude".into()),
+        stream_json: true,
+        extra_args: vec![],
+        env: Default::default(),
+        env_file: None,
+    };
+    config.cli_timeout_secs = 5;
+    let gw = TestGateway::with_config(config).await;
+    let store = gw.runner.store().unwrap();
+    store
+        .set_current_session("mock", "chat-stale-race", "user-1", "old-session", "claude")
+        .await
+        .unwrap();
+    store
+        .set_current_session(
+            "mock",
+            "chat-stale-race",
+            "user-1",
+            "target-session",
+            "claude",
+        )
+        .await
+        .unwrap();
+    store
+        .switch_session("mock", "chat-stale-race", "claude", "old-session")
+        .await
+        .unwrap();
+
+    let outputs = Arc::new(Mutex::new(Vec::new()));
+    let adapter = Arc::new(MockPlatformAdapter::new(mpsc::channel(1).1, outputs));
+    let runner = gw.runner.clone();
+    let task_adapter = adapter.clone();
+    let running_turn = tokio::spawn(async move {
+        runner
+            .handle_message(
+                &msg("chat-stale-race", "user-1", "slow stale turn"),
+                task_adapter.as_ref(),
+            )
+            .await
+    });
+
+    let started_path = fake_cli.path().join("started");
+    for _ in 0..100 {
+        if started_path.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(started_path.exists(), "stale CLI turn did not start");
+
+    let switched = gw
+        .runner
+        .handle_fast(&msg(
+            "chat-stale-race",
+            "user-1",
+            "/session switch target-session",
+        ))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        switched.starts_with("✅ 已切换到会话"),
+        "unexpected switch response: {switched}"
+    );
+
+    assert!(running_turn.await.unwrap().is_some());
+    let current = store
+        .get_current_session("mock", "chat-stale-race", "claude")
+        .await
+        .unwrap();
+    assert_eq!(current.as_deref(), Some("target-session"));
+}
+
+#[tokio::test]
+async fn persistent_claude_pool_isolated_by_platform_for_same_chat_id() {
+    let fake_cli = create_tracking_claude_stream_script();
+    let mut config = TestGateway::build_config(&script_path(&fake_cli));
+    config.cli = CliProfile::Claude {
+        bin: script_path(&fake_cli),
+        model: Some("test-claude".into()),
+        stream_json: true,
+        extra_args: vec![],
+        env: Default::default(),
+        env_file: None,
+    };
+    config.cli_timeout_secs = 5;
+    let gw = TestGateway::with_config(config).await;
+    let outputs = Arc::new(Mutex::new(Vec::new()));
+    let adapter = MockPlatformAdapter::new(mpsc::channel(1).1, outputs);
+
+    let mut first = msg("shared-chat", "user-1", "first platform");
+    first.platform = "mock-a";
+    let mut second = msg("shared-chat", "user-1", "second platform");
+    second.platform = "mock-b";
+    assert!(gw.runner.handle_message(&first, &adapter).await.is_some());
+    assert!(gw.runner.handle_message(&second, &adapter).await.is_some());
+
+    let starts = std::fs::read_to_string(fake_cli.path().join("starts.log")).unwrap();
+    assert_eq!(
+        starts
+            .lines()
+            .filter(|line| *line == "PROCESS_START")
+            .count(),
+        2,
+        "same chat ID on different platforms must not share a process: {starts}"
+    );
+}
+
+#[tokio::test]
 async fn session_per_user_in_group() {
     let gw = TestGateway::new().await;
     let outputs = Arc::new(Mutex::new(Vec::new()));
@@ -572,12 +1025,14 @@ async fn session_switch_restores_previous() {
     let cli_name = gw.runner.cli_profile().name();
 
     // Manually create two sessions
+    let first = "ac73779a-60b1-4973-a582-9b73350e3e8b";
+    let second = "2e8c8b02-5c96-45e8-85b3-b74f0bc2f101";
     store
-        .set_current_session("mock", "chat-sw", "user-1", "session-aaa", cli_name)
+        .set_current_session("mock", "chat-sw", "user-1", first, cli_name)
         .await
         .unwrap();
     store
-        .set_current_session("mock", "chat-sw", "user-1", "session-bbb", cli_name)
+        .set_current_session("mock", "chat-sw", "user-1", second, cli_name)
         .await
         .unwrap();
 
@@ -586,10 +1041,14 @@ async fn session_switch_restores_previous() {
         .get_current_session("mock", "chat-sw", cli_name)
         .await
         .unwrap();
-    assert_eq!(current.as_deref(), Some("session-bbb"));
+    assert_eq!(current.as_deref(), Some(second));
 
-    // Switch to aaa via /session switch
-    let switch_msg = msg("chat-sw", "user-1", "/session switch session-aaa");
+    // Switch via a copied short prefix wrapped in Markdown and U+2060.
+    let switch_msg = msg(
+        "chat-sw",
+        "user-1",
+        "/session switch \u{2060}`ac73779a`\u{2060}",
+    );
     let result = gw.runner.handle_fast(&switch_msg).await;
     assert!(result.is_ok());
     let text = result.unwrap().unwrap();
@@ -600,7 +1059,100 @@ async fn session_switch_restores_previous() {
         .get_current_session("mock", "chat-sw", cli_name)
         .await
         .unwrap();
-    assert_eq!(current.as_deref(), Some("session-aaa"));
+    assert_eq!(current.as_deref(), Some(first));
+}
+
+#[tokio::test]
+async fn session_switch_restarts_persistent_claude_with_target_session() {
+    let fake_cli = create_tracking_claude_stream_script();
+    let mut config = TestGateway::build_config(&script_path(&fake_cli));
+    config.cli = CliProfile::Claude {
+        bin: script_path(&fake_cli),
+        model: Some("test-claude".into()),
+        stream_json: true,
+        extra_args: vec![],
+        env: Default::default(),
+        env_file: None,
+    };
+    config.cli_timeout_secs = 5;
+    let gw = TestGateway::with_config(config).await;
+    let store = gw.runner.store().unwrap();
+    let cli_name = gw.runner.cli_profile().name();
+    let first = "ac73779a-60b1-4973-a582-9b73350e3e8b";
+    let target = "2e8c8b02-5c96-45e8-85b3-b74f0bc2f101";
+    store
+        .set_current_session("mock", "chat-pool-switch", "user-1", target, cli_name)
+        .await
+        .unwrap();
+    store
+        .set_current_session("mock", "chat-pool-switch", "user-1", first, cli_name)
+        .await
+        .unwrap();
+
+    let outputs = Arc::new(Mutex::new(Vec::new()));
+    let adapter = MockPlatformAdapter::new(mpsc::channel(1).1, outputs);
+    let first_response = gw
+        .runner
+        .handle_message(&msg("chat-pool-switch", "user-1", "first turn"), &adapter)
+        .await;
+    assert!(first_response.is_some());
+
+    let switched = gw
+        .runner
+        .handle_fast(&msg("chat-pool-switch", "user-1", "/session   sw 2e8c8b02"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(switched.starts_with("✅ 已切换到会话"));
+
+    let second_response = gw
+        .runner
+        .handle_message(&msg("chat-pool-switch", "user-1", "second turn"), &adapter)
+        .await;
+    assert!(second_response.is_some());
+
+    let starts = std::fs::read_to_string(fake_cli.path().join("starts.log")).unwrap();
+    let starts = starts
+        .lines()
+        .filter(|line| line.starts_with("--resume "))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        starts.len(),
+        2,
+        "expected a new persistent process: {starts:?}"
+    );
+    assert!(starts[0].contains(&format!("--resume {first}")));
+    assert!(starts[1].contains(&format!("--resume {target}")));
+}
+
+#[tokio::test]
+async fn session_switch_rejects_short_and_ambiguous_prefixes() {
+    let gw = TestGateway::new().await;
+    let store = gw.runner.store().unwrap();
+    let cli_name = gw.runner.cli_profile().name();
+
+    for session_id in ["abcdefgh-one", "abcdefgh-two"] {
+        store
+            .set_current_session("mock", "chat-prefix", "user-1", session_id, cli_name)
+            .await
+            .unwrap();
+    }
+
+    let short = msg("chat-prefix", "user-1", "/session switch abcdefg");
+    let short_text = gw.runner.handle_fast(&short).await.unwrap().unwrap();
+    assert!(short_text.contains("至少需要 8"));
+
+    let ambiguous = msg("chat-prefix", "user-1", "/session switch abcdefgh");
+    let ambiguous_text = gw.runner.handle_fast(&ambiguous).await.unwrap().unwrap();
+    assert!(ambiguous_text.contains("多个会话"));
+    assert_eq!(
+        store
+            .get_current_session("mock", "chat-prefix", cli_name)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("abcdefgh-two")
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -635,6 +1187,304 @@ async fn cli_failure_returns_error_response() {
     assert!(
         text.contains("segfault") || text.contains("错误") || text.contains("⚠"),
         "should report CLI failure: {text}"
+    );
+    let usage = gw
+        .runner
+        .store()
+        .unwrap()
+        .get_usage_total("mock", "user-1")
+        .await
+        .unwrap();
+    assert_eq!(usage.messages, 1);
+    assert_eq!(usage.total_tokens, 0);
+    assert_eq!(usage.cost_usd, 0.0);
+}
+
+#[tokio::test]
+async fn cli_spawn_failure_records_zero_usage() {
+    let fake_cli = create_fake_cli_script("probe succeeds");
+    let profile = CliProfile::Custom {
+        bin: script_path(&fake_cli),
+        args_template: vec![],
+        json_output: true,
+        text_field: Some("text".into()),
+        session_id_field: Some("session_id".into()),
+    };
+    assert!(
+        astra_gateway::cli_bridge::probe_cli(&profile)
+            .await
+            .is_available()
+    );
+
+    let config = TestGateway::build_config(&script_path(&fake_cli));
+    let gw = TestGateway::with_config(config).await;
+    std::fs::remove_file(fake_cli.path().join("fake_cli.sh")).unwrap();
+
+    let outputs = Arc::new(Mutex::new(Vec::new()));
+    let adapter = MockPlatformAdapter::new(mpsc::channel(1).1, outputs);
+    let response = gw
+        .runner
+        .handle_message(&msg("chat-spawn-fail", "user-1", "hello"), &adapter)
+        .await
+        .expect("spawn failure response");
+    assert!(response.contains("错误") || response.contains("⚠"));
+
+    let usage = gw
+        .runner
+        .store()
+        .unwrap()
+        .get_usage_total("mock", "user-1")
+        .await
+        .unwrap();
+    assert_eq!(usage.messages, 0);
+    assert_eq!(usage.total_tokens, 0);
+    assert_eq!(usage.cost_usd, 0.0);
+}
+
+#[tokio::test]
+async fn cli_timeout_records_zero_usage() {
+    let hanging_cli = create_hanging_cli_script();
+    let mut config = TestGateway::build_config(&script_path(&hanging_cli));
+    config.cli_timeout_secs = 1;
+    let gw = TestGateway::with_config(config).await;
+    let outputs = Arc::new(Mutex::new(Vec::new()));
+    let adapter = MockPlatformAdapter::new(mpsc::channel(1).1, outputs);
+
+    let response = gw
+        .runner
+        .handle_message(&msg("chat-timeout", "user-1", "hello"), &adapter)
+        .await
+        .expect("timeout response");
+    assert!(response.contains("超时") || response.contains("timeout"));
+
+    let usage = gw
+        .runner
+        .store()
+        .unwrap()
+        .get_usage_total("mock", "user-1")
+        .await
+        .unwrap();
+    assert_eq!(usage.messages, 0);
+    assert_eq!(usage.total_tokens, 0);
+    assert_eq!(usage.cost_usd, 0.0);
+}
+
+#[tokio::test]
+async fn persistent_claude_no_result_records_zero_usage() {
+    let fake_cli = create_no_result_claude_stream_script();
+    let mut config = TestGateway::build_config(&script_path(&fake_cli));
+    config.cli = CliProfile::Claude {
+        bin: script_path(&fake_cli),
+        model: Some("test-claude".into()),
+        stream_json: true,
+        extra_args: vec![],
+        env: Default::default(),
+        env_file: None,
+    };
+    config.cli_timeout_secs = 5;
+    let gw = TestGateway::with_config(config).await;
+    let outputs = Arc::new(Mutex::new(Vec::new()));
+    let adapter = MockPlatformAdapter::new(mpsc::channel(1).1, outputs);
+
+    let response = gw
+        .runner
+        .handle_message(&msg("chat-no-result", "user-1", "hello"), &adapter)
+        .await
+        .expect("missing result response");
+    assert!(response.contains("错误") || response.contains("⚠"));
+
+    let usage = gw
+        .runner
+        .store()
+        .unwrap()
+        .get_usage_total("mock", "user-1")
+        .await
+        .unwrap();
+    assert_eq!(usage.messages, 0);
+    assert_eq!(usage.total_tokens, 0);
+    assert_eq!(usage.cost_usd, 0.0);
+}
+
+#[tokio::test]
+async fn persistent_claude_cancel_preserves_partial_usage_and_session() {
+    let fake_cli = create_interrupt_result_claude_stream_script();
+    let mut config = TestGateway::build_config(&script_path(&fake_cli));
+    config.cli = CliProfile::Claude {
+        bin: script_path(&fake_cli),
+        model: Some("test-claude".into()),
+        stream_json: true,
+        extra_args: vec![],
+        env: Default::default(),
+        env_file: None,
+    };
+    config.cli_timeout_secs = 5;
+    let gw = TestGateway::with_config(config).await;
+    let outputs = Arc::new(Mutex::new(Vec::new()));
+    let (adapter_tx, adapter_rx) = mpsc::channel(8);
+    let adapter = MockPlatformAdapter::new(adapter_rx, outputs.clone());
+    let (_cron_tx, cron_rx) = mpsc::channel(1);
+    let (_scheduled_tx, scheduled_rx) = mpsc::channel(1);
+    let (_inject_tx, inject_rx) = mpsc::channel(1);
+    let (_runtime_tx, runtime_rx) = mpsc::channel(1);
+    let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
+    let run = tokio::spawn(gw.runner.clone().run(
+        vec![Box::new(adapter)],
+        cron_rx,
+        scheduled_rx,
+        inject_rx,
+        runtime_rx,
+        shutdown_rx,
+    ));
+
+    adapter_tx
+        .send(msg("chat-cancel-partial", "user-1", "long request"))
+        .await
+        .unwrap();
+    let conversation = ConversationKey::new("mock", "chat-cancel-partial", "claude");
+    let repo = gw.runner.trace_repo().unwrap();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let running = repo
+                .list_active_requests(&conversation, 10)
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .any(|request| {
+                    request.status == astra_gateway::trace_model::RequestStatus::Running
+                });
+            if running {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("turn should become active");
+
+    adapter_tx
+        .send(msg("chat-cancel-partial", "user-1", "/esc"))
+        .await
+        .unwrap();
+    let cancel_response = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if let Some((_, text)) = outputs
+                .lock()
+                .await
+                .iter()
+                .find(|(_, text)| text.contains("已中断") || text.contains("已取消"))
+                .cloned()
+            {
+                break text;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("cancel response");
+    assert!(
+        cancel_response.contains("中断") || cancel_response.contains("取消"),
+        "response: {cancel_response}"
+    );
+
+    let store = gw.runner.store().unwrap();
+    tokio::time::timeout(Duration::from_secs(6), async {
+        loop {
+            if store
+                .get_current_session("mock", "chat-cancel-partial", "claude")
+                .await
+                .unwrap()
+                .as_deref()
+                == Some("cancelled-session")
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("cancelled result should be finalized");
+
+    let usage = store.get_usage_total("mock", "user-1").await.unwrap();
+    assert_eq!(usage.messages, 0, "cancelled attempts are not model turns");
+    assert_eq!(usage.total_tokens, 13);
+    assert!((usage.cost_usd - 0.05).abs() < 1e-9);
+    assert_eq!(
+        store
+            .get_current_session("mock", "chat-cancel-partial", "claude")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("cancelled-session")
+    );
+    let _ = shutdown_tx.send(());
+    tokio::time::timeout(Duration::from_secs(2), run)
+        .await
+        .expect("runner shutdown")
+        .unwrap();
+}
+
+#[tokio::test]
+async fn claude_context_overflow_returns_actionable_zero_cost_failure() {
+    let session_id = "2e8c8b02-5c96-45e8-85b3-b74f0bc2f101";
+    let upstream_request_id = "upstream-overflow-123";
+    let result = serde_json::json!({
+        "type": "result",
+        "subtype": "success",
+        "is_error": false,
+        "api_error_status": 400,
+        "session_id": session_id,
+        "result": format!(
+            "API Error: 400 event:error\ndata:{{\"code\":\"InvalidParameter\",\"message\":\"Range of input length should be [1, 983616]\",\"request_id\":\"{upstream_request_id}\"}}"
+        ),
+        "usage": {"input_tokens": 0, "output_tokens": 0},
+        "total_cost_usd": 77.5227695
+    });
+    let fake_cli = create_fake_claude_stream_script(&result);
+    let mut config = TestGateway::build_config(&script_path(&fake_cli));
+    config.cli = CliProfile::Claude {
+        bin: script_path(&fake_cli),
+        model: Some("test-claude".into()),
+        stream_json: true,
+        extra_args: vec![],
+        env: Default::default(),
+        env_file: None,
+    };
+    config.cli_timeout_secs = 5;
+    let gw = TestGateway::with_config(config).await;
+    let outputs = Arc::new(Mutex::new(Vec::new()));
+    let adapter = MockPlatformAdapter::new(mpsc::channel(1).1, outputs);
+    let inbound = msg("chat-overflow", "user-1", "continue");
+
+    let response = gw
+        .runner
+        .handle_message(&inbound, &adapter)
+        .await
+        .expect("actionable error response");
+    assert!(response.contains("/compact"), "response: {response}");
+    assert!(response.contains(upstream_request_id));
+    assert!(!response.contains("InvalidParameter"));
+    assert!(!response.contains("Range of input length"));
+
+    let usage = gw
+        .runner
+        .store()
+        .unwrap()
+        .get_usage_session("mock", "user-1", "claude", session_id)
+        .await
+        .unwrap();
+    assert_eq!(usage.messages, 1);
+    assert_eq!(usage.total_tokens, 0);
+    assert_eq!(usage.cost_usd, 0.0);
+    assert_eq!(
+        gw.runner
+            .store()
+            .unwrap()
+            .get_current_session("mock", "chat-overflow", "claude")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(session_id),
+        "provider-error session must remain resumable for /compact"
     );
 }
 
@@ -1174,6 +2024,94 @@ async fn slash_command_unknown_falls_to_slow_path() {
     assert!(
         result.is_err(),
         "non-slash message should fall to slow path"
+    );
+}
+
+#[tokio::test]
+async fn compact_routes_only_claude_to_slow_path() {
+    let non_claude = TestGateway::new().await;
+    let command = msg("chat-compact", "user-1", "/compact focus on fixes");
+    let rejection = non_claude
+        .runner
+        .handle_fast(&command)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(rejection.contains("仅适用于 Claude"));
+
+    let fake_cli = create_fake_cli_script("unused");
+    let mut config = TestGateway::build_config(&script_path(&fake_cli));
+    config.cli = CliProfile::Claude {
+        bin: script_path(&fake_cli),
+        model: Some("test-claude".into()),
+        stream_json: true,
+        extra_args: vec![],
+        env: Default::default(),
+        env_file: None,
+    };
+    let claude = TestGateway::with_config(config).await;
+    let routed = claude.runner.handle_fast(&command).await;
+    assert!(routed.is_err(), "Claude /compact must reach the slow path");
+}
+
+#[tokio::test]
+async fn compact_not_enough_messages_is_not_reported_as_success() {
+    let fake_cli = create_local_command_claude_stream_script("Not enough messages to compact.");
+    let mut config = TestGateway::build_config(&script_path(&fake_cli));
+    config.cli = CliProfile::Claude {
+        bin: script_path(&fake_cli),
+        model: Some("test-claude".into()),
+        stream_json: true,
+        extra_args: vec![],
+        env: Default::default(),
+        env_file: None,
+    };
+    let gateway = TestGateway::with_config(config).await;
+    let outputs = Arc::new(Mutex::new(Vec::new()));
+    let adapter = MockPlatformAdapter::new(mpsc::channel(1).1, outputs);
+
+    let response = gateway
+        .runner
+        .handle_message(&msg("chat-compact-local", "user-1", "/compact"), &adapter)
+        .await
+        .unwrap();
+
+    assert!(response.contains("内容太少"), "response: {response}");
+    assert!(!response.contains("会话已压缩"), "response: {response}");
+}
+
+#[tokio::test]
+async fn local_command_output_does_not_leak_into_next_turn() {
+    let fake_cli = create_one_local_command_then_empty_claude_script();
+    let mut config = TestGateway::build_config(&script_path(&fake_cli));
+    config.cli = CliProfile::Claude {
+        bin: script_path(&fake_cli),
+        model: Some("test-claude".into()),
+        stream_json: true,
+        extra_args: vec![],
+        env: Default::default(),
+        env_file: None,
+    };
+    let gateway = TestGateway::with_config(config).await;
+    let outputs = Arc::new(Mutex::new(Vec::new()));
+    let adapter = MockPlatformAdapter::new(mpsc::channel(1).1, outputs);
+
+    let compact = gateway
+        .runner
+        .handle_message(&msg("chat-compact-two", "user-1", "/compact"), &adapter)
+        .await
+        .unwrap();
+    assert!(compact.contains("内容太少"), "response: {compact}");
+
+    let next = gateway
+        .runner
+        .handle_message(&msg("chat-compact-two", "user-1", "next"), &adapter)
+        .await
+        .unwrap();
+    assert!(!next.contains("内容太少"), "stale local output: {next}");
+    assert!(
+        !next.contains("Not enough messages"),
+        "stale local output: {next}"
     );
 }
 

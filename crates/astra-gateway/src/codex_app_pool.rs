@@ -220,6 +220,7 @@ impl CodexAppPool {
             exit_code: if turn_failed { 1 } else { 0 },
             success: !turn_failed,
             error_kind: None,
+            provider_error: None,
             trace_id: None,
             request_id: None,
             run_id: None,

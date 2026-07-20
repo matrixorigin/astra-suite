@@ -106,6 +106,35 @@ pub struct PlatformCredential {
 }
 
 /// A single usage event to be recorded.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UsageStatus {
+    #[default]
+    Success,
+    ProviderError,
+    CliError,
+    Cancelled,
+    PreflightFailed,
+    InternalError,
+}
+
+impl UsageStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Success => "success",
+            Self::ProviderError => "provider_error",
+            Self::CliError => "cli_error",
+            Self::Cancelled => "cancelled",
+            Self::PreflightFailed => "preflight_failed",
+            Self::InternalError => "internal_error",
+        }
+    }
+
+    pub fn counts_as_message(self) -> bool {
+        matches!(self, Self::Success | Self::ProviderError | Self::CliError)
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct UsageRecord {
     pub platform: String,
@@ -127,6 +156,10 @@ pub struct UsageRecord {
     pub max_output_tokens: Option<u64>,
     pub cost_usd: Option<f64>,
     pub raw_usage_json: Option<String>,
+    #[serde(default)]
+    pub status: UsageStatus,
+    #[serde(default)]
+    pub failure_kind: Option<String>,
     pub tool_calls: u32,
     pub elapsed_ms: u64,
 }
@@ -239,10 +272,21 @@ pub trait GatewayStore: Send + Sync + 'static {
         cli_profile: &str,
     ) -> Result<Vec<SessionRecord>, StoreError>;
 
+    /// Return at most two matches so callers can distinguish missing, unique,
+    /// and ambiguous selectors without scanning only the recent display page.
+    async fn find_sessions_by_prefix(
+        &self,
+        platform: &str,
+        chat_id: &str,
+        cli_profile: &str,
+        prefix: &str,
+    ) -> Result<Vec<String>, StoreError>;
+
     async fn switch_session(
         &self,
         platform: &str,
         chat_id: &str,
+        cli_profile: &str,
         target_session_id: &str,
     ) -> Result<bool, StoreError>;
 
@@ -323,6 +367,7 @@ pub trait GatewayStore: Send + Sync + 'static {
         &self,
         platform: &str,
         user_id: &str,
+        cli_profile: &str,
         session_id: &str,
     ) -> Result<UsageSummary, StoreError>;
 
@@ -1329,6 +1374,8 @@ url: "mysql://root:111@127.0.0.1:6001/astra_gateway""#;
             max_output_tokens: None,
             cost_usd: None,
             raw_usage_json: None,
+            status: UsageStatus::Success,
+            failure_kind: None,
             tool_calls: 3,
             elapsed_ms: 5000,
         };
@@ -1421,6 +1468,8 @@ url: "mysql://root:111@127.0.0.1:6001/astra_gateway""#;
             max_output_tokens: None,
             cost_usd: None,
             raw_usage_json: None,
+            status: UsageStatus::Success,
+            failure_kind: None,
             tool_calls: 2,
             elapsed_ms: 3000,
         };
@@ -1617,7 +1666,12 @@ url: "mysql://root:111@127.0.0.1:6001/astra_gateway""#;
                 .as_deref(),
             Some("s11")
         );
-        assert!(store.switch_session("test", "c1", "s10").await.unwrap());
+        assert!(
+            store
+                .switch_session("test", "c1", "astra", "s10")
+                .await
+                .unwrap()
+        );
         assert_eq!(
             store
                 .get_current_session("test", "c1", "astra")
@@ -1628,9 +1682,18 @@ url: "mysql://root:111@127.0.0.1:6001/astra_gateway""#;
         );
         assert!(
             !store
-                .switch_session("test", "c1", "nonexistent")
+                .switch_session("test", "c1", "astra", "nonexistent")
                 .await
                 .unwrap()
+        );
+        assert_eq!(
+            store
+                .get_current_session("test", "c1", "astra")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("s10"),
+            "failed switch must preserve the current session"
         );
 
         // Credentials
@@ -1675,6 +1738,8 @@ url: "mysql://root:111@127.0.0.1:6001/astra_gateway""#;
             max_output_tokens: None,
             cost_usd: None,
             raw_usage_json: None,
+            status: UsageStatus::Success,
+            failure_kind: None,
             tool_calls: 2,
             elapsed_ms: 3000,
         };
@@ -1687,6 +1752,17 @@ url: "mysql://root:111@127.0.0.1:6001/astra_gateway""#;
         store.record_usage(&record).await.unwrap();
         let total = store.get_usage_total("test", "u1").await.unwrap();
         assert_eq!(total.messages, 2);
+        assert_eq!(total.tokens_prompt, 200);
+
+        let mut preflight_failure = record.clone();
+        preflight_failure.status = UsageStatus::PreflightFailed;
+        preflight_failure.failure_kind = Some("cli_unavailable".into());
+        preflight_failure.tokens_prompt = 0;
+        preflight_failure.tokens_completion = 0;
+        preflight_failure.total_tokens = 0;
+        store.record_usage(&preflight_failure).await.unwrap();
+        let total = store.get_usage_total("test", "u1").await.unwrap();
+        assert_eq!(total.messages, 2, "preflight failures are not model turns");
         assert_eq!(total.tokens_prompt, 200);
     }
 

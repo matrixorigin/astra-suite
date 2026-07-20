@@ -149,6 +149,9 @@ providers:
     env:
       ANTHROPIC_API_KEY: ""                   # FILL ME — your DashScope API key
       ANTHROPIC_BASE_URL: "https://dashscope.aliyuncs.com/apps/anthropic"
+      # Recommended for Claude-compatible providers: their token accounting may
+      # differ from Claude Code's local estimate, so compact before the hard limit.
+      # CLAUDE_AUTOCOMPACT_PCT_OVERRIDE: "50"
 
 # ─── CLI Profiles (optional, for /cli switching) ────────────────────────────
 #
