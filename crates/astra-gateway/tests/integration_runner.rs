@@ -198,13 +198,13 @@ fn create_fake_claude_stream_script(result: &serde_json::Value) -> tempfile::Tem
     dir
 }
 
-fn create_local_command_claude_stream_script(output: &str) -> tempfile::TempDir {
+fn create_system_status_claude_stream_script(subtype: &str, content: &str) -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
     let script_path = dir.path().join("fake_cli.sh");
-    let local_command = serde_json::json!({
+    let system_status = serde_json::json!({
         "type": "system",
-        "subtype": "local_command",
-        "content": format!("<local-command-stdout>{output}</local-command-stdout>")
+        "subtype": subtype,
+        "content": content
     });
     let result = serde_json::json!({
         "type": "result",
@@ -218,7 +218,7 @@ fn create_local_command_claude_stream_script(output: &str) -> tempfile::TempDir 
     });
     let content = format!(
         "#!/bin/sh\ncase \"$*\" in *--version*) echo '2.1.0'; exit 0;; esac\nwhile IFS= read -r line; do\n  printf '%s\\n' '{}'\n  printf '%s\\n' '{}'\ndone\n",
-        local_command.to_string().replace('\'', "'\\''"),
+        system_status.to_string().replace('\'', "'\\''"),
         result.to_string().replace('\'', "'\\''")
     );
     std::fs::write(&script_path, content).unwrap();
@@ -2056,7 +2056,10 @@ async fn compact_routes_only_claude_to_slow_path() {
 
 #[tokio::test]
 async fn compact_not_enough_messages_is_not_reported_as_success() {
-    let fake_cli = create_local_command_claude_stream_script("Not enough messages to compact.");
+    let fake_cli = create_system_status_claude_stream_script(
+        "local_command",
+        "<local-command-stdout>Not enough messages to compact.</local-command-stdout>",
+    );
     let mut config = TestGateway::build_config(&script_path(&fake_cli));
     config.cli = CliProfile::Claude {
         bin: script_path(&fake_cli),
@@ -2078,6 +2081,36 @@ async fn compact_not_enough_messages_is_not_reported_as_success() {
 
     assert!(response.contains("内容太少"), "response: {response}");
     assert!(!response.contains("会话已压缩"), "response: {response}");
+}
+
+#[tokio::test]
+async fn compact_boundary_is_reported_as_confirmed_success() {
+    let fake_cli =
+        create_system_status_claude_stream_script("compact_boundary", "Conversation compacted");
+    let mut config = TestGateway::build_config(&script_path(&fake_cli));
+    config.cli = CliProfile::Claude {
+        bin: script_path(&fake_cli),
+        model: Some("test-claude".into()),
+        stream_json: true,
+        extra_args: vec![],
+        env: Default::default(),
+        env_file: None,
+    };
+    let gateway = TestGateway::with_config(config).await;
+    let outputs = Arc::new(Mutex::new(Vec::new()));
+    let adapter = MockPlatformAdapter::new(mpsc::channel(1).1, outputs);
+
+    let response = gateway
+        .runner
+        .handle_message(
+            &msg("chat-compact-boundary", "user-1", "/compact"),
+            &adapter,
+        )
+        .await
+        .unwrap();
+
+    assert!(response.contains("会话已压缩"), "response: {response}");
+    assert!(!response.contains("无法确认"), "response: {response}");
 }
 
 #[tokio::test]

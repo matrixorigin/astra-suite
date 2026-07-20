@@ -1348,20 +1348,24 @@ pub(crate) fn parse_claude_result_value(v: &serde_json::Value, exit_code: i32) -
     }
 }
 
-pub(crate) fn claude_local_command_output(v: &serde_json::Value) -> Option<String> {
-    if v["type"].as_str() != Some("system") || v["subtype"].as_str() != Some("local_command") {
+pub(crate) fn claude_system_status_output(v: &serde_json::Value) -> Option<String> {
+    if v["type"].as_str() != Some("system") {
         return None;
     }
     let content = v["content"].as_str()?.trim();
-    let output = content
-        .strip_prefix("<local-command-stdout>")
-        .and_then(|value| value.strip_suffix("</local-command-stdout>"))
-        .unwrap_or(content)
-        .trim();
+    let output = match v["subtype"].as_str() {
+        Some("local_command") => content
+            .strip_prefix("<local-command-stdout>")
+            .and_then(|value| value.strip_suffix("</local-command-stdout>"))
+            .unwrap_or(content)
+            .trim(),
+        Some("compact_boundary") => content,
+        _ => return None,
+    };
     (!output.is_empty()).then(|| output.to_string())
 }
 
-pub(crate) fn apply_claude_local_command_output(result: &mut CliResult, output: Option<String>) {
+pub(crate) fn apply_claude_system_status_output(result: &mut CliResult, output: Option<String>) {
     if result
         .text
         .as_deref()
@@ -1539,7 +1543,7 @@ fn parse_claude_plain_result(stdout: &str, exit_code: i32) -> CliResult {
 /// frame only carries `num_turns`, not tool metadata).
 fn parse_claude_stream_json_stdout(stdout: &str, exit_code: i32) -> CliResult {
     let mut result_value: Option<serde_json::Value> = None;
-    let mut local_command_output: Option<String> = None;
+    let mut system_status_output: Option<String> = None;
     let mut tools_used: Vec<String> = Vec::new();
     let mut tool_use_count: u32 = 0;
 
@@ -1570,8 +1574,8 @@ fn parse_claude_stream_json_stdout(stdout: &str, exit_code: i32) -> CliResult {
                 result_value = Some(v);
             }
             Some("system") => {
-                if let Some(output) = claude_local_command_output(&v) {
-                    local_command_output = Some(output);
+                if let Some(output) = claude_system_status_output(&v) {
+                    system_status_output = Some(output);
                 }
             }
             _ => {}
@@ -1580,7 +1584,7 @@ fn parse_claude_stream_json_stdout(stdout: &str, exit_code: i32) -> CliResult {
 
     if let Some(value) = result_value {
         let mut result = parse_claude_result_value(&value, exit_code);
-        apply_claude_local_command_output(&mut result, local_command_output);
+        apply_claude_system_status_output(&mut result, system_status_output);
         result.tool_calls_count = if tool_use_count == 0 {
             None
         } else {
@@ -4213,14 +4217,14 @@ extra_args:
     }
 
     #[test]
-    fn claude_local_command_output_is_preserved_with_empty_result() {
+    fn claude_system_status_output_is_preserved_with_empty_result() {
         let local_command = serde_json::json!({
             "type": "system",
             "subtype": "local_command",
             "content": "<local-command-stdout>Not enough messages to compact.</local-command-stdout>"
         });
         assert_eq!(
-            claude_local_command_output(&local_command).as_deref(),
+            claude_system_status_output(&local_command).as_deref(),
             Some("Not enough messages to compact.")
         );
 
@@ -4240,6 +4244,20 @@ extra_args:
             parsed.text.as_deref(),
             Some("Not enough messages to compact.")
         );
+
+        let compact_boundary = serde_json::json!({
+            "type": "system",
+            "subtype": "compact_boundary",
+            "content": "Conversation compacted",
+            "compactMetadata": {"trigger": "manual"}
+        });
+        assert_eq!(
+            claude_system_status_output(&compact_boundary).as_deref(),
+            Some("Conversation compacted")
+        );
+        let stdout = format!("{compact_boundary}\n{result}\n");
+        let parsed = parse_claude_stream_json_stdout(&stdout, 0);
+        assert_eq!(parsed.text.as_deref(), Some("Conversation compacted"));
     }
 
     #[test]
