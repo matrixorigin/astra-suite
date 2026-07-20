@@ -2695,7 +2695,12 @@ impl GatewayRunner {
             .unwrap_or(result.stdout.trim())
             .to_string();
 
-        if let Some(response) = compact_response_override(&message_text, result.success, &text) {
+        if let Some(response) = compact_response_override(
+            &message_text,
+            result.success,
+            &text,
+            cli_result_has_model_activity(&result),
+        ) {
             text = response.to_string();
         }
 
@@ -4672,6 +4677,7 @@ fn compact_response_override(
     message: &str,
     success: bool,
     response_text: &str,
+    model_activity: bool,
 ) -> Option<&'static str> {
     let message = message.trim();
     let is_compact = message == "/compact" || message.starts_with("/compact ");
@@ -4680,7 +4686,11 @@ fn compact_response_override(
     }
     let response_text = response_text.trim();
     if response_text.is_empty() {
-        return Some("⚠️ 未收到 Claude 的压缩状态，无法确认会话是否已压缩；请重试 `/compact`。");
+        return Some(if model_activity {
+            "✅ 会话已压缩，可以继续对话。原始历史记录仍然保留。"
+        } else {
+            "⚠️ 未收到 Claude 的压缩状态，无法确认会话是否已压缩；请重试 `/compact`。"
+        });
     }
     let normalized = response_text.to_ascii_lowercase();
     if normalized.contains("not enough messages to compact") {
@@ -4696,6 +4706,22 @@ fn compact_response_override(
         return Some("✅ 会话已压缩，可以继续对话。原始历史记录仍然保留。");
     }
     None
+}
+
+fn cli_result_has_model_activity(result: &CliResult) -> bool {
+    [
+        result.tokens_prompt,
+        result.tokens_completion,
+        result.cached_input_tokens,
+        result.cache_creation_input_tokens,
+        result.cache_read_input_tokens,
+        result.reasoning_output_tokens,
+        result.total_tokens,
+    ]
+    .into_iter()
+    .flatten()
+    .any(|tokens| tokens > 0)
+        || result.cost_usd.is_some_and(|cost| cost > 0.0)
 }
 
 /// Strip `<think>...</think>` / `<thinking>...</thinking>` blocks from complete text.
@@ -4880,37 +4906,42 @@ mod tests {
     use super::*;
 
     #[test]
-    fn compact_empty_success_reports_unknown_state() {
+    fn compact_empty_success_uses_model_activity_to_confirm() {
         assert_eq!(
-            compact_response_override("/compact", true, ""),
+            compact_response_override("/compact", true, "", false),
             Some("⚠️ 未收到 Claude 的压缩状态，无法确认会话是否已压缩；请重试 `/compact`。")
         );
         assert_eq!(
-            compact_response_override("/compact focus on fixes", true, "  "),
-            Some("⚠️ 未收到 Claude 的压缩状态，无法确认会话是否已压缩；请重试 `/compact`。")
+            compact_response_override("/compact focus on fixes", true, "  ", true),
+            Some("✅ 会话已压缩，可以继续对话。原始历史记录仍然保留。")
         );
-        assert_eq!(compact_response_override("/compact", false, ""), None);
-        assert_eq!(compact_response_override("hello", true, ""), None);
+        assert_eq!(compact_response_override("/compact", false, "", true), None);
+        assert_eq!(compact_response_override("hello", true, "", true), None);
     }
 
     #[test]
     fn compact_local_command_result_is_not_misreported() {
         assert_eq!(
-            compact_response_override("/compact", true, "Not enough messages to compact."),
+            compact_response_override("/compact", true, "Not enough messages to compact.", false,),
             Some(
                 "ℹ️ 当前会话内容太少，Claude 未执行压缩；继续对话即可，稍后可再次使用 `/compact`。"
             )
         );
         assert_eq!(
-            compact_response_override("/compact", true, "Compacted (ctrl+o to see full summary)"),
+            compact_response_override(
+                "/compact",
+                true,
+                "Compacted (ctrl+o to see full summary)",
+                false,
+            ),
             Some("✅ 会话已压缩，可以继续对话。原始历史记录仍然保留。")
         );
         assert_eq!(
-            compact_response_override("/compact", true, "Not compacted"),
+            compact_response_override("/compact", true, "Not compacted", true),
             None
         );
         assert_eq!(
-            compact_response_override("/compact", true, "Could not be compacted"),
+            compact_response_override("/compact", true, "Could not be compacted", true),
             None
         );
     }
