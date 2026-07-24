@@ -2,6 +2,7 @@ pub mod access_control;
 pub mod cli_bridge;
 pub(crate) mod cli_pool;
 pub(crate) mod codex_app_pool;
+pub(crate) mod codex_sessions;
 pub mod commands;
 pub mod config;
 pub mod dedup;

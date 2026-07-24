@@ -1346,8 +1346,24 @@ impl GatewayRunner {
             );
         }
 
-        // Resolve workspace directory for CLI. User preference wins; the
-        // configured working_dir is only a fallback for new users.
+        // A resumed Codex thread should continue in the directory recorded by
+        // Codex itself. User preference and configured working_dir remain the
+        // fallbacks for new threads and sessions whose original directory no
+        // longer exists.
+        let session_workspace = if matches!(&cli_profile, CliProfile::Codex { .. })
+            && let Some(session_id) = session_id.as_deref()
+        {
+            match crate::codex_sessions::session_cwd(session_id).await {
+                Ok(Some(cwd)) => crate::workspace::resolve_existing_dir(&cwd),
+                Ok(None) => None,
+                Err(error) => {
+                    tracing::warn!(%error, %session_id, "failed to resolve Codex session cwd");
+                    None
+                }
+            }
+        } else {
+            None
+        };
         let user_workspace: Option<std::path::PathBuf> = if let Some(ref store) = self.store
             && let Ok(Some(ws)) = store
                 .get_user_preference(msg.platform, &msg.user_id, "workspace")
@@ -1357,7 +1373,7 @@ impl GatewayRunner {
         } else {
             None
         };
-        let workspace = user_workspace.or_else(|| {
+        let workspace = session_workspace.or(user_workspace).or_else(|| {
             self.config
                 .working_dir
                 .as_deref()
