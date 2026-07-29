@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
@@ -462,8 +462,12 @@ pub struct GatewayRunner {
     user_skills: Vec<(String, String)>,
     projects: Vec<String>,
     trace_repo: Option<Arc<dyn TraceRepository>>,
-    queue_senders:
-        tokio::sync::Mutex<HashMap<ConversationKey, tokio::sync::mpsc::Sender<QueuedRequest>>>,
+    queue_senders: tokio::sync::Mutex<HashMap<ConversationKey, ConversationSender>>,
+    /// Every normal, attachment, and scheduled message passes through the
+    /// same per-conversation ingress sequencer before it can steer or queue.
+    ingress_senders: tokio::sync::Mutex<HashMap<ConversationKey, ConversationSender>>,
+    execution_states: tokio::sync::Mutex<HashMap<ConversationKey, ExecutionLaneState>>,
+    next_worker_generation: AtomicU64,
     global_run_limiter: Arc<tokio::sync::Semaphore>,
     cli_availability: Vec<(String, cli_bridge::CliAvailability)>,
     /// Tracks consecutive auth failures per CLI profile name.
@@ -537,7 +541,32 @@ struct QueuedRequest {
     conversation: ConversationKey,
     trace: Option<OutboxDeliveryTrace>,
     background: bool,
+    steer_eligible: bool,
     scheduled_response_tx: Option<tokio::sync::oneshot::Sender<Option<OutboundMessage>>>,
+}
+
+#[derive(Clone)]
+struct ConversationSender {
+    generation: u64,
+    tx: tokio::sync::mpsc::Sender<QueuedRequest>,
+}
+
+#[derive(Default)]
+struct ExecutionLaneState {
+    active: bool,
+    waiting: usize,
+}
+
+impl ExecutionLaneState {
+    fn can_steer(&self) -> bool {
+        self.active && self.waiting == 0
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ConversationLane {
+    Ingress,
+    Execution,
 }
 
 #[derive(Debug, Clone)]
@@ -648,6 +677,9 @@ impl GatewayRunner {
             projects,
             trace_repo,
             queue_senders: tokio::sync::Mutex::new(HashMap::new()),
+            ingress_senders: tokio::sync::Mutex::new(HashMap::new()),
+            execution_states: tokio::sync::Mutex::new(HashMap::new()),
+            next_worker_generation: AtomicU64::new(1),
             global_run_limiter: Arc::new(tokio::sync::Semaphore::new(max_concurrent_runs)),
             cli_availability,
             auth_failures: Arc::new(dashmap::DashMap::new()),
@@ -3429,6 +3461,16 @@ impl GatewayRunner {
             None
         };
         QueuedRequest {
+            steer_eligible: profile_override.is_none()
+                && msg.attachments.is_empty()
+                && !msg.text.trim().is_empty()
+                && matches!(
+                    &resolved,
+                    CliProfile::Codex {
+                        stream_json: true,
+                        ..
+                    }
+                ),
             msg,
             conversation,
             trace,
@@ -3466,23 +3508,105 @@ impl GatewayRunner {
         let queued = self
             .build_queued_request_with_profile_override(msg, profile_override)
             .await;
+        self.enqueue_ingress(queued, cli_resp_tx).await;
+    }
+
+    async fn enqueue_ingress(
+        self: &Arc<Self>,
+        queued: QueuedRequest,
+        cli_resp_tx: tokio::sync::mpsc::Sender<CliResponse>,
+    ) {
+        if let Err(queued) = self
+            .enqueue_lane(queued, cli_resp_tx, ConversationLane::Ingress)
+            .await
+        {
+            self.fail_dispatch(&queued, "failed to enqueue conversation ingress")
+                .await;
+        }
+    }
+
+    async fn enqueue_queued_request(
+        self: &Arc<Self>,
+        queued: QueuedRequest,
+        cli_resp_tx: tokio::sync::mpsc::Sender<CliResponse>,
+    ) {
         let key = queued.conversation.clone();
-        let tx = {
-            let mut queues = self.queue_senders.lock().await;
-            if let Some(tx) = queues.get(&key) {
-                tx.clone()
-            } else {
-                let (tx, rx) = tokio::sync::mpsc::channel(128);
-                queues.insert(key.clone(), tx.clone());
-                let runner = self.clone();
-                tokio::spawn(async move {
-                    runner.run_conversation_worker(key, rx, cli_resp_tx).await;
-                });
-                tx
-            }
+        {
+            let mut states = self.execution_states.lock().await;
+            states.entry(key.clone()).or_default().waiting += 1;
+        }
+        if let Err(queued) = self
+            .enqueue_lane(queued, cli_resp_tx, ConversationLane::Execution)
+            .await
+        {
+            self.execution_enqueue_failed(&key).await;
+            self.fail_dispatch(&queued, "failed to enqueue gateway request")
+                .await;
+        }
+    }
+
+    async fn enqueue_lane(
+        self: &Arc<Self>,
+        mut queued: QueuedRequest,
+        cli_resp_tx: tokio::sync::mpsc::Sender<CliResponse>,
+        lane: ConversationLane,
+    ) -> Result<(), QueuedRequest> {
+        let key = queued.conversation.clone();
+        let senders = match lane {
+            ConversationLane::Ingress => &self.ingress_senders,
+            ConversationLane::Execution => &self.queue_senders,
         };
-        if let Err(e) = tx.send(queued).await {
-            tracing::warn!(error = %e, "failed to enqueue gateway request");
+        for _ in 0..2 {
+            let sender = {
+                let mut senders = senders.lock().await;
+                if let Some(sender) = senders.get(&key) {
+                    sender.clone()
+                } else {
+                    let generation = self.next_worker_generation.fetch_add(1, Ordering::Relaxed);
+                    let (tx, rx) = tokio::sync::mpsc::channel(128);
+                    let sender = ConversationSender { generation, tx };
+                    senders.insert(key.clone(), sender.clone());
+                    self.spawn_lane_worker(lane, key.clone(), generation, rx, cli_resp_tx.clone());
+                    sender
+                }
+            };
+            let send_result = sender.tx.send(queued).await;
+            match send_result {
+                Ok(()) => return Ok(()),
+                Err(error) => {
+                    queued = error.0;
+                    self.remove_sender_if_generation(senders, &key, sender.generation)
+                        .await;
+                }
+            }
+        }
+        Err(queued)
+    }
+
+    fn spawn_lane_worker(
+        self: &Arc<Self>,
+        lane: ConversationLane,
+        key: ConversationKey,
+        generation: u64,
+        rx: tokio::sync::mpsc::Receiver<QueuedRequest>,
+        cli_resp_tx: tokio::sync::mpsc::Sender<CliResponse>,
+    ) {
+        let runner = self.clone();
+        match lane {
+            ConversationLane::Ingress => {
+                tokio::spawn(async move {
+                    runner
+                        .run_ingress_worker(key, generation, rx, cli_resp_tx)
+                        .await;
+                });
+            }
+            ConversationLane::Execution => {
+                tokio::spawn(async move {
+                    runner
+                        .run_conversation_worker(key, generation, rx, cli_resp_tx)
+                        .await;
+                });
+            }
         }
     }
 
@@ -3495,57 +3619,196 @@ impl GatewayRunner {
             .build_queued_request_with_profile_override(turn.message, None)
             .await;
         queued.background = true;
+        queued.steer_eligible = false;
         queued.scheduled_response_tx = Some(turn.response_tx);
-        let key = queued.conversation.clone();
-        let tx = {
-            let mut queues = self.queue_senders.lock().await;
-            if let Some(tx) = queues.get(&key) {
-                tx.clone()
-            } else {
-                let (tx, rx) = tokio::sync::mpsc::channel(128);
-                queues.insert(key.clone(), tx.clone());
-                let runner = self.clone();
-                tokio::spawn(async move {
-                    runner.run_conversation_worker(key, rx, cli_resp_tx).await;
-                });
-                tx
+        self.enqueue_ingress(queued, cli_resp_tx).await;
+    }
+
+    async fn run_ingress_worker(
+        self: Arc<Self>,
+        key: ConversationKey,
+        generation: u64,
+        mut rx: tokio::sync::mpsc::Receiver<QueuedRequest>,
+        cli_resp_tx: tokio::sync::mpsc::Sender<CliResponse>,
+    ) {
+        loop {
+            let Some(queued) = self
+                .receive_from_lane(&self.ingress_senders, &key, generation, &mut rx)
+                .await
+            else {
+                break;
+            };
+
+            if !self.should_execute_queued(&queued).await {
+                continue;
             }
-        };
-        if let Err(e) = tx.send(queued).await {
-            tracing::warn!(error = %e, "failed to enqueue scheduled agent turn");
+            let can_steer = queued.steer_eligible && self.execution_can_steer(&key).await;
+            if !can_steer {
+                self.enqueue_queued_request(queued, cli_resp_tx.clone())
+                    .await;
+                continue;
+            }
+
+            let trace_writer = queued.trace.as_ref().and_then(|trace| {
+                self.trace_repo.as_ref().map(|repo| {
+                    TraceWriter::from_existing(
+                        repo.as_ref() as &dyn TraceRepository,
+                        trace.trace_id.clone(),
+                        trace.request_id.clone(),
+                    )
+                })
+            });
+            let Some(trace_writer) = trace_writer else {
+                // Steering must be claimed atomically so cancellation cannot
+                // report success after the app-server request has begun.
+                self.enqueue_queued_request(queued, cli_resp_tx.clone())
+                    .await;
+                continue;
+            };
+            match trace_writer.claim_for_steer().await {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        platform = queued.msg.platform,
+                        chat_id = %safe_id(&queued.msg.chat_id),
+                        "failed to claim request for Codex steering"
+                    );
+                    self.fail_dispatch(&queued, "failed to claim request for Codex steering")
+                        .await;
+                    continue;
+                }
+            }
+
+            let pool_key = persistent_pool_key(
+                queued.conversation.platform(),
+                queued.conversation.chat_id(),
+                queued.conversation.cli_profile(),
+            );
+            let steer_request = {
+                self.codex_app_pool.lock().await.prepare_steer(
+                    &pool_key,
+                    &queued.msg.text,
+                    Some(&queued.msg.msg_id),
+                )
+            };
+            let outcome = match steer_request {
+                Some(request) => request.execute().await,
+                None => crate::codex_app_pool::CodexSteerOutcome::NoActiveTurn,
+            };
+
+            match outcome {
+                crate::codex_app_pool::CodexSteerOutcome::Accepted { turn_id } => {
+                    let _ = trace_writer
+                        .append(
+                            GatewayEventKind::TurnSteerAccepted,
+                            serde_json::json!({
+                                "thread_turn_id": turn_id,
+                                "platform_msg_id": queued.msg.msg_id,
+                            }),
+                        )
+                        .await;
+                    let _ = trace_writer.complete_request().await;
+                    tracing::info!(
+                        platform = queued.msg.platform,
+                        chat_id = %safe_id(&queued.msg.chat_id),
+                        turn_id,
+                        platform_msg_id = %queued.msg.msg_id,
+                        "steered active Codex turn"
+                    );
+                }
+                crate::codex_app_pool::CodexSteerOutcome::NoActiveTurn => {
+                    self.fallback_after_steer(
+                        &trace_writer,
+                        queued,
+                        &cli_resp_tx,
+                        "no_active_turn",
+                        None,
+                    )
+                    .await;
+                }
+                crate::codex_app_pool::CodexSteerOutcome::Rejected { error } => {
+                    tracing::info!(
+                        %error,
+                        platform = queued.msg.platform,
+                        chat_id = %safe_id(&queued.msg.chat_id),
+                        "Codex turn steering was rejected; falling back to queue"
+                    );
+                    let safe_error = redact_sensitive(&error);
+                    self.fallback_after_steer(
+                        &trace_writer,
+                        queued,
+                        &cli_resp_tx,
+                        "rejected",
+                        Some(&safe_error),
+                    )
+                    .await;
+                }
+                crate::codex_app_pool::CodexSteerOutcome::OutcomeUnknown { error } => {
+                    let safe_error = redact_sensitive(&error);
+                    let _ = trace_writer
+                        .append(
+                            GatewayEventKind::TurnSteerOutcomeUnknown,
+                            serde_json::json!({
+                                "error": safe_error,
+                                "requeued": false,
+                            }),
+                        )
+                        .await;
+                    let _ = trace_writer
+                        .fail_request(&format!(
+                            "Codex turn steering outcome unknown: {safe_error}"
+                        ))
+                        .await;
+                    tracing::warn!(
+                        %error,
+                        platform = queued.msg.platform,
+                        chat_id = %safe_id(&queued.msg.chat_id),
+                        platform_msg_id = %queued.msg.msg_id,
+                        "Codex turn steering outcome unknown; not requeueing to avoid duplicate execution"
+                    );
+                    let response = self
+                        .outbound_response(
+                            queued.trace.as_ref(),
+                            queued.msg.platform,
+                            &queued.msg.chat_id,
+                            queued.msg.reply_token.clone(),
+                            "⚠️ 插话请求的投递状态无法确认。为避免重复执行，我没有自动排队；请先查看当前任务输出，如未生效再重新发送。"
+                                .to_string(),
+                        )
+                        .await;
+                    let _ = cli_resp_tx.send(response).await;
+                }
+            }
         }
+        self.remove_sender_if_generation(&self.ingress_senders, &key, generation)
+            .await;
     }
 
     async fn run_conversation_worker(
         self: Arc<Self>,
         key: ConversationKey,
+        generation: u64,
         mut rx: tokio::sync::mpsc::Receiver<QueuedRequest>,
         cli_resp_tx: tokio::sync::mpsc::Sender<CliResponse>,
     ) {
         loop {
-            let queued = match tokio::time::timeout(CONVERSATION_QUEUE_IDLE_TIMEOUT, rx.recv())
+            let Some(queued) = self
+                .receive_from_lane(&self.queue_senders, &key, generation, &mut rx)
                 .await
-            {
-                Ok(Some(queued)) => queued,
-                Ok(None) => break,
-                Err(_) => {
-                    let mut queues = self.queue_senders.lock().await;
-                    if let Ok(queued) = rx.try_recv() {
-                        drop(queues);
-                        queued
-                    } else {
-                        queues.remove(&key);
-                        tracing::debug!(conversation = %key, "conversation worker idle timeout");
-                        break;
-                    }
-                }
+            else {
+                break;
             };
+            self.execution_dequeued(&key).await;
             if !self.should_execute_queued(&queued).await {
+                self.execution_cleanup_if_idle(&key).await;
                 continue;
             }
             let Ok(_permit) = self.global_run_limiter.clone().acquire_owned().await else {
                 break;
             };
+            self.execution_started(&key).await;
             let response = self
                 .handle_message_inner(
                     &queued.msg,
@@ -3554,6 +3817,7 @@ impl GatewayRunner {
                     queued.background,
                 )
                 .await;
+            self.execution_finished(&key).await;
             if let Some(response_tx) = queued.scheduled_response_tx {
                 let _ = response_tx.send(response);
                 continue;
@@ -3577,23 +3841,192 @@ impl GatewayRunner {
                 }
             }
         }
-        // Fix C: Sweep any Running/Accepted traces for this conversation before exiting.
-        if let Some(repo) = self.trace_repo.as_ref() {
-            match repo
-                .sweep_conversation_stale_requests(&key, "conversation worker exited")
-                .await
-            {
-                Ok(0) => {}
-                Ok(n) => {
-                    tracing::info!(conversation = %key, count = n, "swept stale traces on worker exit");
-                }
-                Err(e) => {
-                    tracing::warn!(conversation = %key, error = %e, "failed to sweep stale traces on worker exit");
+        self.remove_sender_if_generation(&self.queue_senders, &key, generation)
+            .await;
+        self.execution_cleanup_if_idle(&key).await;
+        tracing::debug!(conversation = %key, "conversation worker stopped");
+    }
+
+    async fn receive_from_lane(
+        &self,
+        senders: &tokio::sync::Mutex<HashMap<ConversationKey, ConversationSender>>,
+        key: &ConversationKey,
+        generation: u64,
+        rx: &mut tokio::sync::mpsc::Receiver<QueuedRequest>,
+    ) -> Option<QueuedRequest> {
+        loop {
+            match tokio::time::timeout(CONVERSATION_QUEUE_IDLE_TIMEOUT, rx.recv()).await {
+                Ok(queued) => return queued,
+                Err(_) => {
+                    let mut senders = senders.lock().await;
+                    let sender = senders
+                        .get(key)
+                        .filter(|sender| sender.generation == generation)?;
+                    if sender.tx.strong_count() > 1 {
+                        continue;
+                    }
+                    if let Ok(queued) = rx.try_recv() {
+                        return Some(queued);
+                    }
+                    senders.remove(key);
+                    return None;
                 }
             }
         }
-        self.queue_senders.lock().await.remove(&key);
-        tracing::debug!(conversation = %key, "conversation worker stopped");
+    }
+
+    async fn remove_sender_if_generation(
+        &self,
+        senders: &tokio::sync::Mutex<HashMap<ConversationKey, ConversationSender>>,
+        key: &ConversationKey,
+        generation: u64,
+    ) -> bool {
+        let mut senders = senders.lock().await;
+        if senders
+            .get(key)
+            .is_some_and(|sender| sender.generation == generation)
+        {
+            senders.remove(key);
+            true
+        } else {
+            false
+        }
+    }
+
+    async fn execution_can_steer(&self, key: &ConversationKey) -> bool {
+        self.execution_states
+            .lock()
+            .await
+            .get(key)
+            .is_some_and(ExecutionLaneState::can_steer)
+    }
+
+    async fn execution_dequeued(&self, key: &ConversationKey) {
+        let mut states = self.execution_states.lock().await;
+        if let Some(state) = states.get_mut(key) {
+            state.waiting = state.waiting.saturating_sub(1);
+        }
+    }
+
+    async fn execution_started(&self, key: &ConversationKey) {
+        self.execution_states
+            .lock()
+            .await
+            .entry(key.clone())
+            .or_default()
+            .active = true;
+    }
+
+    async fn execution_finished(&self, key: &ConversationKey) {
+        let mut states = self.execution_states.lock().await;
+        if let Some(state) = states.get_mut(key) {
+            state.active = false;
+            if state.waiting == 0 {
+                states.remove(key);
+            }
+        }
+    }
+
+    async fn execution_enqueue_failed(&self, key: &ConversationKey) {
+        self.execution_dequeued(key).await;
+        self.execution_cleanup_if_idle(key).await;
+    }
+
+    async fn execution_cleanup_if_idle(&self, key: &ConversationKey) {
+        let mut states = self.execution_states.lock().await;
+        if states
+            .get(key)
+            .is_some_and(|state| !state.active && state.waiting == 0)
+        {
+            states.remove(key);
+        }
+    }
+
+    async fn release_steer_claim_for_fallback(
+        &self,
+        writer: &TraceWriter<'_>,
+        queued: &QueuedRequest,
+        cli_resp_tx: &tokio::sync::mpsc::Sender<CliResponse>,
+    ) -> bool {
+        let mut last_error = None;
+        for _ in 0..2 {
+            match writer.release_steer_claim().await {
+                Ok(true) => return true,
+                Ok(false) => {
+                    tracing::warn!(
+                        trace_id = %writer.trace_id(),
+                        "steering claim was lost before queue fallback"
+                    );
+                    return false;
+                }
+                Err(error) => last_error = Some(error),
+            }
+        }
+
+        let error = last_error.unwrap_or_else(|| "unknown database error".to_string());
+        tracing::error!(
+            trace_id = %writer.trace_id(),
+            %error,
+            "failed to release steering claim; request cannot safely fall back"
+        );
+        let _ = writer
+            .fail_request(&format!("failed to release steering claim: {error}"))
+            .await;
+        let response = self
+            .outbound_response(
+                queued.trace.as_ref(),
+                queued.msg.platform,
+                &queued.msg.chat_id,
+                queued.msg.reply_token.clone(),
+                "⚠️ 插话未生效，但恢复排队状态失败；请重新发送这条消息。".to_string(),
+            )
+            .await;
+        let _ = cli_resp_tx.send(response).await;
+        false
+    }
+
+    async fn fallback_after_steer(
+        self: &Arc<Self>,
+        writer: &TraceWriter<'_>,
+        queued: QueuedRequest,
+        cli_resp_tx: &tokio::sync::mpsc::Sender<CliResponse>,
+        reason: &str,
+        error: Option<&str>,
+    ) {
+        if !self
+            .release_steer_claim_for_fallback(writer, &queued, cli_resp_tx)
+            .await
+        {
+            return;
+        }
+        let mut payload = serde_json::json!({ "reason": reason });
+        if let Some(error) = error {
+            payload["error"] = serde_json::Value::String(error.to_string());
+        }
+        let _ = writer
+            .append(GatewayEventKind::TurnSteerFallback, payload)
+            .await;
+        self.enqueue_queued_request(queued, cli_resp_tx.clone())
+            .await;
+    }
+
+    async fn fail_dispatch(&self, queued: &QueuedRequest, error: &str) {
+        tracing::warn!(
+            conversation = %queued.conversation,
+            platform_msg_id = %queued.msg.msg_id,
+            %error,
+            "gateway request dispatch failed"
+        );
+        if let Some(trace) = queued.trace.as_ref()
+            && let Some(repo) = self.trace_repo.as_ref()
+        {
+            let writer = TraceWriter::from_existing(
+                repo.as_ref() as &dyn TraceRepository,
+                trace.trace_id.clone(),
+                trace.request_id.clone(),
+            );
+            let _ = writer.fail_request(error).await;
+        }
     }
 
     async fn should_execute_queued(&self, queued: &QueuedRequest) -> bool {
@@ -4878,6 +5311,31 @@ fn answer_progressive_flush_enabled(reasoning_display: ReasoningDisplay) -> bool
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn execution_lane_allows_steer_only_for_active_head_without_backlog() {
+        assert!(
+            !ExecutionLaneState {
+                active: false,
+                waiting: 0,
+            }
+            .can_steer()
+        );
+        assert!(
+            ExecutionLaneState {
+                active: true,
+                waiting: 0,
+            }
+            .can_steer()
+        );
+        assert!(
+            !ExecutionLaneState {
+                active: true,
+                waiting: 1,
+            }
+            .can_steer()
+        );
+    }
 
     #[test]
     fn compact_empty_success_reports_unknown_state() {

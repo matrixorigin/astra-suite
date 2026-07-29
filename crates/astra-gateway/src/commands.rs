@@ -1122,6 +1122,7 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
                         repo,
                         &conversation,
                         ctx.active_requests,
+                        ctx.gateway_start,
                         "cancelled by user via /cancel all",
                     )
                     .await,
@@ -1199,6 +1200,7 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
                         repo,
                         &conversation,
                         ctx.active_requests,
+                        ctx.gateway_start,
                         if command_name == "/kill" {
                             "interrupted by user via /esc all (/kill alias)"
                         } else {
@@ -1229,6 +1231,37 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
                 }
                 return Some(format!("❌ 找不到匹配 `{arg}` 的请求"));
             };
+            if row.status == RequestStatus::Accepted {
+                return match repo
+                    .cancel_accepted_request(
+                        &conversation,
+                        row.trace_id.as_str(),
+                        if command_name == "/kill" {
+                            "cancelled by user via /esc (/kill alias)"
+                        } else {
+                            "cancelled by user via /esc"
+                        },
+                    )
+                    .await
+                {
+                    Ok(CancelRequestOutcome::Cancelled(r)) => {
+                        Some(format!("🚫 已取消: {}", truncate_text(&r.text_preview, 40)))
+                    }
+                    Ok(CancelRequestOutcome::AlreadyRunning(_)) => {
+                        Some("⚠️ 请求已开始投递或运行，请稍后再用 `/esc`。".into())
+                    }
+                    Ok(CancelRequestOutcome::NotFound) => {
+                        Some("⚠️ 请求状态已变化，未执行中断。".into())
+                    }
+                    Err(e) => Some(format!("⚠️ 中断失败: {e}")),
+                };
+            }
+            let has_live_token = ctx
+                .active_requests
+                .is_some_and(|tasks| tasks.contains_key(row.trace_id.as_str()));
+            if !has_live_token && !is_zombie_request(&row.created_at, ctx.gateway_start) {
+                return Some("⚠️ 请求正在投递，暂时无法撤回；请稍后再用 `/esc`。".into());
+            }
             match repo
                 .force_fail_request(
                     &row.trace_id,
@@ -1761,6 +1794,7 @@ async fn kill_or_cancel_all(
     repo: &dyn TraceRepository,
     conversation: &ConversationKey,
     active_requests: Option<&dashmap::DashMap<String, tokio_util::sync::CancellationToken>>,
+    gateway_start: chrono::DateTime<chrono::Utc>,
     reason: &str,
 ) -> String {
     let rows = match repo.list_active_requests(conversation, 200).await {
@@ -1774,6 +1808,38 @@ async fn kill_or_cancel_all(
     let mut live_interrupted = 0usize;
     let mut zombie_cleared = 0usize;
     for row in &rows {
+        if row.status == RequestStatus::Accepted {
+            match repo
+                .cancel_accepted_request(conversation, row.trace_id.as_str(), reason)
+                .await
+            {
+                Ok(CancelRequestOutcome::Cancelled(_)) => db_cleared += 1,
+                Ok(CancelRequestOutcome::AlreadyRunning(_)) => {}
+                Ok(CancelRequestOutcome::NotFound) => zombie_cleared += 1,
+                Err(e) => {
+                    tracing::warn!(
+                        target: "gateway::commands",
+                        trace_id = %row.trace_id.as_str(),
+                        error = %e,
+                        "cancel_accepted_request failed during /esc all"
+                    );
+                }
+            }
+            if let Some(tasks) = active_requests
+                && let Some((_, token)) = tasks.remove(row.trace_id.as_str())
+            {
+                token.cancel();
+                live_interrupted += 1;
+            }
+            continue;
+        }
+        let has_live_token =
+            active_requests.is_some_and(|tasks| tasks.contains_key(row.trace_id.as_str()));
+        if !has_live_token && !is_zombie_request(&row.created_at, gateway_start) {
+            // A current-process Running request without a token is in the
+            // atomic steering-dispatch window. It cannot be safely retracted.
+            continue;
+        }
         match repo.force_fail_request(&row.trace_id, reason).await {
             Ok(true) => db_cleared += 1,
             Ok(false) => {

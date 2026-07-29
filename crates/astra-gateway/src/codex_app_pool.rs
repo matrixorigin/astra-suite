@@ -9,6 +9,7 @@ use crate::cli_bridge::{
 use crate::mcp::config::CodexMcpConfig;
 use serde_json::Value;
 use std::collections::HashMap;
+use std::fmt;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -19,14 +20,42 @@ use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 type ConversationKey = String;
-type PendingResponses = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, String>>>>>;
+type PendingResponses =
+    Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, AppServerRequestError>>>>>;
 const TOOL_PARAM_MAX_CHARS: usize = 160;
 const TOOL_NAME_MAX_CHARS: usize = 80;
 const APP_SERVER_RPC_TIMEOUT: Duration = Duration::from_secs(30);
 const APPROVAL_RESPONSE_TIMEOUT: Duration = Duration::from_secs(15);
 
 pub(crate) struct CodexAppPool {
-    processes: HashMap<ConversationKey, ProcessHandle>,
+    processes: HashMap<ConversationKey, Arc<ProcessHandle>>,
+}
+
+#[derive(Debug)]
+enum AppServerRequestError {
+    Rejected(String),
+    OutcomeUnknown(String),
+}
+
+impl fmt::Display for AppServerRequestError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Rejected(message) | Self::OutcomeUnknown(message) => f.write_str(message),
+        }
+    }
+}
+
+pub(crate) enum CodexSteerOutcome {
+    Accepted { turn_id: String },
+    NoActiveTurn,
+    Rejected { error: String },
+    OutcomeUnknown { error: String },
+}
+
+pub(crate) struct CodexSteerRequest {
+    handle: Arc<ProcessHandle>,
+    message: String,
+    client_user_message_id: Option<String>,
 }
 
 struct ProcessHandle {
@@ -173,6 +202,22 @@ impl CodexAppPool {
             )
             .await?;
         Ok(())
+    }
+
+    /// Prepare a same-turn steering request without holding the pool lock
+    /// while the JSON-RPC response is pending.
+    pub fn prepare_steer(
+        &self,
+        key: &str,
+        message: &str,
+        client_user_message_id: Option<&str>,
+    ) -> Option<CodexSteerRequest> {
+        let handle = self.processes.get(key)?.clone();
+        Some(CodexSteerRequest {
+            handle,
+            message: message.to_string(),
+            client_user_message_id: client_user_message_id.map(str::to_string),
+        })
     }
 
     pub fn kill(&mut self, key: &str) {
@@ -418,9 +463,58 @@ impl CodexAppPool {
             .to_string();
         *handle.thread_id.lock().await = Some(tid);
 
-        self.processes.insert(key.to_string(), handle);
+        self.processes.insert(key.to_string(), Arc::new(handle));
         tracing::info!(pid, key, "spawned codex app-server process");
         Ok(())
+    }
+}
+
+impl CodexSteerRequest {
+    pub async fn execute(self) -> CodexSteerOutcome {
+        let Some(thread_id) = self.handle.thread_id.lock().await.clone() else {
+            return CodexSteerOutcome::NoActiveTurn;
+        };
+        let Some(turn_id) = self.handle.active_turn_id.lock().await.clone() else {
+            return CodexSteerOutcome::NoActiveTurn;
+        };
+
+        let response = self
+            .handle
+            .request_classified(
+                "turn/steer",
+                turn_steer_params(
+                    &thread_id,
+                    &turn_id,
+                    &self.message,
+                    self.client_user_message_id.as_deref(),
+                ),
+                APP_SERVER_RPC_TIMEOUT,
+            )
+            .await;
+        let response = match response {
+            Ok(response) => response,
+            Err(AppServerRequestError::Rejected(error)) => {
+                return CodexSteerOutcome::Rejected { error };
+            }
+            Err(AppServerRequestError::OutcomeUnknown(error)) => {
+                return CodexSteerOutcome::OutcomeUnknown { error };
+            }
+        };
+        let Some(accepted_turn_id) = response["turnId"].as_str() else {
+            return CodexSteerOutcome::OutcomeUnknown {
+                error: "codex turn/steer response missing turnId".to_string(),
+            };
+        };
+        if accepted_turn_id != turn_id {
+            return CodexSteerOutcome::OutcomeUnknown {
+                error: format!(
+                    "codex turn/steer accepted unexpected turn `{accepted_turn_id}` (expected `{turn_id}`)"
+                ),
+            };
+        }
+        CodexSteerOutcome::Accepted {
+            turn_id: accepted_turn_id.to_string(),
+        }
     }
 }
 
@@ -452,6 +546,27 @@ fn apply_turn_profile_params(params: &mut Value, profile: &CliProfile) {
     }
 }
 
+fn turn_steer_params(
+    thread_id: &str,
+    turn_id: &str,
+    message: &str,
+    client_user_message_id: Option<&str>,
+) -> Value {
+    let mut params = serde_json::json!({
+        "threadId": thread_id,
+        "input": [{
+            "type": "text",
+            "text": message,
+            "text_elements": []
+        }],
+        "expectedTurnId": turn_id,
+    });
+    if let Some(client_id) = client_user_message_id.filter(|id| !id.trim().is_empty()) {
+        params["clientUserMessageId"] = Value::String(client_id.to_string());
+    }
+    params
+}
+
 impl ProcessHandle {
     async fn request(&self, method: &str, params: Value) -> Result<Value, String> {
         self.request_with_timeout(method, params, APP_SERVER_RPC_TIMEOUT)
@@ -464,6 +579,17 @@ impl ProcessHandle {
         params: Value,
         timeout_duration: Duration,
     ) -> Result<Value, String> {
+        self.request_classified(method, params, timeout_duration)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    async fn request_classified(
+        &self,
+        method: &str,
+        params: Value,
+        timeout_duration: Duration,
+    ) -> Result<Value, AppServerRequestError> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
         self.pending.lock().await.insert(id, tx);
@@ -474,18 +600,21 @@ impl ProcessHandle {
         });
         if self.request_tx.send(msg).await.is_err() {
             let _ = self.pending.lock().await.remove(&id);
-            return Err("codex app-server stdin closed".to_string());
+            return Err(AppServerRequestError::Rejected(
+                "codex app-server stdin closed".to_string(),
+            ));
         }
         match tokio::time::timeout(timeout_duration, rx).await {
-            Ok(response) => {
-                response.map_err(|_| "codex app-server response channel closed".to_string())?
-            }
+            Ok(Ok(response)) => response,
+            Ok(Err(_)) => Err(AppServerRequestError::OutcomeUnknown(
+                "codex app-server response channel closed".to_string(),
+            )),
             Err(_) => {
                 let _ = self.pending.lock().await.remove(&id);
-                Err(format!(
+                Err(AppServerRequestError::OutcomeUnknown(format!(
                     "codex app-server `{method}` timed out after {}s",
                     timeout_duration.as_secs()
-                ))
+                )))
             }
         }
     }
@@ -702,7 +831,7 @@ async fn stdout_reader_task(
                             let tx = pending.lock().await.remove(&id);
                             if let Some(tx) = tx {
                                 let res = if let Some(err) = v.get("error") {
-                                    Err(err.to_string())
+                                    Err(AppServerRequestError::Rejected(err.to_string()))
                                 } else {
                                     Ok(v.get("result").cloned().unwrap_or(Value::Null))
                                 };
@@ -1187,7 +1316,9 @@ async fn send_progress(
 async fn fail_pending(pending: &PendingResponses, error: &str) {
     let mut guard = pending.lock().await;
     for (_, tx) in guard.drain() {
-        let _ = tx.send(Err(error.to_string()));
+        let _ = tx.send(Err(AppServerRequestError::OutcomeUnknown(
+            error.to_string(),
+        )));
     }
 }
 
@@ -1228,6 +1359,35 @@ async fn stderr_drainer_task(stderr: tokio::process::ChildStderr, cancel: Cancel
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_process_handle(
+        active_turn_id: Option<&str>,
+    ) -> (Arc<ProcessHandle>, mpsc::Receiver<Value>) {
+        let (request_tx, request_rx) = mpsc::channel(8);
+        let handle = ProcessHandle {
+            request_tx,
+            pending: Arc::new(Mutex::new(HashMap::new())),
+            next_id: AtomicU64::new(1),
+            progress_slot: Arc::new(Mutex::new(None)),
+            cancel: CancellationToken::new(),
+            thread_id: Arc::new(Mutex::new(Some("thread-1".to_string()))),
+            active_turn_id: Arc::new(Mutex::new(active_turn_id.map(str::to_string))),
+            last_text: Arc::new(Mutex::new(String::new())),
+            tokens_prompt: Arc::new(Mutex::new(None)),
+            tokens_completion: Arc::new(Mutex::new(None)),
+            cached_input_tokens: Arc::new(Mutex::new(None)),
+            reasoning_output_tokens: Arc::new(Mutex::new(None)),
+            total_tokens: Arc::new(Mutex::new(None)),
+            context_window: Arc::new(Mutex::new(None)),
+            raw_usage_json: Arc::new(Mutex::new(None)),
+            tool_calls_count: Arc::new(Mutex::new(0)),
+            tools_used: Arc::new(Mutex::new(Vec::new())),
+            last_error: Arc::new(Mutex::new(None)),
+            turn_failed: Arc::new(Mutex::new(false)),
+            approval_id: Arc::new(Mutex::new(None)),
+        };
+        (Arc::new(handle), request_rx)
+    }
 
     #[test]
     fn thread_start_uses_codex_profile_fields() {
@@ -1431,6 +1591,126 @@ mod tests {
             params["config"]["mcp_servers"]["gateway"]["env"]["GW_MCP_CHAT_ID"],
             "chat-1"
         );
+    }
+
+    #[test]
+    fn turn_steer_includes_active_turn_precondition_and_client_message_id() {
+        let params = turn_steer_params(
+            "thread-1",
+            "turn-1",
+            "Actually run the failing test first.",
+            Some("message-1"),
+        );
+
+        assert_eq!(params["threadId"], "thread-1");
+        assert_eq!(params["expectedTurnId"], "turn-1");
+        assert_eq!(params["clientUserMessageId"], "message-1");
+        assert_eq!(
+            params["input"],
+            serde_json::json!([{
+                "type": "text",
+                "text": "Actually run the failing test first.",
+                "text_elements": []
+            }])
+        );
+    }
+
+    #[test]
+    fn turn_steer_omits_empty_client_message_id() {
+        let params = turn_steer_params("thread-1", "turn-1", "continue", Some("  "));
+
+        assert!(params.get("clientUserMessageId").is_none());
+    }
+
+    #[tokio::test]
+    async fn steer_request_accepts_matching_turn_response() {
+        let (handle, mut request_rx) = test_process_handle(Some("turn-1"));
+        let request = CodexSteerRequest {
+            handle: handle.clone(),
+            message: "change direction".to_string(),
+            client_user_message_id: Some("message-1".to_string()),
+        };
+
+        let task = tokio::spawn(request.execute());
+        let rpc = request_rx.recv().await.expect("steer RPC should be sent");
+        assert_eq!(rpc["method"], "turn/steer");
+        assert_eq!(rpc["params"]["expectedTurnId"], "turn-1");
+        let id = rpc["id"].as_u64().unwrap();
+        handle
+            .pending
+            .lock()
+            .await
+            .remove(&id)
+            .unwrap()
+            .send(Ok(serde_json::json!({"turnId": "turn-1"})))
+            .unwrap();
+
+        assert!(matches!(
+            task.await.unwrap(),
+            CodexSteerOutcome::Accepted { turn_id } if turn_id == "turn-1"
+        ));
+    }
+
+    #[tokio::test]
+    async fn steer_request_reports_no_active_turn_without_sending_rpc() {
+        let (handle, mut request_rx) = test_process_handle(None);
+        let outcome = CodexSteerRequest {
+            handle,
+            message: "change direction".to_string(),
+            client_user_message_id: None,
+        }
+        .execute()
+        .await;
+
+        assert!(matches!(outcome, CodexSteerOutcome::NoActiveTurn));
+        assert!(request_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn steer_timeout_is_outcome_unknown_not_rejected() {
+        let (handle, _request_rx) = test_process_handle(Some("turn-1"));
+        let result = handle
+            .request_classified(
+                "turn/steer",
+                serde_json::json!({}),
+                Duration::from_millis(1),
+            )
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(AppServerRequestError::OutcomeUnknown(message))
+                if message.contains("timed out")
+        ));
+    }
+
+    #[tokio::test]
+    async fn explicit_rpc_error_is_safe_rejection() {
+        let (handle, mut request_rx) = test_process_handle(Some("turn-1"));
+        let request_handle = handle.clone();
+        let task = tokio::spawn(async move {
+            request_handle
+                .request_classified("turn/steer", serde_json::json!({}), Duration::from_secs(1))
+                .await
+        });
+        let rpc = request_rx.recv().await.unwrap();
+        let id = rpc["id"].as_u64().unwrap();
+        handle
+            .pending
+            .lock()
+            .await
+            .remove(&id)
+            .unwrap()
+            .send(Err(AppServerRequestError::Rejected(
+                "no active turn to steer".to_string(),
+            )))
+            .unwrap();
+
+        assert!(matches!(
+            task.await.unwrap(),
+            Err(AppServerRequestError::Rejected(message))
+                if message.contains("no active turn")
+        ));
     }
 
     #[tokio::test]

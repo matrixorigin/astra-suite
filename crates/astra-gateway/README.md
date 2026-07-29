@@ -11,6 +11,7 @@ attachments, scheduled tasks, and full observability.
 |--------------------|-------------|
 | **Multi-CLI**      | claude / codex / copilot / astra — switch at runtime via `/cli`. |
 | **Multi-model**    | `/model haiku\|sonnet\|opus\|minimax\|deepseek\|qwen\|glm` |
+| **Live steering**  | Plain-text follow-ups can redirect an active Codex app-server turn without waiting for it to finish. |
 | **Sessions**       | Per-user isolation, auto-reset (daily / idle), history, switch. |
 | **MCP tools**      | Agent-callable reminders, cron jobs, workspace listing, and file sending. |
 | **Cron & tasks**   | Recurring jobs and one-time reminders, via slash commands or MCP tools. |
@@ -137,6 +138,16 @@ agents through `gateway_send_attachment`.
 
 Natural language also works — when MCP is enabled, the agent can call gateway
 tools to schedule cron jobs or set reminders on your behalf.
+
+When Codex is running through app-server mode, a new plain-text message in the
+same conversation is sent to the active turn with `turn/steer`. Codex consumes
+it at the next agent/model step, after any tool call already in progress
+returns. If no turn is active, the turn finishes during the handoff, or Codex
+rejects steering, the message falls back to the normal conversation queue.
+An ambiguous transport timeout is not requeued, preventing duplicate execution,
+and the user receives a warning. Messages with attachments remain queued so
+media preparation is preserved; later text messages cannot overtake an already
+queued attachment or scheduled turn.
 
 ## Configuration
 

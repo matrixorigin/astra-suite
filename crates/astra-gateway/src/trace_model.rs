@@ -234,6 +234,9 @@ pub enum GatewayEventKind {
     RequestRunning,
     RequestCancelled,
     RequestShutdown,
+    TurnSteerAccepted,
+    TurnSteerFallback,
+    TurnSteerOutcomeUnknown,
     PolicyDenied,
     CliProgress,
     Feedback,
@@ -256,6 +259,9 @@ impl GatewayEventKind {
             Self::RequestRunning => "request_running",
             Self::RequestCancelled => "request_cancelled",
             Self::RequestShutdown => "request_shutdown",
+            Self::TurnSteerAccepted => "turn_steer_accepted",
+            Self::TurnSteerFallback => "turn_steer_fallback",
+            Self::TurnSteerOutcomeUnknown => "turn_steer_outcome_unknown",
             Self::PolicyDenied => "policy_denied",
             Self::CliProgress => "cli_progress",
             Self::Feedback => "feedback",
@@ -278,6 +284,9 @@ impl GatewayEventKind {
             "request_running" => Self::RequestRunning,
             "request_cancelled" => Self::RequestCancelled,
             "request_shutdown" => Self::RequestShutdown,
+            "turn_steer_accepted" => Self::TurnSteerAccepted,
+            "turn_steer_fallback" => Self::TurnSteerFallback,
+            "turn_steer_outcome_unknown" => Self::TurnSteerOutcomeUnknown,
             "policy_denied" => Self::PolicyDenied,
             "cli_progress" => Self::CliProgress,
             "feedback" => Self::Feedback,
@@ -484,6 +493,44 @@ pub trait TraceRepository: Send + Sync {
         status: RequestStatus,
         error_message: Option<&str>,
     ) -> TraceResult<()>;
+    /// Atomically change one request from an expected status.
+    async fn transition_request_if(
+        &self,
+        request_id: &RequestId,
+        expected: RequestStatus,
+        next: RequestStatus,
+        error_message: Option<&str>,
+    ) -> TraceResult<bool>;
+
+    async fn claim_accepted_request(&self, request_id: &RequestId) -> TraceResult<bool> {
+        self.transition_request_if(
+            request_id,
+            RequestStatus::Accepted,
+            RequestStatus::Running,
+            None,
+        )
+        .await
+    }
+
+    async fn release_steer_claim(&self, request_id: &RequestId) -> TraceResult<bool> {
+        self.transition_request_if(
+            request_id,
+            RequestStatus::Running,
+            RequestStatus::Accepted,
+            None,
+        )
+        .await
+    }
+
+    async fn fail_if_accepted(&self, request_id: &RequestId, reason: &str) -> TraceResult<bool> {
+        self.transition_request_if(
+            request_id,
+            RequestStatus::Accepted,
+            RequestStatus::Failed,
+            Some(reason),
+        )
+        .await
+    }
     async fn create_run(&self, run: &GatewayRun) -> TraceResult<()>;
     async fn finish_run(
         &self,
@@ -594,8 +641,14 @@ pub trait TraceRepository: Send + Sync {
             return Ok(CancelRequestOutcome::NotFound);
         }
 
-        self.update_request_status(&request.request_id, RequestStatus::Failed, Some(reason))
-            .await?;
+        if !self.fail_if_accepted(&request.request_id, reason).await? {
+            return match self.get_request(&request.request_id).await? {
+                Some(current) if current.status == RequestStatus::Running => {
+                    Ok(CancelRequestOutcome::AlreadyRunning(request))
+                }
+                _ => Ok(CancelRequestOutcome::NotFound),
+            };
+        }
         self.append_event(&NewGatewayEvent {
             trace_id: request.trace_id.clone(),
             request_id: request.request_id.clone(),
@@ -694,6 +747,18 @@ impl<'a> TraceWriter<'a> {
     pub async fn mark_running(&self) -> TraceResult<()> {
         self.append(GatewayEventKind::RequestRunning, serde_json::json!({}))
             .await
+    }
+
+    pub async fn claim_for_steer(&self) -> TraceResult<bool> {
+        if !self.repo.claim_accepted_request(&self.request_id).await? {
+            return Ok(false);
+        }
+        self.mark_running().await?;
+        Ok(true)
+    }
+
+    pub async fn release_steer_claim(&self) -> TraceResult<bool> {
+        self.repo.release_steer_claim(&self.request_id).await
     }
 
     pub async fn mark_cancelled(&self, reason: &str) -> TraceResult<()> {
@@ -1074,6 +1139,27 @@ impl TraceRepository for MysqlTraceRepository {
             ));
         }
         Ok(())
+    }
+
+    async fn transition_request_if(
+        &self,
+        request_id: &RequestId,
+        expected: RequestStatus,
+        next: RequestStatus,
+        error_message: Option<&str>,
+    ) -> TraceResult<bool> {
+        let result = sqlx::query(
+            "UPDATE gw_trace_requests SET status = ?, error_message = ?, updated_at = NOW(6)
+             WHERE request_id = ? AND status = ?",
+        )
+        .bind(next.as_str())
+        .bind(error_message)
+        .bind(request_id.as_str())
+        .bind(expected.as_str())
+        .execute(&self.pool)
+        .await
+        .map_err(|e| format!("conditional request transition failed: {e}"))?;
+        Ok(result.rows_affected() == 1)
     }
 
     async fn create_run(&self, run: &GatewayRun) -> TraceResult<()> {
@@ -1843,6 +1929,28 @@ impl TraceRepository for SqliteTraceRepository {
         Ok(())
     }
 
+    async fn transition_request_if(
+        &self,
+        request_id: &RequestId,
+        expected: RequestStatus,
+        next: RequestStatus,
+        error_message: Option<&str>,
+    ) -> TraceResult<bool> {
+        let result = sqlx::query(
+            "UPDATE gw_trace_requests SET status = ?, error_message = ?,
+                    updated_at = strftime('%Y-%m-%d %H:%M:%f', 'now')
+             WHERE request_id = ? AND status = ?",
+        )
+        .bind(next.as_str())
+        .bind(error_message)
+        .bind(request_id.as_str())
+        .bind(expected.as_str())
+        .execute(&self.pool)
+        .await
+        .map_err(|e| format!("conditional request transition failed: {e}"))?;
+        Ok(result.rows_affected() == 1)
+    }
+
     async fn create_run(&self, run: &GatewayRun) -> TraceResult<()> {
         sqlx::query(
             "INSERT INTO gw_trace_runs
@@ -2436,6 +2544,25 @@ impl TraceRepository for InMemoryTraceRepository {
         request.status = status;
         request.error_message = error_message.map(str::to_string);
         Ok(())
+    }
+
+    async fn transition_request_if(
+        &self,
+        request_id: &RequestId,
+        expected: RequestStatus,
+        next: RequestStatus,
+        error_message: Option<&str>,
+    ) -> TraceResult<bool> {
+        let mut state = self.state.lock().unwrap();
+        let Some((request, _)) = state.requests.get_mut(request_id) else {
+            return Ok(false);
+        };
+        if request.status != expected {
+            return Ok(false);
+        }
+        request.status = next;
+        request.error_message = error_message.map(str::to_string);
+        Ok(true)
     }
 
     async fn create_run(&self, run: &GatewayRun) -> TraceResult<()> {
@@ -3428,6 +3555,66 @@ mod tests {
         let kinds: Vec<_> = events.iter().map(|e| e.kind).collect();
         assert!(kinds.contains(&GatewayEventKind::RunFailed));
         assert!(kinds.contains(&GatewayEventKind::RequestFailed));
+    }
+
+    #[tokio::test]
+    async fn steering_claim_is_atomic_and_releasable() {
+        let repo = InMemoryTraceRepository::default();
+        let request = GatewayRequest::new(
+            ConversationKey::new("test", "chat", "codex"),
+            "msg-claim",
+            "user",
+            "steer me",
+        );
+        let request_id = request.request_id.clone();
+        repo.create_request(&request).await.unwrap();
+
+        assert!(repo.claim_accepted_request(&request_id).await.unwrap());
+        assert!(!repo.claim_accepted_request(&request_id).await.unwrap());
+        assert_eq!(
+            repo.get_request(&request_id).await.unwrap().unwrap().status,
+            RequestStatus::Running
+        );
+
+        assert!(repo.release_steer_claim(&request_id).await.unwrap());
+        assert_eq!(
+            repo.get_request(&request_id).await.unwrap().unwrap().status,
+            RequestStatus::Accepted
+        );
+    }
+
+    #[tokio::test]
+    async fn steering_claim_wins_over_stale_cancel_snapshot() {
+        let repo = InMemoryTraceRepository::default();
+        let conversation = ConversationKey::new("test", "chat", "codex");
+        let request = GatewayRequest::new(conversation.clone(), "msg-race", "user", "steer me");
+        let request_id = request.request_id.clone();
+        repo.create_request(&request).await.unwrap();
+
+        let stale = repo.list_active_requests(&conversation, 1).await.unwrap();
+        assert_eq!(stale[0].status, RequestStatus::Accepted);
+        assert!(repo.claim_accepted_request(&request_id).await.unwrap());
+
+        assert!(
+            !repo
+                .fail_if_accepted(&request_id, "stale cancellation")
+                .await
+                .unwrap()
+        );
+        assert!(matches!(
+            repo.cancel_accepted_request(
+                &conversation,
+                request.trace_id.as_str(),
+                "user cancellation"
+            )
+            .await
+            .unwrap(),
+            CancelRequestOutcome::AlreadyRunning(_)
+        ));
+        assert_eq!(
+            repo.get_request(&request_id).await.unwrap().unwrap().status,
+            RequestStatus::Running
+        );
     }
 
     // ── GAP 5: cancel_accepted_request coverage ─────────────────
