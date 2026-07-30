@@ -3931,7 +3931,9 @@ impl GatewayRunner {
                             trace.trace_id.clone(),
                             trace.request_id.clone(),
                         );
-                        let _ = writer.fail_request("request produced no response").await;
+                        let _ = writer
+                            .fail_request_if_active("request produced no response")
+                            .await;
                     }
                 }
             }

@@ -44,6 +44,8 @@ struct ProcessHandle {
     last_usage_snapshot: Arc<Mutex<Option<ClaudeUsageSnapshot>>>,
     /// Current turn generation — incremented on each begin_turn.
     generation: Arc<AtomicU64>,
+    /// Generation currently executing inside Claude, or zero while idle.
+    active_generation: Arc<AtomicU64>,
     interrupted_generation: Arc<AtomicU64>,
     next_control_request_id: AtomicU64,
     control_waiters: ControlWaiters,
@@ -62,6 +64,7 @@ struct StdoutState {
     last_result: Arc<Mutex<Option<serde_json::Value>>>,
     last_local_command_output: Arc<Mutex<Option<String>>>,
     generation: Arc<AtomicU64>,
+    active_generation: Arc<AtomicU64>,
     interrupted_generation: Arc<AtomicU64>,
     control_waiters: ControlWaiters,
 }
@@ -124,6 +127,10 @@ impl CliProcessPool {
 
         // Increment generation and register new progress channel
         let turn_gen = handle.generation.fetch_add(1, Ordering::Relaxed) + 1;
+        handle
+            .active_generation
+            .compare_exchange(0, turn_gen, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|active| format!("Claude turn {active} is still active"))?;
         let (progress_tx, progress_rx) = mpsc::channel(256);
         *handle.progress_slot.lock().await = (turn_gen, Some(progress_tx));
 
@@ -137,11 +144,24 @@ impl CliProcessPool {
         });
         let json_line = format!("{}\n", serde_json::to_string(&payload).unwrap());
 
-        handle
+        if handle
             .stdin_tx
             .send(StdinCommand::UserMessage(json_line))
             .await
-            .map_err(|_| "process stdin closed (process may have died)".to_string())?;
+            .is_err()
+        {
+            let _ = handle.active_generation.compare_exchange(
+                turn_gen,
+                0,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+            let mut slot = handle.progress_slot.lock().await;
+            if slot.0 == turn_gen {
+                slot.1 = None;
+            }
+            return Err("process stdin closed (process may have died)".to_string());
+        }
 
         Ok(progress_rx)
     }
@@ -151,6 +171,10 @@ impl CliProcessPool {
             .processes
             .get(key)
             .ok_or("no process for conversation")?;
+        let turn_generation = handle.active_generation.load(Ordering::Acquire);
+        if turn_generation == 0 {
+            return Err("no active Claude turn".to_string());
+        }
         let request_id = format!(
             "astra_interrupt_{}",
             handle
@@ -161,7 +185,7 @@ impl CliProcessPool {
         handle.control_waiters.lock().await.insert(
             request_id.clone(),
             ControlWaiter {
-                turn_generation: handle.generation.load(Ordering::Acquire),
+                turn_generation,
                 response_tx,
             },
         );
@@ -206,13 +230,7 @@ impl CliProcessPool {
         let value = handle.last_result.lock().await.take()?;
         let mut result = cli_bridge::parse_claude_result_value(&value, 0);
         let turn_generation = handle.generation.load(Ordering::Acquire);
-        if handle
-            .interrupted_generation
-            .compare_exchange(turn_generation, 0, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-        {
-            mark_result_interrupted(&mut result);
-        }
+        apply_acknowledged_interrupt(&mut result, turn_generation, &handle.interrupted_generation);
         let local_command_output = handle.last_local_command_output.lock().await.take();
         cli_bridge::apply_claude_local_command_output(&mut result, local_command_output);
         // Preserve the existing persistent-mode interpretation: a single
@@ -294,6 +312,7 @@ impl CliProcessPool {
         let last_usage_snapshot: Arc<Mutex<Option<ClaudeUsageSnapshot>>> =
             Arc::new(Mutex::new(None));
         let generation = Arc::new(AtomicU64::new(0));
+        let active_generation = Arc::new(AtomicU64::new(0));
         let interrupted_generation = Arc::new(AtomicU64::new(0));
         let control_waiters = Arc::new(Mutex::new(HashMap::new()));
         let stderr_hint: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
@@ -317,6 +336,7 @@ impl CliProcessPool {
                 last_result: last_result.clone(),
                 last_local_command_output: last_local_command_output.clone(),
                 generation: generation.clone(),
+                active_generation: active_generation.clone(),
                 interrupted_generation: interrupted_generation.clone(),
                 control_waiters: control_waiters.clone(),
             },
@@ -348,6 +368,7 @@ impl CliProcessPool {
             last_local_command_output,
             last_usage_snapshot,
             generation,
+            active_generation,
             interrupted_generation,
             next_control_request_id: AtomicU64::new(1),
             control_waiters,
@@ -484,6 +505,33 @@ fn mark_result_interrupted(result: &mut CliResult) {
     result.error_kind = Some(CLAUDE_INTERRUPTED_ERROR_KIND.to_string());
 }
 
+fn apply_acknowledged_interrupt(
+    result: &mut CliResult,
+    turn_generation: u64,
+    interrupted_generation: &AtomicU64,
+) {
+    let was_interrupted = interrupted_generation
+        .compare_exchange(turn_generation, 0, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok();
+    if was_interrupted && !result.success {
+        mark_result_interrupted(result);
+    }
+}
+
+fn acknowledge_interrupt(
+    result: Result<(), String>,
+    turn_generation: u64,
+    active_generation: &AtomicU64,
+    interrupted_generation: &AtomicU64,
+) -> Result<(), String> {
+    result?;
+    active_generation
+        .compare_exchange(turn_generation, 0, Ordering::AcqRel, Ordering::Acquire)
+        .map_err(|_| "no matching active Claude turn".to_string())?;
+    interrupted_generation.store(turn_generation, Ordering::Release);
+    Ok(())
+}
+
 async fn stdout_reader_task(
     stdout: tokio::process::ChildStdout,
     state: StdoutState,
@@ -495,6 +543,7 @@ async fn stdout_reader_task(
         last_result,
         last_local_command_output,
         generation,
+        active_generation,
         interrupted_generation,
         control_waiters,
     } = state;
@@ -521,16 +570,24 @@ async fn stdout_reader_task(
                                 if let Some(waiter) =
                                     control_waiters.lock().await.remove(request_id)
                                 {
-                                    if result.is_ok() {
-                                        interrupted_generation
-                                            .store(waiter.turn_generation, Ordering::Release);
-                                    }
+                                    let result = acknowledge_interrupt(
+                                        result,
+                                        waiter.turn_generation,
+                                        &active_generation,
+                                        &interrupted_generation,
+                                    );
                                     let _ = waiter.response_tx.send(result);
                                 }
                                 continue;
                             }
                             // Check for result event (turn complete)
                             if v["type"].as_str() == Some("result") {
+                                let _ = active_generation.compare_exchange(
+                                    current_gen,
+                                    0,
+                                    Ordering::AcqRel,
+                                    Ordering::Acquire,
+                                );
                                 if let Some(sid) = v["session_id"].as_str() {
                                     *session_id.lock().await = Some(sid.to_string());
                                 }
@@ -655,6 +712,15 @@ mod tests {
 
     #[test]
     fn acknowledged_interrupt_is_not_a_provider_error() {
+        let active_generation = AtomicU64::new(7);
+        let interrupted_generation = AtomicU64::new(0);
+        assert_eq!(
+            acknowledge_interrupt(Ok(()), 7, &active_generation, &interrupted_generation),
+            Ok(())
+        );
+        assert_eq!(active_generation.load(Ordering::Acquire), 0);
+        assert_eq!(interrupted_generation.load(Ordering::Acquire), 7);
+
         let mut result = cli_bridge::parse_claude_result_value(
             &serde_json::json!({
                 "type": "result",
@@ -666,7 +732,7 @@ mod tests {
         );
         assert!(result.provider_error.is_some());
 
-        mark_result_interrupted(&mut result);
+        apply_acknowledged_interrupt(&mut result, 7, &interrupted_generation);
 
         assert!(result.provider_error.is_none());
         assert!(!result.success);
@@ -674,5 +740,39 @@ mod tests {
             result.error_kind.as_deref(),
             Some(CLAUDE_INTERRUPTED_ERROR_KIND)
         );
+    }
+
+    #[test]
+    fn acknowledged_idle_race_preserves_successful_result() {
+        let interrupted_generation = AtomicU64::new(7);
+        let mut result = cli_bridge::parse_claude_result_value(
+            &serde_json::json!({
+                "type": "result",
+                "subtype": "success",
+                "is_error": false,
+                "result": "completed normally",
+                "session_id": "session-1",
+            }),
+            0,
+        );
+
+        apply_acknowledged_interrupt(&mut result, 7, &interrupted_generation);
+
+        assert!(result.success);
+        assert!(result.error_kind.is_none());
+        assert!(result.provider_error.is_none());
+        assert_eq!(interrupted_generation.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn idle_interrupt_ack_is_rejected_and_cannot_mark_a_result() {
+        let active_generation = AtomicU64::new(0);
+        let interrupted_generation = AtomicU64::new(0);
+
+        assert_eq!(
+            acknowledge_interrupt(Ok(()), 7, &active_generation, &interrupted_generation),
+            Err("no matching active Claude turn".to_string())
+        );
+        assert_eq!(interrupted_generation.load(Ordering::Acquire), 0);
     }
 }

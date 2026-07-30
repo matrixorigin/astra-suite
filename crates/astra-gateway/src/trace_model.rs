@@ -856,6 +856,22 @@ impl<'a> TraceWriter<'a> {
         .await
     }
 
+    pub async fn fail_request_if_active(&self, error_message: &str) -> TraceResult<bool> {
+        if !self
+            .repo
+            .force_fail_request(&self.trace_id, error_message)
+            .await?
+        {
+            return Ok(false);
+        }
+        self.append(
+            GatewayEventKind::RequestFailed,
+            serde_json::json!({"error": error_message}),
+        )
+        .await?;
+        Ok(true)
+    }
+
     pub async fn enqueue_outbox(
         &self,
         platform: &str,
@@ -3555,6 +3571,41 @@ mod tests {
         let kinds: Vec<_> = events.iter().map(|e| e.kind).collect();
         assert!(kinds.contains(&GatewayEventKind::RunFailed));
         assert!(kinds.contains(&GatewayEventKind::RequestFailed));
+    }
+
+    #[tokio::test]
+    async fn fail_request_if_active_does_not_overwrite_terminal_failure() {
+        let repo = InMemoryTraceRepository::default();
+        let conv = ConversationKey::new("wx", "c1", "claude");
+        let req = GatewayRequest::new(conv, "m1", "u1", "interrupt me");
+        let req_id = req.request_id.clone();
+        let trace_id = req.trace_id.clone();
+        let writer = TraceWriter::begin(&repo, req).await.unwrap();
+        writer.start_run("claude", None).await.unwrap();
+        writer
+            .fail_request("interrupted by follow-up message")
+            .await
+            .unwrap();
+
+        assert!(
+            !writer
+                .fail_request_if_active("request produced no response")
+                .await
+                .unwrap()
+        );
+        let stored = repo.get_request(&req_id).await.unwrap().unwrap();
+        assert_eq!(
+            stored.error_message.as_deref(),
+            Some("interrupted by follow-up message")
+        );
+        let events = repo.list_events_for_trace(&trace_id, 50).await.unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.kind == GatewayEventKind::RequestFailed)
+                .count(),
+            1
+        );
     }
 
     #[tokio::test]
