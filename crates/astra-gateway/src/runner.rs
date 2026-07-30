@@ -2499,6 +2499,33 @@ impl GatewayRunner {
             }
         };
 
+        if use_claude_pool
+            && result.error_kind.as_deref() == Some(crate::cli_pool::CLAUDE_INTERRUPTED_ERROR_KIND)
+        {
+            self.finalize_attempt(
+                &msg,
+                &effective_chat_id,
+                session_generation,
+                &cli_name,
+                &cli_profile,
+                trace.as_ref(),
+                trace_writer.as_ref(),
+                run_id.as_ref(),
+                session_id.as_deref(),
+                Some(&result),
+                AttemptOutcome::Cancelled,
+                Some("steered_by_followup"),
+                Some("interrupted by follow-up message"),
+                start.elapsed(),
+            )
+            .await;
+            tracing::info!(
+                tag = %request_tag,
+                "Claude turn interrupted by follow-up; suppressing terminal error"
+            );
+            return None;
+        }
+
         // Stale session recovery: if CLI says the stored session/thread is gone,
         // clear it and retry without resume. Some backends report this on stderr
         // while still exiting 0, so do not gate on exit_code.

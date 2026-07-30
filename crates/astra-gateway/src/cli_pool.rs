@@ -14,7 +14,14 @@ use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 type ConversationKey = String;
-type ControlWaiters = Arc<Mutex<HashMap<String, oneshot::Sender<Result<(), String>>>>>;
+type ControlWaiters = Arc<Mutex<HashMap<String, ControlWaiter>>>;
+
+pub(crate) const CLAUDE_INTERRUPTED_ERROR_KIND: &str = "claude_interrupted";
+
+struct ControlWaiter {
+    turn_generation: u64,
+    response_tx: oneshot::Sender<Result<(), String>>,
+}
 
 pub(crate) struct CliProcessPool {
     processes: HashMap<ConversationKey, ProcessHandle>,
@@ -37,6 +44,7 @@ struct ProcessHandle {
     last_usage_snapshot: Arc<Mutex<Option<ClaudeUsageSnapshot>>>,
     /// Current turn generation — incremented on each begin_turn.
     generation: Arc<AtomicU64>,
+    interrupted_generation: Arc<AtomicU64>,
     next_control_request_id: AtomicU64,
     control_waiters: ControlWaiters,
     /// Stderr hint: drainer stores notable errors (e.g. stale session) for the runner to check.
@@ -54,6 +62,7 @@ struct StdoutState {
     last_result: Arc<Mutex<Option<serde_json::Value>>>,
     last_local_command_output: Arc<Mutex<Option<String>>>,
     generation: Arc<AtomicU64>,
+    interrupted_generation: Arc<AtomicU64>,
     control_waiters: ControlWaiters,
 }
 
@@ -149,11 +158,13 @@ impl CliProcessPool {
                 .fetch_add(1, Ordering::Relaxed)
         );
         let (response_tx, response_rx) = oneshot::channel();
-        handle
-            .control_waiters
-            .lock()
-            .await
-            .insert(request_id.clone(), response_tx);
+        handle.control_waiters.lock().await.insert(
+            request_id.clone(),
+            ControlWaiter {
+                turn_generation: handle.generation.load(Ordering::Acquire),
+                response_tx,
+            },
+        );
         if handle
             .stdin_tx
             .send(StdinCommand::Interrupt {
@@ -165,16 +176,17 @@ impl CliProcessPool {
             handle.control_waiters.lock().await.remove(&request_id);
             return Err("stdin closed".to_string());
         }
-        let result =
-            match tokio::time::timeout(std::time::Duration::from_secs(5), response_rx).await {
-                Ok(Ok(result)) => result,
-                Ok(Err(_)) => Err("Claude interrupt response channel closed".to_string()),
-                Err(_) => Err("Claude interrupt response timed out".to_string()),
-            };
-        if result.is_err() {
-            handle.control_waiters.lock().await.remove(&request_id);
+        match tokio::time::timeout(std::time::Duration::from_secs(5), response_rx).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => {
+                handle.control_waiters.lock().await.remove(&request_id);
+                Err("Claude interrupt response channel closed".to_string())
+            }
+            // Keep the waiter after a timeout. A late acknowledgement still
+            // means Claude will emit an interrupted result that must not be
+            // reported as an upstream provider failure.
+            Err(_) => Err("Claude interrupt response timed out".to_string()),
         }
-        result
     }
 
     pub fn kill(&mut self, key: &str) {
@@ -193,6 +205,14 @@ impl CliProcessPool {
         let handle = self.processes.get(key)?;
         let value = handle.last_result.lock().await.take()?;
         let mut result = cli_bridge::parse_claude_result_value(&value, 0);
+        let turn_generation = handle.generation.load(Ordering::Acquire);
+        if handle
+            .interrupted_generation
+            .compare_exchange(turn_generation, 0, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            mark_result_interrupted(&mut result);
+        }
         let local_command_output = handle.last_local_command_output.lock().await.take();
         cli_bridge::apply_claude_local_command_output(&mut result, local_command_output);
         // Preserve the existing persistent-mode interpretation: a single
@@ -274,6 +294,7 @@ impl CliProcessPool {
         let last_usage_snapshot: Arc<Mutex<Option<ClaudeUsageSnapshot>>> =
             Arc::new(Mutex::new(None));
         let generation = Arc::new(AtomicU64::new(0));
+        let interrupted_generation = Arc::new(AtomicU64::new(0));
         let control_waiters = Arc::new(Mutex::new(HashMap::new()));
         let stderr_hint: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
 
@@ -296,6 +317,7 @@ impl CliProcessPool {
                 last_result: last_result.clone(),
                 last_local_command_output: last_local_command_output.clone(),
                 generation: generation.clone(),
+                interrupted_generation: interrupted_generation.clone(),
                 control_waiters: control_waiters.clone(),
             },
             cancel.clone(),
@@ -326,6 +348,7 @@ impl CliProcessPool {
             last_local_command_output,
             last_usage_snapshot,
             generation,
+            interrupted_generation,
             next_control_request_id: AtomicU64::new(1),
             control_waiters,
             stderr_hint,
@@ -455,6 +478,12 @@ fn claude_control_response(value: &serde_json::Value) -> Option<(&str, Result<()
     Some((request_id, result))
 }
 
+fn mark_result_interrupted(result: &mut CliResult) {
+    result.provider_error = None;
+    result.success = false;
+    result.error_kind = Some(CLAUDE_INTERRUPTED_ERROR_KIND.to_string());
+}
+
 async fn stdout_reader_task(
     stdout: tokio::process::ChildStdout,
     state: StdoutState,
@@ -466,6 +495,7 @@ async fn stdout_reader_task(
         last_result,
         last_local_command_output,
         generation,
+        interrupted_generation,
         control_waiters,
     } = state;
     let reader = BufReader::new(stdout);
@@ -491,7 +521,11 @@ async fn stdout_reader_task(
                                 if let Some(waiter) =
                                     control_waiters.lock().await.remove(request_id)
                                 {
-                                    let _ = waiter.send(result);
+                                    if result.is_ok() {
+                                        interrupted_generation
+                                            .store(waiter.turn_generation, Ordering::Release);
+                                    }
+                                    let _ = waiter.response_tx.send(result);
                                 }
                                 continue;
                             }
@@ -542,7 +576,9 @@ async fn stdout_reader_task(
         }
     }
     for (_, waiter) in control_waiters.lock().await.drain() {
-        let _ = waiter.send(Err("Claude process closed".to_string()));
+        let _ = waiter
+            .response_tx
+            .send(Err("Claude process closed".to_string()));
     }
 }
 
@@ -614,6 +650,29 @@ mod tests {
         assert_eq!(
             claude_control_response(&rejected),
             Some(("request-8", Err("no active turn".to_string())))
+        );
+    }
+
+    #[test]
+    fn acknowledged_interrupt_is_not_a_provider_error() {
+        let mut result = cli_bridge::parse_claude_result_value(
+            &serde_json::json!({
+                "type": "result",
+                "subtype": "error_during_execution",
+                "is_error": true,
+                "session_id": "session-1",
+            }),
+            0,
+        );
+        assert!(result.provider_error.is_some());
+
+        mark_result_interrupted(&mut result);
+
+        assert!(result.provider_error.is_none());
+        assert!(!result.success);
+        assert_eq!(
+            result.error_kind.as_deref(),
+            Some(CLAUDE_INTERRUPTED_ERROR_KIND)
         );
     }
 }
