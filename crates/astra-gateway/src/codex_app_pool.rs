@@ -353,6 +353,7 @@ impl CodexAppPool {
         tokio::spawn(stderr_drainer_task(stderr, cancel.clone()));
         tokio::spawn(stdout_reader_task(
             stdout,
+            request_tx.clone(),
             pending.clone(),
             progress_slot.clone(),
             thread_id.clone(),
@@ -793,6 +794,7 @@ async fn stdin_writer_task(
 #[allow(clippy::too_many_arguments)]
 async fn stdout_reader_task(
     stdout: tokio::process::ChildStdout,
+    request_tx: mpsc::Sender<Value>,
     pending: PendingResponses,
     progress_slot: Arc<Mutex<Option<mpsc::Sender<CliProgress>>>>,
     thread_id: Arc<Mutex<Option<String>>>,
@@ -827,6 +829,31 @@ async fn stdout_reader_task(
                             tracing::debug!(line = %trimmed, "invalid codex app-server stdout");
                             continue;
                         };
+                        if let Some(response) = unsupported_server_request_response(&v) {
+                            let method = v["method"].as_str().unwrap_or("unknown");
+                            let tool = v["params"]["tool"].as_str();
+                            tracing::warn!(
+                                method,
+                                tool,
+                                "rejecting unsupported codex app-server request"
+                            );
+                            if request_tx.send(response).await.is_err() {
+                                let error = "codex app-server stdin closed";
+                                mark_process_failed(
+                                    &progress_slot,
+                                    &active_turn_id,
+                                    &last_error,
+                                    &turn_failed,
+                                    &approval_id,
+                                    error,
+                                )
+                                .await;
+                                fail_pending(&pending, error).await;
+                                cancel.cancel();
+                                break;
+                            }
+                            continue;
+                        }
                         if let Some(id) = v["id"].as_u64() {
                             let tx = pending.lock().await.remove(&id);
                             if let Some(tx) = tx {
@@ -908,6 +935,41 @@ async fn stdout_reader_task(
             }
         }
     }
+}
+
+fn unsupported_server_request_response(request: &Value) -> Option<Value> {
+    let id = request.get("id")?.clone();
+    let method = request.get("method")?.as_str()?;
+
+    if method == "item/tool/call" {
+        let tool = request["params"]["tool"]
+            .as_str()
+            .filter(|tool| !tool.trim().is_empty())
+            .unwrap_or("unknown");
+        let message = format!(
+            "client tool `{tool}` is not supported by astra-gateway; use another available tool"
+        );
+        return Some(serde_json::json!({
+            "id": id,
+            "result": {
+                "contentItems": [{
+                    "type": "inputText",
+                    "text": message,
+                }],
+                "success": false,
+            },
+        }));
+    }
+
+    Some(serde_json::json!({
+        "id": id,
+        "error": {
+            "code": -32601,
+            "message": format!(
+                "server request `{method}` is not supported by astra-gateway"
+            ),
+        },
+    }))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1711,6 +1773,62 @@ mod tests {
             Err(AppServerRequestError::Rejected(message))
                 if message.contains("no active turn")
         ));
+    }
+
+    #[test]
+    fn dynamic_client_tool_request_gets_failed_tool_result() {
+        let response = unsupported_server_request_response(&serde_json::json!({
+            "id": "server-request-1",
+            "method": "item/tool/call",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "callId": "call-1",
+                "tool": "request_plugin_install",
+                "arguments": {
+                    "plugin_id": "github@openai-curated-remote"
+                }
+            }
+        }))
+        .expect("server request should get a response");
+
+        assert_eq!(response["id"], "server-request-1");
+        assert_eq!(response["result"]["success"], false);
+        assert_eq!(response["result"]["contentItems"][0]["type"], "inputText");
+        assert!(
+            response["result"]["contentItems"][0]["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("request_plugin_install"))
+        );
+    }
+
+    #[test]
+    fn unknown_server_request_gets_method_not_found_error() {
+        let response = unsupported_server_request_response(&serde_json::json!({
+            "id": 42,
+            "method": "unknown/request",
+            "params": {}
+        }))
+        .expect("server request should get a response");
+
+        assert_eq!(response["id"], 42);
+        assert_eq!(response["error"]["code"], -32601);
+        assert!(
+            response["error"]["message"]
+                .as_str()
+                .is_some_and(|text| text.contains("unknown/request"))
+        );
+    }
+
+    #[test]
+    fn rpc_response_is_not_misclassified_as_server_request() {
+        assert!(
+            unsupported_server_request_response(&serde_json::json!({
+                "id": 7,
+                "result": {"turnId": "turn-1"}
+            }))
+            .is_none()
+        );
     }
 
     #[tokio::test]
