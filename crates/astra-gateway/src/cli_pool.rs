@@ -37,8 +37,8 @@ struct ProcessHandle {
     session_id: Arc<Mutex<Option<String>>>,
     /// Last `result` event JSON — reader stores it here for the runner to extract stats.
     last_result: Arc<Mutex<Option<serde_json::Value>>>,
-    /// Output from a Claude local slash command emitted before the result frame.
-    last_local_command_output: Arc<Mutex<Option<String>>>,
+    /// Status from a Claude system command event emitted before the result frame.
+    last_system_status_output: Arc<Mutex<Option<String>>>,
     /// Claude persistent mode reports cumulative usage for the process.
     /// Keep the previous snapshot so each gateway turn receives only its delta.
     last_usage_snapshot: Arc<Mutex<Option<ClaudeUsageSnapshot>>>,
@@ -62,7 +62,7 @@ struct StdoutState {
     progress_slot: Arc<Mutex<(u64, Option<mpsc::Sender<CliProgress>>)>>,
     session_id: Arc<Mutex<Option<String>>>,
     last_result: Arc<Mutex<Option<serde_json::Value>>>,
-    last_local_command_output: Arc<Mutex<Option<String>>>,
+    last_system_status_output: Arc<Mutex<Option<String>>>,
     generation: Arc<AtomicU64>,
     active_generation: Arc<AtomicU64>,
     interrupted_generation: Arc<AtomicU64>,
@@ -123,7 +123,7 @@ impl CliProcessPool {
 
         // Clear stale result from previous turn (e.g. after interrupt)
         *handle.last_result.lock().await = None;
-        *handle.last_local_command_output.lock().await = None;
+        *handle.last_system_status_output.lock().await = None;
 
         // Increment generation and register new progress channel
         let turn_gen = handle.generation.fetch_add(1, Ordering::Relaxed) + 1;
@@ -231,8 +231,8 @@ impl CliProcessPool {
         let mut result = cli_bridge::parse_claude_result_value(&value, 0);
         let turn_generation = handle.generation.load(Ordering::Acquire);
         apply_acknowledged_interrupt(&mut result, turn_generation, &handle.interrupted_generation);
-        let local_command_output = handle.last_local_command_output.lock().await.take();
-        cli_bridge::apply_claude_local_command_output(&mut result, local_command_output);
+        let system_status_output = handle.last_system_status_output.lock().await.take();
+        cli_bridge::apply_claude_system_status_output(&mut result, system_status_output);
         // Preserve the existing persistent-mode interpretation: a single
         // model turn is not a tool call, while values above one indicate the
         // extra agent turns previously shown in the footer.
@@ -308,7 +308,7 @@ impl CliProcessPool {
             Arc::new(Mutex::new((0, None)));
         let session_id: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
         let last_result: Arc<Mutex<Option<serde_json::Value>>> = Arc::new(Mutex::new(None));
-        let last_local_command_output: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let last_system_status_output: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
         let last_usage_snapshot: Arc<Mutex<Option<ClaudeUsageSnapshot>>> =
             Arc::new(Mutex::new(None));
         let generation = Arc::new(AtomicU64::new(0));
@@ -334,7 +334,7 @@ impl CliProcessPool {
                 progress_slot: progress_slot.clone(),
                 session_id: session_id.clone(),
                 last_result: last_result.clone(),
-                last_local_command_output: last_local_command_output.clone(),
+                last_system_status_output: last_system_status_output.clone(),
                 generation: generation.clone(),
                 active_generation: active_generation.clone(),
                 interrupted_generation: interrupted_generation.clone(),
@@ -365,7 +365,7 @@ impl CliProcessPool {
             cancel,
             session_id,
             last_result,
-            last_local_command_output,
+            last_system_status_output,
             last_usage_snapshot,
             generation,
             active_generation,
@@ -541,7 +541,7 @@ async fn stdout_reader_task(
         progress_slot,
         session_id,
         last_result,
-        last_local_command_output,
+        last_system_status_output,
         generation,
         active_generation,
         interrupted_generation,
@@ -599,8 +599,8 @@ async fn stdout_reader_task(
                                 }
                                 continue;
                             }
-                            if let Some(output) = cli_bridge::claude_local_command_output(&v) {
-                                *last_local_command_output.lock().await = Some(output);
+                            if let Some(output) = cli_bridge::claude_system_status_output(&v) {
+                                *last_system_status_output.lock().await = Some(output);
                                 continue;
                             }
                         }
