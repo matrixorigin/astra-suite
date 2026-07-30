@@ -546,6 +546,34 @@ async fn stdout_reader_task(
     }
 }
 
+async fn stderr_drainer_task(
+    stderr: tokio::process::ChildStderr,
+    stderr_hint: Arc<Mutex<Option<String>>>,
+    cancel: CancellationToken,
+) {
+    let reader = BufReader::new(stderr);
+    let mut lines = reader.lines();
+    loop {
+        tokio::select! {
+            line = lines.next_line() => {
+                match line {
+                    Ok(Some(line)) if !line.trim().is_empty() => {
+                        tracing::debug!(line = %line, "persistent claude stderr");
+                        if line.contains("No conversation found")
+                            || line.contains("session not found")
+                        {
+                            *stderr_hint.lock().await = Some(line.clone());
+                        }
+                    }
+                    Ok(None) | Err(_) => break,
+                    _ => {}
+                }
+            }
+            _ = cancel.cancelled() => break,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -587,33 +615,5 @@ mod tests {
             claude_control_response(&rejected),
             Some(("request-8", Err("no active turn".to_string())))
         );
-    }
-}
-
-async fn stderr_drainer_task(
-    stderr: tokio::process::ChildStderr,
-    stderr_hint: Arc<Mutex<Option<String>>>,
-    cancel: CancellationToken,
-) {
-    let reader = BufReader::new(stderr);
-    let mut lines = reader.lines();
-    loop {
-        tokio::select! {
-            line = lines.next_line() => {
-                match line {
-                    Ok(Some(line)) if !line.trim().is_empty() => {
-                        tracing::debug!(line = %line, "persistent claude stderr");
-                        if line.contains("No conversation found")
-                            || line.contains("session not found")
-                        {
-                            *stderr_hint.lock().await = Some(line.clone());
-                        }
-                    }
-                    Ok(None) | Err(_) => break,
-                    _ => {}
-                }
-            }
-            _ = cancel.cancelled() => break,
-        }
     }
 }
