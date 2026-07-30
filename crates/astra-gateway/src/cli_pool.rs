@@ -7,12 +7,14 @@ use crate::cli_bridge::{self, ClaudeUsageSnapshot, CliProfile, CliProgress, CliR
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 type ConversationKey = String;
+type ControlWaiters = Arc<Mutex<HashMap<String, oneshot::Sender<Result<(), String>>>>>;
 
 pub(crate) struct CliProcessPool {
     processes: HashMap<ConversationKey, ProcessHandle>,
@@ -34,14 +36,25 @@ struct ProcessHandle {
     /// Keep the previous snapshot so each gateway turn receives only its delta.
     last_usage_snapshot: Arc<Mutex<Option<ClaudeUsageSnapshot>>>,
     /// Current turn generation — incremented on each begin_turn.
-    generation: Arc<std::sync::atomic::AtomicU64>,
+    generation: Arc<AtomicU64>,
+    next_control_request_id: AtomicU64,
+    control_waiters: ControlWaiters,
     /// Stderr hint: drainer stores notable errors (e.g. stale session) for the runner to check.
     stderr_hint: Arc<Mutex<Option<String>>>,
 }
 
 enum StdinCommand {
     UserMessage(String),
-    Interrupt,
+    Interrupt { request_id: String },
+}
+
+struct StdoutState {
+    progress_slot: Arc<Mutex<(u64, Option<mpsc::Sender<CliProgress>>)>>,
+    session_id: Arc<Mutex<Option<String>>>,
+    last_result: Arc<Mutex<Option<serde_json::Value>>>,
+    last_local_command_output: Arc<Mutex<Option<String>>>,
+    generation: Arc<AtomicU64>,
+    control_waiters: ControlWaiters,
 }
 
 impl CliProcessPool {
@@ -101,10 +114,7 @@ impl CliProcessPool {
         *handle.last_local_command_output.lock().await = None;
 
         // Increment generation and register new progress channel
-        let turn_gen = handle
-            .generation
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-            + 1;
+        let turn_gen = handle.generation.fetch_add(1, Ordering::Relaxed) + 1;
         let (progress_tx, progress_rx) = mpsc::channel(256);
         *handle.progress_slot.lock().await = (turn_gen, Some(progress_tx));
 
@@ -132,11 +142,39 @@ impl CliProcessPool {
             .processes
             .get(key)
             .ok_or("no process for conversation")?;
+        let request_id = format!(
+            "astra_interrupt_{}",
+            handle
+                .next_control_request_id
+                .fetch_add(1, Ordering::Relaxed)
+        );
+        let (response_tx, response_rx) = oneshot::channel();
         handle
-            .stdin_tx
-            .send(StdinCommand::Interrupt)
+            .control_waiters
+            .lock()
             .await
-            .map_err(|_| "stdin closed".to_string())
+            .insert(request_id.clone(), response_tx);
+        if handle
+            .stdin_tx
+            .send(StdinCommand::Interrupt {
+                request_id: request_id.clone(),
+            })
+            .await
+            .is_err()
+        {
+            handle.control_waiters.lock().await.remove(&request_id);
+            return Err("stdin closed".to_string());
+        }
+        let result =
+            match tokio::time::timeout(std::time::Duration::from_secs(5), response_rx).await {
+                Ok(Ok(result)) => result,
+                Ok(Err(_)) => Err("Claude interrupt response channel closed".to_string()),
+                Err(_) => Err("Claude interrupt response timed out".to_string()),
+            };
+        if result.is_err() {
+            handle.control_waiters.lock().await.remove(&request_id);
+        }
+        result
     }
 
     pub fn kill(&mut self, key: &str) {
@@ -235,7 +273,8 @@ impl CliProcessPool {
         let last_local_command_output: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
         let last_usage_snapshot: Arc<Mutex<Option<ClaudeUsageSnapshot>>> =
             Arc::new(Mutex::new(None));
-        let generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let generation = Arc::new(AtomicU64::new(0));
+        let control_waiters = Arc::new(Mutex::new(HashMap::new()));
         let stderr_hint: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
 
         // Spawn stdin writer
@@ -251,11 +290,14 @@ impl CliProcessPool {
         // Spawn stdout reader — routes events to progress_slot
         tokio::spawn(stdout_reader_task(
             stdout,
-            progress_slot.clone(),
-            session_id.clone(),
-            last_result.clone(),
-            last_local_command_output.clone(),
-            generation.clone(),
+            StdoutState {
+                progress_slot: progress_slot.clone(),
+                session_id: session_id.clone(),
+                last_result: last_result.clone(),
+                last_local_command_output: last_local_command_output.clone(),
+                generation: generation.clone(),
+                control_waiters: control_waiters.clone(),
+            },
             cancel.clone(),
         ));
 
@@ -284,6 +326,8 @@ impl CliProcessPool {
             last_local_command_output,
             last_usage_snapshot,
             generation,
+            next_control_request_id: AtomicU64::new(1),
+            control_waiters,
             stderr_hint,
         };
 
@@ -367,8 +411,9 @@ async fn stdin_writer_task(
                         }
                         let _ = stdin.flush().await;
                     }
-                    Some(StdinCommand::Interrupt) => {
-                        if let Err(e) = stdin.write_all(b"{\"subtype\":\"interrupt\"}\n").await {
+                    Some(StdinCommand::Interrupt { request_id }) => {
+                        let line = claude_interrupt_control_request(&request_id);
+                        if let Err(e) = stdin.write_all(line.as_bytes()).await {
                             tracing::warn!(error = %e, "failed to write interrupt to stdin");
                             break;
                         }
@@ -382,15 +427,47 @@ async fn stdin_writer_task(
     }
 }
 
+fn claude_interrupt_control_request(request_id: &str) -> String {
+    format!(
+        "{}\n",
+        serde_json::json!({
+            "type": "control_request",
+            "request_id": request_id,
+            "request": {"subtype": "interrupt"},
+        })
+    )
+}
+
+fn claude_control_response(value: &serde_json::Value) -> Option<(&str, Result<(), String>)> {
+    if value["type"].as_str() != Some("control_response") {
+        return None;
+    }
+    let response = &value["response"];
+    let request_id = response["request_id"].as_str()?;
+    let result = if response["subtype"].as_str() == Some("success") {
+        Ok(())
+    } else {
+        Err(response["error"]
+            .as_str()
+            .unwrap_or("Claude rejected the control request")
+            .to_string())
+    };
+    Some((request_id, result))
+}
+
 async fn stdout_reader_task(
     stdout: tokio::process::ChildStdout,
-    progress_slot: Arc<Mutex<(u64, Option<mpsc::Sender<CliProgress>>)>>,
-    session_id: Arc<Mutex<Option<String>>>,
-    last_result: Arc<Mutex<Option<serde_json::Value>>>,
-    last_local_command_output: Arc<Mutex<Option<String>>>,
-    generation: Arc<std::sync::atomic::AtomicU64>,
+    state: StdoutState,
     cancel: CancellationToken,
 ) {
+    let StdoutState {
+        progress_slot,
+        session_id,
+        last_result,
+        last_local_command_output,
+        generation,
+        control_waiters,
+    } = state;
     let reader = BufReader::new(stdout);
     let mut lines = reader.lines();
     #[allow(unused_assignments)]
@@ -407,9 +484,17 @@ async fn stdout_reader_task(
                         }
 
                         // Track latest generation before processing
-                        current_gen = generation.load(std::sync::atomic::Ordering::Relaxed);
+                        current_gen = generation.load(Ordering::Relaxed);
 
                         if let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed) {
+                            if let Some((request_id, result)) = claude_control_response(&v) {
+                                if let Some(waiter) =
+                                    control_waiters.lock().await.remove(request_id)
+                                {
+                                    let _ = waiter.send(result);
+                                }
+                                continue;
+                            }
                             // Check for result event (turn complete)
                             if v["type"].as_str() == Some("result") {
                                 if let Some(sid) = v["session_id"].as_str() {
@@ -455,6 +540,53 @@ async fn stdout_reader_task(
             }
             _ = cancel.cancelled() => break,
         }
+    }
+    for (_, waiter) in control_waiters.lock().await.drain() {
+        let _ = waiter.send(Err("Claude process closed".to_string()));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn interrupt_uses_claude_control_protocol_envelope() {
+        let value: serde_json::Value =
+            serde_json::from_str(claude_interrupt_control_request("request-7").trim()).unwrap();
+
+        assert_eq!(value["type"], "control_request");
+        assert_eq!(value["request_id"], "request-7");
+        assert_eq!(value["request"]["subtype"], "interrupt");
+    }
+
+    #[test]
+    fn claude_control_response_preserves_acknowledgement() {
+        let success = serde_json::json!({
+            "type": "control_response",
+            "response": {
+                "subtype": "success",
+                "request_id": "request-7",
+                "response": {},
+            },
+        });
+        let rejected = serde_json::json!({
+            "type": "control_response",
+            "response": {
+                "subtype": "error",
+                "request_id": "request-8",
+                "error": "no active turn",
+            },
+        });
+
+        assert_eq!(
+            claude_control_response(&success),
+            Some(("request-7", Ok(())))
+        );
+        assert_eq!(
+            claude_control_response(&rejected),
+            Some(("request-8", Err("no active turn".to_string())))
+        );
     }
 }
 

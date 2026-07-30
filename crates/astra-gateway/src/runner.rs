@@ -541,8 +541,26 @@ struct QueuedRequest {
     conversation: ConversationKey,
     trace: Option<OutboxDeliveryTrace>,
     background: bool,
-    steer_eligible: bool,
+    steering_backend: Option<SteeringBackend>,
     scheduled_response_tx: Option<tokio::sync::oneshot::Sender<Option<OutboundMessage>>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SteeringBackend {
+    Claude,
+    Codex,
+}
+
+fn steering_backend(profile: &CliProfile) -> Option<SteeringBackend> {
+    match profile {
+        CliProfile::Claude {
+            stream_json: true, ..
+        } => Some(SteeringBackend::Claude),
+        CliProfile::Codex {
+            stream_json: true, ..
+        } => Some(SteeringBackend::Codex),
+        _ => None,
+    }
 }
 
 #[derive(Clone)]
@@ -3461,16 +3479,11 @@ impl GatewayRunner {
             None
         };
         QueuedRequest {
-            steer_eligible: profile_override.is_none()
+            steering_backend: (profile_override.is_none()
                 && msg.attachments.is_empty()
-                && !msg.text.trim().is_empty()
-                && matches!(
-                    &resolved,
-                    CliProfile::Codex {
-                        stream_json: true,
-                        ..
-                    }
-                ),
+                && !msg.text.trim().is_empty())
+            .then(|| steering_backend(&resolved))
+            .flatten(),
             msg,
             conversation,
             trace,
@@ -3619,7 +3632,7 @@ impl GatewayRunner {
             .build_queued_request_with_profile_override(turn.message, None)
             .await;
         queued.background = true;
-        queued.steer_eligible = false;
+        queued.steering_backend = None;
         queued.scheduled_response_tx = Some(turn.response_tx);
         self.enqueue_ingress(queued, cli_resp_tx).await;
     }
@@ -3642,8 +3655,12 @@ impl GatewayRunner {
             if !self.should_execute_queued(&queued).await {
                 continue;
             }
-            let can_steer = queued.steer_eligible && self.execution_can_steer(&key).await;
-            if !can_steer {
+            let Some(steering_backend) = queued.steering_backend else {
+                self.enqueue_queued_request(queued, cli_resp_tx.clone())
+                    .await;
+                continue;
+            };
+            if !self.execution_can_steer(&key).await {
                 self.enqueue_queued_request(queued, cli_resp_tx.clone())
                     .await;
                 continue;
@@ -3673,9 +3690,9 @@ impl GatewayRunner {
                         %error,
                         platform = queued.msg.platform,
                         chat_id = %safe_id(&queued.msg.chat_id),
-                        "failed to claim request for Codex steering"
+                        "failed to claim request for live steering"
                     );
-                    self.fail_dispatch(&queued, "failed to claim request for Codex steering")
+                    self.fail_dispatch(&queued, "failed to claim request for live steering")
                         .await;
                     continue;
                 }
@@ -3686,6 +3703,56 @@ impl GatewayRunner {
                 queued.conversation.chat_id(),
                 queued.conversation.cli_profile(),
             );
+            if steering_backend == SteeringBackend::Claude {
+                let interrupt_result = self.cli_pool.lock().await.interrupt(&pool_key).await;
+                match interrupt_result {
+                    Ok(()) => {
+                        if !self
+                            .release_steer_claim_for_fallback(&trace_writer, &queued, &cli_resp_tx)
+                            .await
+                        {
+                            continue;
+                        }
+                        let _ = trace_writer
+                            .append(
+                                GatewayEventKind::TurnSteerAccepted,
+                                serde_json::json!({
+                                    "backend": "claude",
+                                    "mode": "interrupt_then_queue",
+                                    "platform_msg_id": queued.msg.msg_id,
+                                }),
+                            )
+                            .await;
+                        tracing::info!(
+                            platform = queued.msg.platform,
+                            chat_id = %safe_id(&queued.msg.chat_id),
+                            platform_msg_id = %queued.msg.msg_id,
+                            "interrupted active Claude turn; queued steering message next"
+                        );
+                        self.enqueue_queued_request(queued, cli_resp_tx.clone())
+                            .await;
+                    }
+                    Err(error) => {
+                        tracing::info!(
+                            %error,
+                            platform = queued.msg.platform,
+                            chat_id = %safe_id(&queued.msg.chat_id),
+                            "Claude turn interrupt was rejected; falling back to queue"
+                        );
+                        let safe_error = redact_sensitive(&error);
+                        self.fallback_after_steer(
+                            &trace_writer,
+                            queued,
+                            &cli_resp_tx,
+                            "claude_interrupt_rejected",
+                            Some(&safe_error),
+                        )
+                        .await;
+                    }
+                }
+                continue;
+            }
+
             let steer_request = {
                 self.codex_app_pool.lock().await.prepare_steer(
                     &pool_key,
@@ -3704,6 +3771,7 @@ impl GatewayRunner {
                         .append(
                             GatewayEventKind::TurnSteerAccepted,
                             serde_json::json!({
+                                "backend": "codex",
                                 "thread_turn_id": turn_id,
                                 "platform_msg_id": queued.msg.msg_id,
                             }),
@@ -5311,6 +5379,28 @@ fn answer_progressive_flush_enabled(reasoning_display: ReasoningDisplay) -> bool
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn live_steering_requires_streaming_claude_or_codex() {
+        let profile = |profile_type, stream_json| {
+            serde_json::from_value::<CliProfile>(serde_json::json!({
+                "type": profile_type,
+                "stream_json": stream_json,
+            }))
+            .unwrap()
+        };
+
+        assert_eq!(
+            steering_backend(&profile("claude", true)),
+            Some(SteeringBackend::Claude)
+        );
+        assert_eq!(
+            steering_backend(&profile("codex", true)),
+            Some(SteeringBackend::Codex)
+        );
+        assert_eq!(steering_backend(&profile("claude", false)), None);
+        assert_eq!(steering_backend(&profile("codex", false)), None);
+    }
 
     #[test]
     fn execution_lane_allows_steer_only_for_active_head_without_backlog() {

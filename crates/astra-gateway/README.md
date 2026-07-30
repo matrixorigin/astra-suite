@@ -11,7 +11,7 @@ attachments, scheduled tasks, and full observability.
 |--------------------|-------------|
 | **Multi-CLI**      | claude / codex / copilot / astra — switch at runtime via `/cli`. |
 | **Multi-model**    | `/model haiku\|sonnet\|opus\|minimax\|deepseek\|qwen\|glm` |
-| **Live steering**  | Plain-text follow-ups can redirect an active Codex app-server turn without waiting for it to finish. |
+| **Live steering**  | Plain-text follow-ups can redirect active Claude and Codex turns without waiting for them to finish. |
 | **Sessions**       | Per-user isolation, auto-reset (daily / idle), history, switch. |
 | **MCP tools**      | Agent-callable reminders, cron jobs, workspace listing, and file sending. |
 | **Cron & tasks**   | Recurring jobs and one-time reminders, via slash commands or MCP tools. |
@@ -139,15 +139,18 @@ agents through `gateway_send_attachment`.
 Natural language also works — when MCP is enabled, the agent can call gateway
 tools to schedule cron jobs or set reminders on your behalf.
 
-When Codex is running through app-server mode, a new plain-text message in the
-same conversation is sent to the active turn with `turn/steer`. Codex consumes
-it at the next agent/model step, after any tool call already in progress
-returns. If no turn is active, the turn finishes during the handoff, or Codex
-rejects steering, the message falls back to the normal conversation queue.
-An ambiguous transport timeout is not requeued, preventing duplicate execution,
-and the user receives a warning. Messages with attachments remain queued so
-media preparation is preserved; later text messages cannot overtake an already
-queued attachment or scheduled turn.
+With a streaming Claude or Codex profile, a new plain-text message in the same
+conversation can redirect active work. Claude receives an interrupt and the new
+message runs as the next turn. Codex app-server receives `turn/steer` and
+consumes the message at its next agent/model step, after any tool call already
+in progress returns.
+
+If no turn is active, the turn finishes during the handoff, or the backend
+rejects steering, the message falls back to the normal conversation queue. An
+ambiguous Codex transport timeout is not requeued, preventing duplicate
+execution, and the user receives a warning. Messages with attachments remain
+queued so media preparation is preserved; later text messages cannot overtake
+an already queued attachment or scheduled turn.
 
 ## Configuration
 
