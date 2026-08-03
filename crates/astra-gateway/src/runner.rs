@@ -2366,9 +2366,12 @@ impl GatewayRunner {
                     );
                 }
                 _ = &mut post_stream_heartbeat_timer, if stream_cutoff_active && !post_stream_final_sent => {
-                    let heartbeat = format!(
-                        "[{request_tag}] 流式窗口已切段，仍在继续处理；当前已累积后续输出 {} 字节。",
-                        post_stream_buffer.len() + token_buf.len()
+                    let has_buffered_content = deferred_plain_delivery(&post_stream_buffer).is_some()
+                        || deferred_plain_delivery(&token_buf).is_some();
+                    let heartbeat = format_post_stream_heartbeat(
+                        &request_tag,
+                        has_buffered_content,
+                        start.elapsed(),
                     );
                     send_plain(heartbeat, &execution_outbound_tx, msg.platform, &chat_id);
                     post_stream_heartbeat_timer.as_mut().reset(
@@ -5455,6 +5458,22 @@ fn deferred_plain_delivery(text: &str) -> Option<&str> {
     (!text.trim().is_empty()).then_some(text)
 }
 
+fn format_post_stream_heartbeat(
+    request_tag: &str,
+    has_buffered_content: bool,
+    elapsed: Duration,
+) -> String {
+    let delivery_status = if has_buffered_content {
+        "已有后续内容，完成后发送"
+    } else {
+        "尚未产生可发送的新内容"
+    };
+    format!(
+        "[{request_tag}] 流式窗口已切段；任务进程仍在运行（已运行 {}），{delivery_status}。",
+        format_elapsed(elapsed)
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5471,6 +5490,28 @@ mod tests {
             deferred_plain_delivery("final answer"),
             Some("final answer")
         );
+    }
+
+    #[test]
+    fn post_stream_heartbeat_reports_live_process_without_buffered_content() {
+        let heartbeat = format_post_stream_heartbeat("#A7", false, Duration::from_secs(14 * 60));
+
+        assert!(heartbeat.contains("[#A7]"));
+        assert!(heartbeat.contains("任务进程仍在运行"));
+        assert!(heartbeat.contains("已运行 14m0s"));
+        assert!(heartbeat.contains("尚未产生可发送的新内容"));
+        assert!(!heartbeat.contains("字节"));
+    }
+
+    #[test]
+    fn post_stream_heartbeat_reports_buffered_content_without_byte_count() {
+        let heartbeat = format_post_stream_heartbeat("#A7", true, Duration::from_secs(14 * 60));
+
+        assert!(heartbeat.contains("[#A7]"));
+        assert!(heartbeat.contains("任务进程仍在运行"));
+        assert!(heartbeat.contains("已运行 14m0s"));
+        assert!(heartbeat.contains("已有后续内容，完成后发送"));
+        assert!(!heartbeat.contains("字节"));
     }
 
     #[test]
