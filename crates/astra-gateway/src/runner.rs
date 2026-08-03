@@ -2326,13 +2326,17 @@ impl GatewayRunner {
                             }
                             // Send full accumulated content with finish=true to close the stream
                             if stream_cutoff_active {
-                                send_plain_ai(
-                                    post_stream_buffer.clone(),
-                                    &execution_outbound_tx,
-                                    msg.platform,
-                                    &chat_id,
-                                );
-                                post_stream_final_sent = true;
+                                if let Some(deferred) =
+                                    deferred_plain_delivery(&post_stream_buffer)
+                                {
+                                    send_plain_ai(
+                                        deferred.to_string(),
+                                        &execution_outbound_tx,
+                                        msg.platform,
+                                        &chat_id,
+                                    );
+                                    post_stream_final_sent = true;
+                                }
                             } else {
                                 send_stream(&accumulated, &execution_outbound_tx, msg.platform, &chat_id, reply_token.clone(), stream_id.clone(), true);
                             }
@@ -5447,9 +5451,27 @@ fn answer_progressive_flush_enabled(reasoning_display: ReasoningDisplay) -> bool
     !reasoning_display.is_enabled()
 }
 
+fn deferred_plain_delivery(text: &str) -> Option<&str> {
+    (!text.trim().is_empty()).then_some(text)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deferred_plain_delivery_skips_empty_buffer() {
+        assert_eq!(deferred_plain_delivery(""), None);
+        assert_eq!(deferred_plain_delivery(" \n\t"), None);
+    }
+
+    #[test]
+    fn deferred_plain_delivery_preserves_nonempty_buffer() {
+        assert_eq!(
+            deferred_plain_delivery("final answer"),
+            Some("final answer")
+        );
+    }
 
     #[test]
     fn live_steering_requires_streaming_claude_or_codex() {
