@@ -583,13 +583,18 @@ impl CliProfile {
                 ..
             } => {
                 let mut cmd = Command::new(bin);
+                let prompt = if let Some(sp) = system_prompt {
+                    format!("{sp}\n\nUser message:\n{message}")
+                } else {
+                    message.to_string()
+                };
                 if let Some(sid) = session_id {
                     cmd.arg("exec").arg("resume").arg(sid);
-                    if !message.is_empty() {
-                        cmd.arg(message);
+                    if !prompt.is_empty() {
+                        cmd.arg(&prompt);
                     }
                 } else {
-                    cmd.arg("exec").arg(message);
+                    cmd.arg("exec").arg(&prompt);
                 }
                 if *stream_json {
                     cmd.arg("--json");
@@ -3946,6 +3951,58 @@ printf '%s\n' '{"type":"assistant.message_delta","data":{"deltaContent":"from sc
         assert!(args.contains(&std::ffi::OsStr::new("follow up")));
         assert!(args.contains(&std::ffi::OsStr::new("--skip-git-repo-check")));
         assert!(args.contains(&std::ffi::OsStr::new("--ephemeral")));
+    }
+
+    #[test]
+    fn build_codex_exec_command_includes_gateway_context() {
+        let p = CliProfile::Codex {
+            bin: "codex".into(),
+            model: None,
+            reasoning_effort: None,
+            sandbox: "workspace-write".into(),
+            stream_json: false,
+            extra_args: vec![],
+            skip_git_repo_check: false,
+            ephemeral: false,
+        };
+        let cmd = p.build_command_with_context(
+            "inspect the pull request",
+            None,
+            None,
+            Some("use the injected GitHub credentials"),
+        );
+        let args: Vec<_> = cmd.as_std().get_args().collect();
+
+        assert!(args.contains(&std::ffi::OsStr::new(
+            "use the injected GitHub credentials\n\nUser message:\ninspect the pull request"
+        )));
+        assert!(!args.contains(&std::ffi::OsStr::new("inspect the pull request")));
+    }
+
+    #[test]
+    fn build_codex_resume_command_includes_gateway_context() {
+        let p = CliProfile::Codex {
+            bin: "codex".into(),
+            model: None,
+            reasoning_effort: None,
+            sandbox: "workspace-write".into(),
+            stream_json: false,
+            extra_args: vec![],
+            skip_git_repo_check: false,
+            ephemeral: false,
+        };
+        let cmd = p.build_command_with_context(
+            "continue the review",
+            Some("thread-123"),
+            None,
+            Some("use the injected GitHub credentials"),
+        );
+        let args: Vec<_> = cmd.as_std().get_args().collect();
+
+        assert!(args.contains(&std::ffi::OsStr::new(
+            "use the injected GitHub credentials\n\nUser message:\ncontinue the review"
+        )));
+        assert!(!args.contains(&std::ffi::OsStr::new("continue the review")));
     }
 
     #[test]
