@@ -59,6 +59,7 @@ pub(crate) struct CodexSteerRequest {
 }
 
 struct ProcessHandle {
+    is_astra: bool,
     request_tx: mpsc::Sender<Value>,
     pending: PendingResponses,
     next_id: AtomicU64,
@@ -78,6 +79,7 @@ struct ProcessHandle {
     tools_used: Arc<Mutex<Vec<String>>>,
     last_error: Arc<Mutex<Option<String>>>,
     turn_failed: Arc<Mutex<bool>>,
+    committed_failure_session_id: Arc<Mutex<Option<String>>>,
     approval_id: Arc<Mutex<Option<String>>>,
 }
 
@@ -141,6 +143,7 @@ impl CodexAppPool {
         *handle.tools_used.lock().await = Vec::new();
         *handle.last_error.lock().await = None;
         *handle.turn_failed.lock().await = false;
+        *handle.committed_failure_session_id.lock().await = None;
         *handle.approval_id.lock().await = None;
         *handle.active_turn_id.lock().await = None;
 
@@ -259,6 +262,11 @@ impl CodexAppPool {
         let tool_count = *handle.tool_calls_count.lock().await;
         let turn_failed = *handle.turn_failed.lock().await;
         let error = handle.last_error.lock().await.clone();
+        let session_id = if turn_failed && handle.is_astra {
+            handle.committed_failure_session_id.lock().await.clone()
+        } else {
+            handle.thread_id.lock().await.clone()
+        };
         Some(CliResult {
             stdout: String::new(),
             stderr: error.unwrap_or_default(),
@@ -269,7 +277,7 @@ impl CodexAppPool {
             trace_id: None,
             request_id: None,
             run_id: None,
-            session_id: handle.thread_id.lock().await.clone(),
+            session_id,
             text: if turn_failed || text.is_empty() {
                 None
             } else {
@@ -347,6 +355,7 @@ impl CodexAppPool {
         let tools_used = Arc::new(Mutex::new(Vec::new()));
         let last_error = Arc::new(Mutex::new(None));
         let turn_failed = Arc::new(Mutex::new(false));
+        let committed_failure_session_id = Arc::new(Mutex::new(None));
         let approval_id = Arc::new(Mutex::new(None));
 
         tokio::spawn(stdin_writer_task(stdin, request_rx, cancel.clone()));
@@ -370,7 +379,9 @@ impl CodexAppPool {
             tools_used.clone(),
             last_error.clone(),
             turn_failed.clone(),
+            committed_failure_session_id.clone(),
             approval_id.clone(),
+            matches!(profile, CliProfile::Astra { .. }),
             cancel.clone(),
         ));
 
@@ -388,6 +399,7 @@ impl CodexAppPool {
         });
 
         let handle = ProcessHandle {
+            is_astra: matches!(profile, CliProfile::Astra { .. }),
             request_tx,
             pending,
             next_id: AtomicU64::new(1),
@@ -407,6 +419,7 @@ impl CodexAppPool {
             tools_used,
             last_error,
             turn_failed,
+            committed_failure_session_id,
             approval_id,
         };
 
@@ -811,7 +824,9 @@ async fn stdout_reader_task(
     tools_used: Arc<Mutex<Vec<String>>>,
     last_error: Arc<Mutex<Option<String>>>,
     turn_failed: Arc<Mutex<bool>>,
+    committed_failure_session_id: Arc<Mutex<Option<String>>>,
     approval_id: Arc<Mutex<Option<String>>>,
+    is_astra: bool,
     cancel: CancellationToken,
 ) {
     let reader = BufReader::new(stdout);
@@ -883,7 +898,9 @@ async fn stdout_reader_task(
                             &tools_used,
                             &last_error,
                             &turn_failed,
+                            &committed_failure_session_id,
                             &approval_id,
+                            is_astra,
                         )
                         .await;
                     }
@@ -990,7 +1007,9 @@ async fn handle_notification(
     tools_used: &Arc<Mutex<Vec<String>>>,
     last_error: &Arc<Mutex<Option<String>>>,
     turn_failed: &Arc<Mutex<bool>>,
+    committed_failure_session_id: &Arc<Mutex<Option<String>>>,
     approval_id: &Arc<Mutex<Option<String>>>,
+    is_astra: bool,
 ) {
     let Some(method) = v["method"].as_str() else {
         return;
@@ -1075,6 +1094,20 @@ async fn handle_notification(
         "turn/completed" => {
             if params["status"].as_str() == Some("failed") {
                 *turn_failed.lock().await = true;
+                if is_astra {
+                    if params["committed"].as_bool() == Some(true)
+                        && let Some(session_id) =
+                            params["sessionId"].as_str().filter(|id| !id.is_empty())
+                    {
+                        *committed_failure_session_id.lock().await = Some(session_id.to_string());
+                        *thread_id.lock().await = Some(session_id.to_string());
+                    }
+                    if params["commitUnknown"].as_bool() == Some(true) {
+                        let mut error = last_error.lock().await;
+                        let message = error.get_or_insert_with(String::new);
+                        message.push_str(" [提交状态未知，请勿直接重试；先核对会话状态]");
+                    }
+                }
             }
             *active_turn_id.lock().await = None;
             *progress_slot.lock().await = None;
@@ -1424,9 +1457,11 @@ mod tests {
 
     fn test_process_handle(
         active_turn_id: Option<&str>,
+        is_astra: bool,
     ) -> (Arc<ProcessHandle>, mpsc::Receiver<Value>) {
         let (request_tx, request_rx) = mpsc::channel(8);
         let handle = ProcessHandle {
+            is_astra,
             request_tx,
             pending: Arc::new(Mutex::new(HashMap::new())),
             next_id: AtomicU64::new(1),
@@ -1446,6 +1481,7 @@ mod tests {
             tools_used: Arc::new(Mutex::new(Vec::new())),
             last_error: Arc::new(Mutex::new(None)),
             turn_failed: Arc::new(Mutex::new(false)),
+            committed_failure_session_id: Arc::new(Mutex::new(None)),
             approval_id: Arc::new(Mutex::new(None)),
         };
         (Arc::new(handle), request_rx)
@@ -1686,7 +1722,7 @@ mod tests {
 
     #[tokio::test]
     async fn steer_request_accepts_matching_turn_response() {
-        let (handle, mut request_rx) = test_process_handle(Some("turn-1"));
+        let (handle, mut request_rx) = test_process_handle(Some("turn-1"), false);
         let request = CodexSteerRequest {
             handle: handle.clone(),
             message: "change direction".to_string(),
@@ -1715,7 +1751,7 @@ mod tests {
 
     #[tokio::test]
     async fn steer_request_reports_no_active_turn_without_sending_rpc() {
-        let (handle, mut request_rx) = test_process_handle(None);
+        let (handle, mut request_rx) = test_process_handle(None, false);
         let outcome = CodexSteerRequest {
             handle,
             message: "change direction".to_string(),
@@ -1730,7 +1766,7 @@ mod tests {
 
     #[tokio::test]
     async fn steer_timeout_is_outcome_unknown_not_rejected() {
-        let (handle, _request_rx) = test_process_handle(Some("turn-1"));
+        let (handle, _request_rx) = test_process_handle(Some("turn-1"), false);
         let result = handle
             .request_classified(
                 "turn/steer",
@@ -1748,7 +1784,7 @@ mod tests {
 
     #[tokio::test]
     async fn explicit_rpc_error_is_safe_rejection() {
-        let (handle, mut request_rx) = test_process_handle(Some("turn-1"));
+        let (handle, mut request_rx) = test_process_handle(Some("turn-1"), false);
         let request_handle = handle.clone();
         let task = tokio::spawn(async move {
             request_handle
@@ -1889,15 +1925,64 @@ mod tests {
             .result("live-astra-app-server-e2e")
             .await
             .expect("pool result should exist");
-        pool.kill("live-astra-app-server-e2e");
-
         assert!(saw_progress, "should receive streaming progress");
-        assert!(result.success, "turn should succeed");
+        assert!(result.success, "turn should succeed: {}", result.stderr);
         assert!(result.session_id.is_some(), "session id should be captured");
         assert!(
             result.text.as_deref().is_some_and(|text| !text.is_empty()),
             "final text should be captured"
         );
+
+        let session_id = result.session_id.clone();
+        let first_process = pool
+            .processes
+            .get("live-astra-app-server-e2e")
+            .cloned()
+            .expect("first astra process should still be running");
+        let mut second_progress = pool
+            .begin_turn(
+                "live-astra-app-server-e2e",
+                "继续上一轮，只回复 ok 两个字母，不要调用工具。",
+                &profile,
+                session_id.as_deref(),
+                Some(workspace.path()),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("second astra turn should reuse the running process");
+        assert!(Arc::ptr_eq(
+            &first_process,
+            pool.processes
+                .get("live-astra-app-server-e2e")
+                .expect("second turn should keep the first astra process")
+        ));
+        let second_deadline = tokio::time::sleep(std::time::Duration::from_secs(180));
+        tokio::pin!(second_deadline);
+        loop {
+            tokio::select! {
+                event = second_progress.recv() => {
+                    if event.is_none() { break; }
+                }
+                _ = &mut second_deadline => {
+                    pool.kill("live-astra-app-server-e2e");
+                    panic!("timed out waiting for second astra app-server turn");
+                }
+            }
+        }
+        let second_result = pool
+            .result("live-astra-app-server-e2e")
+            .await
+            .expect("second pool result should exist");
+        assert!(
+            second_result.success,
+            "second turn should succeed: {}",
+            second_result.stderr
+        );
+        assert_eq!(second_result.session_id, session_id);
+        pool.kill("live-astra-app-server-e2e");
     }
 
     #[tokio::test]
@@ -1918,6 +2003,7 @@ mod tests {
         let tools_used = Arc::new(Mutex::new(Vec::new()));
         let last_error = Arc::new(Mutex::new(None));
         let turn_failed = Arc::new(Mutex::new(false));
+        let committed_failure_session_id = Arc::new(Mutex::new(None));
         let approval_id = Arc::new(Mutex::new(None));
 
         handle_notification(
@@ -1940,7 +2026,9 @@ mod tests {
             &tools_used,
             &last_error,
             &turn_failed,
+            &committed_failure_session_id,
             &approval_id,
+            true,
         )
         .await;
         handle_notification(
@@ -1963,7 +2051,9 @@ mod tests {
             &tools_used,
             &last_error,
             &turn_failed,
+            &committed_failure_session_id,
             &approval_id,
+            true,
         )
         .await;
 
@@ -2007,6 +2097,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn astra_failed_turn_persists_only_a_confirmed_committed_session() {
+        let (handle, _requests) = test_process_handle(Some("turn-1"), true);
+        let mut pool = CodexAppPool::new();
+        pool.processes.insert("chat".to_string(), handle.clone());
+
+        handle_notification(
+            serde_json::json!({
+                "method": "turn/completed",
+                "params": {"status": "failed", "committed": false, "sessionId": "draft"}
+            }),
+            &handle.progress_slot,
+            &handle.thread_id,
+            &handle.active_turn_id,
+            &handle.last_text,
+            &handle.tokens_prompt,
+            &handle.tokens_completion,
+            &handle.cached_input_tokens,
+            &handle.reasoning_output_tokens,
+            &handle.total_tokens,
+            &handle.context_window,
+            &handle.raw_usage_json,
+            &handle.tool_calls_count,
+            &handle.tools_used,
+            &handle.last_error,
+            &handle.turn_failed,
+            &handle.committed_failure_session_id,
+            &handle.approval_id,
+            true,
+        )
+        .await;
+        assert!(pool.result("chat").await.unwrap().session_id.is_none());
+
+        handle_notification(
+            serde_json::json!({
+                "method": "turn/completed",
+                "params": {
+                    "status": "failed",
+                    "committed": true,
+                    "sessionId": "canonical-session"
+                }
+            }),
+            &handle.progress_slot,
+            &handle.thread_id,
+            &handle.active_turn_id,
+            &handle.last_text,
+            &handle.tokens_prompt,
+            &handle.tokens_completion,
+            &handle.cached_input_tokens,
+            &handle.reasoning_output_tokens,
+            &handle.total_tokens,
+            &handle.context_window,
+            &handle.raw_usage_json,
+            &handle.tool_calls_count,
+            &handle.tools_used,
+            &handle.last_error,
+            &handle.turn_failed,
+            &handle.committed_failure_session_id,
+            &handle.approval_id,
+            true,
+        )
+        .await;
+        assert_eq!(
+            pool.result("chat").await.unwrap().session_id.as_deref(),
+            Some("canonical-session")
+        );
+    }
+
+    #[tokio::test]
     async fn approval_requested_notification_records_and_forwards_progress() {
         let (progress_tx, mut progress_rx) = mpsc::channel(4);
         let progress_slot = Arc::new(Mutex::new(Some(progress_tx)));
@@ -2024,6 +2182,7 @@ mod tests {
         let tools_used = Arc::new(Mutex::new(Vec::new()));
         let last_error = Arc::new(Mutex::new(None));
         let turn_failed = Arc::new(Mutex::new(false));
+        let committed_failure_session_id = Arc::new(Mutex::new(None));
         let approval_id = Arc::new(Mutex::new(None));
 
         handle_notification(
@@ -2054,7 +2213,9 @@ mod tests {
             &tools_used,
             &last_error,
             &turn_failed,
+            &committed_failure_session_id,
             &approval_id,
+            false,
         )
         .await;
 

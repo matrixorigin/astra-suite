@@ -483,6 +483,9 @@ pub enum CancelRequestOutcome {
     NotFound,
 }
 
+// async_trait generates #[must_use] methods returning must-use futures; Clippy
+// 1.99 reports those generated attributes as double_must_use.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait TraceRepository: Send + Sync {
     async fn create_request(&self, request: &GatewayRequest) -> TraceResult<()>;

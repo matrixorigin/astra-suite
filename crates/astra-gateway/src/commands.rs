@@ -2680,6 +2680,11 @@ struct AstraModelListItem {
     context_window: Option<u64>,
 }
 
+#[derive(serde::Deserialize)]
+struct AstraModelListPage {
+    items: Vec<AstraModelListItem>,
+}
+
 async fn astra_model_entries(
     profile: &crate::cli_bridge::CliProfile,
 ) -> Result<Vec<ModelEntry>, String> {
@@ -2709,11 +2714,16 @@ async fn astra_model_entries(
         ));
     }
 
-    let items: Vec<AstraModelListItem> = serde_json::from_slice(&output.stdout)
-        .map_err(|e| format!("解析 `{bin} model list` 输出: {e}"))?;
+    parse_astra_model_entries(&output.stdout)
+        .map_err(|e| format!("解析 `{bin} model list` 输出: {e}"))
+}
+
+fn parse_astra_model_entries(output: &[u8]) -> Result<Vec<ModelEntry>, String> {
+    // astra model list returns a catalog page, not a bare array.
+    let page: AstraModelListPage = serde_json::from_slice(output).map_err(|e| e.to_string())?;
 
     let mut entries = vec![default_model_entry()];
-    for item in items.into_iter().filter(|m| m.is_active) {
+    for item in page.items.into_iter().filter(|m| m.is_active) {
         let provider = item.provider.unwrap_or_else(|| "unknown".into());
         let mut desc = provider;
         if let Some(window) = item.context_window {
@@ -3308,6 +3318,38 @@ fn format_model_status(model: &str, effort: Option<&str>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn astra_model_catalog_page_exposes_only_active_models() {
+        let output = serde_json::json!({
+            "catalog_revision": "sha256:test",
+            "total": 2,
+            "items": [
+                {
+                    "name": "glm-5.3",
+                    "provider": "anthropic",
+                    "description": "active model",
+                    "context_window": 128000,
+                    "is_active": true,
+                    "offering_id": "offer-1"
+                },
+                {
+                    "name": "glm-5.2",
+                    "is_active": false
+                }
+            ],
+            "next_cursor": null
+        });
+        let entries = parse_astra_model_entries(&serde_json::to_vec(&output).unwrap()).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[1].full_id.as_deref(), Some("glm-5.3"));
+        assert!(entries[1].desc.contains("ctx 128k"));
+    }
+
+    #[test]
+    fn astra_model_catalog_rejects_obsolete_bare_array() {
+        assert!(parse_astra_model_entries(br#"[{"name":"glm-5.3"}]"#).is_err());
+    }
 
     #[test]
     fn parse_cron_quoted() {

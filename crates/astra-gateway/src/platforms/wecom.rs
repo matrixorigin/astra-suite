@@ -1373,7 +1373,7 @@ fn decrypt_wecom_media(encrypted: &[u8], aes_key: &str) -> Result<Vec<u8>, Strin
     let cipher = Aes256::new_from_slice(&key).map_err(|e| format!("invalid aes key: {e}"))?;
     let mut prev = key[..16].to_vec();
     let mut out = Vec::with_capacity(encrypted.len());
-    for chunk in encrypted.chunks_exact(16) {
+    for chunk in encrypted.as_chunks::<16>().0 {
         let mut block = aes::cipher::generic_array::GenericArray::clone_from_slice(chunk);
         cipher.decrypt_block(&mut block);
         for i in 0..16 {
@@ -1972,7 +1972,7 @@ mod tests {
         let cipher = Aes256::new_from_slice(&key).unwrap();
         let mut prev = key[..16].to_vec();
         let mut encrypted = Vec::new();
-        for chunk in padded.chunks_exact(16) {
+        for chunk in padded.as_chunks::<16>().0 {
             let mut block_bytes = [0u8; 16];
             for i in 0..16 {
                 block_bytes[i] = chunk[i] ^ prev[i];

@@ -303,6 +303,9 @@ impl InboundMessage {
 }
 
 /// Platform adapter trait — implemented by each chat platform.
+// async_trait generates #[must_use] methods returning must-use futures; Clippy
+// 1.99 reports those generated attributes as double_must_use.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait PlatformAdapter: Send + Sync + 'static {
     fn name(&self) -> &'static str;

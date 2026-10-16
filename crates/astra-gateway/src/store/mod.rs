@@ -200,6 +200,9 @@ pub struct SkillRecord {
 /// Methods that operated on a specific CLI profile in the old `storage.rs` now
 /// take an explicit `cli_profile: &str` parameter instead of relying on
 /// `_for_cli` function name suffixes.
+// async_trait generates #[must_use] methods returning must-use futures; Clippy
+// 1.99 reports those generated attributes as double_must_use.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait GatewayStore: Send + Sync + 'static {
     // ── Schema / lifecycle ──────────────────────────────────────────────

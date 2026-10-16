@@ -905,6 +905,8 @@ impl GatewayRunner {
     }
 
     /// Fast path: access control + slash commands. Returns Some if handled (no CLI needed).
+    // On a miss, hand the original message to the slow path without cloning or boxing it.
+    #[allow(clippy::result_large_err)]
     pub async fn handle_fast(
         &self,
         msg: &InboundMessage,
@@ -3610,6 +3612,9 @@ impl GatewayRunner {
         }
     }
 
+    // Return the queued request to the caller on failure so it can settle the
+    // request and release its conversation accounting.
+    #[allow(clippy::result_large_err)]
     async fn enqueue_lane(
         self: &Arc<Self>,
         mut queued: QueuedRequest,
